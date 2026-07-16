@@ -14,6 +14,7 @@ async def main():
     from app.models.probation import Employee, ProbationTask
     from app.models.performance import PerformanceRecord, PerformanceQuarter
     from app.models.knowledge import KnowledgeCategory, KnowledgeItem
+    from app.models.knowledge import KnowledgeBase, KnowledgeDocument, KnowledgeChunk, IngestionTask
     from app.models.agent import AgentSession, AgentMessage, AgentMaterial, AgentTask
     from app.models.settings import SystemSetting
 

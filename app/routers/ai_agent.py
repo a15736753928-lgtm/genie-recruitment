@@ -157,14 +157,21 @@ async def execute_tool_call(tool_name: str, params: dict, db: AsyncSession) -> s
             return "查询完成"
 
         elif tool_name == "rag_search":
-            from app.routers.knowledge import search_milvus, recall_test
             try:
-                # Use Milvus search directly
+                from app.services.rag.search_service import search as rag_search_fn
                 top_k = params.get("topK", 5)
-                cat_key = params.get("categoryKey", "")
-                results = search_milvus(params["query"], top_k, cat_key)
+                results = await rag_search_fn(
+                    query=params["query"],
+                    kb_ids=None,
+                    top_k=top_k,
+                )
                 if results:
-                    return f"检索到 {len(results)} 条相关知识"
+                    summaries = []
+                    for r in results[:3]:
+                        summaries.append(
+                            f"[{r['kb_name']}] {r['file_name']}: {r['content'][:300]}"
+                        )
+                    return f"检索到 {len(results)} 条相关知识:\n" + "\n---\n".join(summaries)
                 return "未检索到相关知识"
             except Exception:
                 return "知识库检索暂不可用"

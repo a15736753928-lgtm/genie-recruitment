@@ -46,6 +46,7 @@ async def global_exception_handler(request: Request, exc: Exception):
 # Register routers
 from app.routers import auth, positions, resumes, interview, probation, performance
 from app.routers import knowledge, dashboard, ai_agent, settings as settings_router
+from app.routers import rag
 
 app.include_router(auth.router, prefix="/api")
 app.include_router(positions.router, prefix="/api")
@@ -57,6 +58,7 @@ app.include_router(knowledge.router, prefix="/api")
 app.include_router(dashboard.router, prefix="/api")
 app.include_router(ai_agent.router, prefix="/api")
 app.include_router(settings_router.router, prefix="/api")
+app.include_router(rag.router)  # RAG endpoints (prefix defined in router)
 
 
 @app.get("/api/health")

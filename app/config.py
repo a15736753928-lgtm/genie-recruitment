@@ -35,7 +35,32 @@ class Settings(BaseSettings):
 
     # Milvus
     milvus_db_path: str = "milvus_lite.db"
-    embedding_dim: int = 1536
+    milvus_collection_name: str = "hr_knowledge_chunks"
+    embedding_dim: int = 512   # bge-small-zh-v1.5 embedding dimension
+    embedding_model: str = "BAAI/bge-small-zh-v1.5"  # sentence-transformers model
+    embedding_device: str = "cpu"  # "cpu" or "cuda" — GPU not required
+
+    # RAG — Chunking
+    chunk_size: int = 500       # default chunk size (characters)
+    chunk_overlap: int = 100    # overlap between chunks
+    min_chunk_size: int = 40    # merge chunks shorter than this
+
+    # RAG — Retrieval
+    default_top_k: int = 10
+    max_search_recall: int = 5000
+    min_similarity: float = 0.0
+    search_ef: int = 64               # HNSW search parameter
+    rerank_enabled: bool = True
+    rerank_top_k: int = 20   # candidates to fetch before reranking
+    reranker_model: str = "BAAI/bge-reranker-base"  # CrossEncoder reranker
+
+    # RAG — Ingestion
+    ingest_batch_size: int = 64     # embedding batch size
+    max_file_size: int = 20 * 1024 * 1024  # 20 MB
+
+    # RAG — OCR (RapidOCR for image/PDF fallback)
+    ocr_enabled: bool = True
+    ocr_fallback_threshold: int = 100  # chars below which OCR is triggered
 
     # Root User — set via ROOT_USERNAME / ROOT_PASSWORD in .env
     root_username: str = ""
