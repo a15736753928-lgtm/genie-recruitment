@@ -1,0 +1,35 @@
+# Environment variables (contains secrets)
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Uploads (local files - user data should not be committed)
+uploads/
+app/uploads/
+
+# Database files
+*.db
+milvus_lite.db
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude
+.claude/

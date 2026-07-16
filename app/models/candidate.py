@@ -1,0 +1,118 @@
+import uuid
+from datetime import datetime, date
+from sqlalchemy import (
+    Column, String, Integer, Text, Date, DateTime, ForeignKey, JSON, Boolean, UniqueConstraint
+)
+from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.orm import relationship
+from app.database import Base
+
+
+class Position(Base):
+    __tablename__ = "positions"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name = Column(String(128), unique=True, nullable=False)
+    jd_content = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    candidates = relationship("Candidate", back_populates="position")
+
+
+class Candidate(Base):
+    __tablename__ = "candidates"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name = Column(String(64), nullable=False)
+    gender = Column(String(4))
+    age = Column(Integer)
+    education = Column(String(32))
+    experience = Column(String(32))
+    ethnicity = Column(String(32))
+    native_place = Column(String(64))
+    phone = Column(String(32))
+    email = Column(String(128))
+    position_id = Column(UUID(as_uuid=True), ForeignKey("positions.id"))
+    score = Column(Integer, default=0)
+    status = Column(String(32), nullable=False, default="job_hunting")
+    resume_file = Column(String(512))
+    upload_time = Column(Date, default=date.today)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    position = relationship("Position", back_populates="candidates")
+    skills = relationship("CandidateSkill", back_populates="candidate", cascade="all, delete-orphan")
+    educations = relationship("CandidateEducation", back_populates="candidate", cascade="all, delete-orphan")
+    work_experiences = relationship("CandidateWorkExperience", back_populates="candidate", cascade="all, delete-orphan")
+    project_experiences = relationship("CandidateProjectExperience", back_populates="candidate", cascade="all, delete-orphan")
+    ai_analysis = relationship("CandidateAIAnalysis", back_populates="candidate", uselist=False, cascade="all, delete-orphan")
+    questions = relationship("InterviewQuestion", back_populates="candidate", cascade="all, delete-orphan")
+    evaluations = relationship("InterviewEvaluation", back_populates="candidate", cascade="all, delete-orphan")
+    transcripts = relationship("InterviewTranscript", back_populates="candidate", cascade="all, delete-orphan")
+
+
+class CandidateSkill(Base):
+    __tablename__ = "candidate_skills"
+    __table_args__ = (UniqueConstraint("candidate_id", "skill"),)
+
+    candidate_id = Column(UUID(as_uuid=True), ForeignKey("candidates.id", ondelete="CASCADE"), primary_key=True)
+    skill = Column(String(64), primary_key=True)
+
+    candidate = relationship("Candidate", back_populates="skills")
+
+
+class CandidateEducation(Base):
+    __tablename__ = "candidate_educations"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    candidate_id = Column(UUID(as_uuid=True), ForeignKey("candidates.id", ondelete="CASCADE"))
+    school = Column(String(128))
+    degree = Column(String(32))
+    major = Column(String(128))
+    period = Column(String(64))
+
+    candidate = relationship("Candidate", back_populates="educations")
+
+
+class CandidateWorkExperience(Base):
+    __tablename__ = "candidate_work_experiences"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    candidate_id = Column(UUID(as_uuid=True), ForeignKey("candidates.id", ondelete="CASCADE"))
+    company = Column(String(128))
+    role = Column(String(128))
+    period = Column(String(64))
+    description = Column(Text)
+
+    candidate = relationship("Candidate", back_populates="work_experiences")
+
+
+class CandidateProjectExperience(Base):
+    __tablename__ = "candidate_project_experiences"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    candidate_id = Column(UUID(as_uuid=True), ForeignKey("candidates.id", ondelete="CASCADE"))
+    name = Column(String(128))
+    role = Column(String(128))
+    period = Column(String(64))
+    description = Column(Text)
+
+    candidate = relationship("Candidate", back_populates="project_experiences")
+
+
+class CandidateAIAnalysis(Base):
+    __tablename__ = "candidate_ai_analyses"
+
+    candidate_id = Column(UUID(as_uuid=True), ForeignKey("candidates.id", ondelete="CASCADE"), primary_key=True)
+    overall_score = Column(Integer)
+    summary = Column(Text)
+    position_match = Column(Text)
+    experience_insight = Column(Text)
+    recommendation = Column(Text)
+    keywords = Column(JSON)
+    highlights = Column(JSON)
+    risks = Column(JSON)
+    dimensions = Column(JSON)
+    analyzed_at = Column(DateTime, default=datetime.utcnow)
+
+    candidate = relationship("Candidate", back_populates="ai_analysis")
