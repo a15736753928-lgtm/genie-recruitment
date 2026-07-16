@@ -30,19 +30,8 @@ class KnowledgeItem(Base):
     file_path = Column(String(512))
     content = Column(Text)
     recall_count = Column(Integer, default=0)
-    training_status = Column(String(16), default="pending")
     milvus_ids = Column(JSON)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     category = relationship("KnowledgeCategory", back_populates="items")
-
-
-class KnowledgeTrainingJob(Base):
-    __tablename__ = "knowledge_training_jobs"
-
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    status = Column(String(16))
-    total_chunks = Column(Integer)
-    started_at = Column(DateTime)
-    finished_at = Column(DateTime)

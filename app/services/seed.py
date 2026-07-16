@@ -29,8 +29,6 @@ DEFAULT_SETTINGS = {
     "aiResumeAnalysis": True,
     "aiQuestionGeneration": True,
     "aiInterviewScoring": True,
-    "autoTrainKnowledge": False,
-    "autoTrainSchedule": "0 2 * * 0",
     "recallThreshold": 0.75,
     "notifyNewResume": True,
     "notifyInterviewReminder": True,

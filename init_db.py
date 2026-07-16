@@ -13,7 +13,7 @@ async def main():
     from app.models.interview import InterviewQuestion, InterviewEvaluation, InterviewTranscript
     from app.models.probation import Employee, ProbationTask
     from app.models.performance import PerformanceRecord, PerformanceQuarter
-    from app.models.knowledge import KnowledgeCategory, KnowledgeItem, KnowledgeTrainingJob
+    from app.models.knowledge import KnowledgeCategory, KnowledgeItem
     from app.models.agent import AgentSession, AgentMessage, AgentMaterial, AgentTask
     from app.models.settings import SystemSetting
 

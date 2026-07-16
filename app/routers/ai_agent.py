@@ -326,6 +326,26 @@ async def create_session(
     }
 
 
+@router.delete("/ai-agent/sessions/{session_id}")
+async def delete_session(
+    session_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    result = await db.execute(
+        select(AgentSession).where(
+            AgentSession.id == session_id,
+            AgentSession.user_id == current_user.id,
+        )
+    )
+    session = result.scalar_one_or_none()
+    if not session:
+        return {"code": 404, "message": "对话不存在", "data": None}
+
+    await db.delete(session)
+    return {"code": 0, "message": "ok", "data": None}
+
+
 @router.get("/ai-agent/sessions/{session_id}/messages")
 async def get_session_messages(
     session_id: str,

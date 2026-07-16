@@ -29,6 +29,11 @@ settings = get_settings()
 logger = logging.getLogger(__name__)
 
 UNKNOWN = "未知"
+IN_SCHOOL = "在校中"
+DEFAULT_ETHNICITY = "汉族"
+NO_WORK_EXPERIENCE_VALUES = {
+    UNKNOWN, "应届", "无", "暂无", "无工作经验", "0", "0年",
+}
 
 os.makedirs(settings.upload_dir, exist_ok=True)
 
@@ -204,13 +209,29 @@ def infer_native_place_from_text(text: str) -> Optional[str]:
     return None
 
 
-def normalize_experience(value) -> str:
+def normalize_ethnicity(value) -> str:
     text = normalize_text_field(value, default="")
-    if not text:
-        return UNKNOWN
-    if text in ("0", "0年", "无", "暂无", "无工作经验"):
-        return "应届"
+    if not text or text == UNKNOWN:
+        return DEFAULT_ETHNICITY
     return text
+
+
+def normalize_experience(value, *, has_work_history: bool = False) -> str:
+    text = normalize_text_field(value, default="")
+    if has_work_history:
+        return text if text else UNKNOWN
+    if not text or text in NO_WORK_EXPERIENCE_VALUES:
+        return IN_SCHOOL
+    return text
+
+
+def format_experience_display(experience, work_experiences) -> str:
+    text = (experience or "").strip()
+    if work_experiences:
+        return display_text(text)
+    if not text or text in NO_WORK_EXPERIENCE_VALUES:
+        return IN_SCHOOL
+    return display_text(text)
 
 
 def enrich_parsed_fields(parsed: dict, raw_text: str) -> dict:
@@ -226,10 +247,13 @@ def enrich_parsed_fields(parsed: dict, raw_text: str) -> dict:
     result["age"] = resolve_age(result, raw_text)
 
     result["education"] = normalize_text_field(result.get("education"))
-    result["experience"] = normalize_experience(result.get("experience"))
+    result["experience"] = normalize_experience(
+        result.get("experience"),
+        has_work_history=bool(result.get("workHistory")),
+    )
     result["phone"] = normalize_text_field(result.get("phone"))
     result["email"] = normalize_text_field(result.get("email"))
-    result["ethnicity"] = normalize_text_field(result.get("ethnicity"))
+    result["ethnicity"] = normalize_ethnicity(result.get("ethnicity"))
 
     native_place = normalize_text_field(result.get("nativePlace"), default="")
     if not native_place:
@@ -268,10 +292,10 @@ async def parse_resume_with_llm(text: str, position_name: str = "") -> Tuple[dic
     "age": null,
     "birthDate": "出生日期，格式如2003-12-12，无则null",
     "education": "最高学历：大专/本科/硕士/博士/其他/未知",
-    "experience": "工作年限，如7年；应届生填应届；未知填未知",
+    "experience": "工作年限，如7年；无工作经历填在校中",
     "phone": "手机号，未知填未知",
     "email": "邮箱，未知填未知",
-    "ethnicity": "民族，未知填未知",
+    "ethnicity": "民族，简历未提及则填汉族",
     "nativePlace": "籍贯或现居地，未知填未知",
     "skills": ["技能1", "技能2"],
     "educationHistory": [{{"school": "学校", "degree": "学位", "major": "专业", "period": "时间段"}}],
@@ -369,7 +393,7 @@ def serialize_candidate(c: Candidate) -> dict:
         "gender": gender,
         "age": c.age if c.age and c.age > 0 else None,
         "education": display_text(c.education),
-        "experience": display_text(c.experience),
+        "experience": format_experience_display(c.experience, c.work_experiences),
         "position": c.position.name if c.position else UNKNOWN,
         "positionId": str(c.position_id) if c.position_id else "",
         "score": c.score or 0,
@@ -377,7 +401,7 @@ def serialize_candidate(c: Candidate) -> dict:
         "uploadTime": c.upload_time.isoformat() if c.upload_time else "",
         "phone": display_text(c.phone),
         "email": display_text(c.email),
-        "ethnicity": display_text(c.ethnicity),
+        "ethnicity": normalize_ethnicity(c.ethnicity),
         "nativePlace": display_text(c.native_place),
         "skills": [s.skill for s in (c.skills or [])],
         "workHistory": [
@@ -448,10 +472,9 @@ async def fill_candidate_from_parsed(candidate: Candidate, parsed: dict, db: Asy
     candidate.age = parsed.get("age") if isinstance(parsed.get("age"), int) and parsed.get("age") > 0 else None
 
     candidate.education = normalize_text_field(parsed.get("education"))
-    candidate.experience = normalize_experience(parsed.get("experience"))
     candidate.phone = normalize_text_field(parsed.get("phone"))
     candidate.email = normalize_text_field(parsed.get("email"))
-    candidate.ethnicity = normalize_text_field(parsed.get("ethnicity"))
+    candidate.ethnicity = normalize_ethnicity(parsed.get("ethnicity"))
     candidate.native_place = normalize_text_field(parsed.get("nativePlace"))
 
     for skill in list(candidate.skills):
@@ -475,6 +498,11 @@ async def fill_candidate_from_parsed(candidate: Candidate, parsed: dict, db: Asy
             company=work.get("company"), role=work.get("role"),
             period=work.get("period"), description=work.get("description"),
         ))
+
+    candidate.experience = normalize_experience(
+        parsed.get("experience"),
+        has_work_history=bool(candidate.work_experiences),
+    )
 
     for proj in list(candidate.project_experiences):
         await db.delete(proj)
@@ -541,7 +569,12 @@ async def list_resumes(
     if statuses:
         status_list = [s.strip() for s in statuses.split(",") if s.strip()]
         if status_list:
-            query = query.where(Candidate.status.in_(status_list))
+            expanded: list[str] = []
+            for status in status_list:
+                expanded.append(status)
+                if status == "passed":
+                    expanded.extend(["pending_interview"])
+            query = query.where(Candidate.status.in_(expanded))
 
     # Keyword search
     if keyword:
@@ -742,6 +775,9 @@ async def update_resume(
     for field in ["name", "gender", "age", "education", "experience", "status", "phone", "email", "ethnicity"]:
         if field in body:
             setattr(candidate, field, body[field])
+
+    if "ethnicity" in body:
+        candidate.ethnicity = normalize_ethnicity(candidate.ethnicity)
 
     if "nativePlace" in body:
         candidate.native_place = body["nativePlace"]

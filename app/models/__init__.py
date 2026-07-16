@@ -9,7 +9,7 @@ from app.models.interview import (
 from app.models.probation import Employee, ProbationTask
 from app.models.performance import PerformanceRecord, PerformanceQuarter
 from app.models.knowledge import (
-    KnowledgeCategory, KnowledgeItem, KnowledgeTrainingJob
+    KnowledgeCategory, KnowledgeItem
 )
 from app.models.agent import (
     AgentSession, AgentMessage, AgentMaterial, AgentTask
@@ -23,7 +23,7 @@ __all__ = [
     "InterviewQuestion", "InterviewEvaluation", "InterviewTranscript",
     "Employee", "ProbationTask",
     "PerformanceRecord", "PerformanceQuarter",
-    "KnowledgeCategory", "KnowledgeItem", "KnowledgeTrainingJob",
+    "KnowledgeCategory", "KnowledgeItem",
     "AgentSession", "AgentMessage", "AgentMaterial", "AgentTask",
     "SystemSetting",
 ]

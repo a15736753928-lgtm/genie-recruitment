@@ -4,7 +4,7 @@ import uuid
 from typing import Optional, List
 from fastapi import APIRouter, Depends, File, Form, Query, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, and_, case
+from sqlalchemy import select, func, and_, case, or_
 from sqlalchemy.orm import selectinload
 from pydantic import BaseModel
 from openai import OpenAI
@@ -25,6 +25,8 @@ llm_client = OpenAI(
 )
 
 os.makedirs(settings.upload_dir, exist_ok=True)
+
+INTERVIEW_ELIGIBLE_STATUSES = {"passed", "first_interview", "second_interview", "pending_interview"}
 
 
 # ── Helpers ─────────────────────────────────────────────
@@ -123,6 +125,13 @@ def extract_text(file_path: str) -> str:
 
 async def get_or_generate_questions(candidate_id: str, round: str, db: AsyncSession) -> List[InterviewQuestion]:
     """Get existing questions or auto-generate them."""
+    cand_result = await db.execute(
+        select(Candidate).options(selectinload(Candidate.position)).where(Candidate.id == candidate_id)
+    )
+    candidate = cand_result.scalar_one_or_none()
+    if not candidate or candidate.status not in INTERVIEW_ELIGIBLE_STATUSES:
+        return []
+
     result = await db.execute(
         select(InterviewQuestion)
         .where(and_(
@@ -136,13 +145,6 @@ async def get_or_generate_questions(candidate_id: str, round: str, db: AsyncSess
         return list(questions)
 
     # Auto-generate
-    cand_result = await db.execute(
-        select(Candidate).options(selectinload(Candidate.position)).where(Candidate.id == candidate_id)
-    )
-    candidate = cand_result.scalar_one_or_none()
-    if not candidate:
-        return []
-
     count = await get_setting(db, "defaultQuestionCount", 8)
     rag_text = ""
     if candidate.resume_file:
@@ -363,12 +365,17 @@ async def get_leaderboard(
 ):
     """Get evaluation leaderboard by category (first_result | second_result)."""
     status_map = {
-        "first_result": "pending_interview",
+        "first_result": "passed",
         "second_result": "second_interview",
     }
     candidate_status = status_map.get(category)
     if not candidate_status:
         return {"code": 400, "message": "无效的排行榜类型", "data": []}
+
+    if category == "first_result":
+        status_filter = Candidate.status.in_(["passed", "pending_interview"])
+    else:
+        status_filter = Candidate.status == candidate_status
 
     # Get candidates with the right status
     result = await db.execute(
@@ -377,7 +384,7 @@ async def get_leaderboard(
             selectinload(Candidate.position),
             selectinload(Candidate.evaluations),
         )
-        .where(Candidate.status == candidate_status)
+        .where(status_filter)
     )
     candidates = result.scalars().all()
 
@@ -732,7 +739,7 @@ async def get_rankings(
             "candidateId": str(c.id),
             "name": c.name,
             "score": c.score or 0,
-            "status": "done" if c.status in ("second_interview", "probation", "onboarded") else "pending",
+            "status": "done" if c.status in ("second_interview", "passed", "probation", "onboarded") else "pending",
             "isCurrent": str(c.id) == candidateId,
         })
 

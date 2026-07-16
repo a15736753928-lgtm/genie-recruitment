@@ -17,7 +17,7 @@ async def get_overview(db: AsyncSession = Depends(get_db)):
     total_positions = (await db.execute(select(func.count()).select_from(Position))).scalar() or 0
     total_interviews = (await db.execute(
         select(func.count()).select_from(Candidate).where(
-            Candidate.status.in_(["pending_interview", "first_interview", "second_interview"])
+            Candidate.status.in_(["passed", "first_interview", "second_interview"])
         )
     )).scalar() or 0
     total_employees = (await db.execute(select(func.count()).select_from(Employee))).scalar() or 0
@@ -54,18 +54,22 @@ async def get_operations(db: AsyncSession = Depends(get_db)):
     job_hunting = (await db.execute(
         select(func.count()).select_from(Candidate).where(Candidate.status == "job_hunting")
     )).scalar() or 0
-    pending = (await db.execute(
-        select(func.count()).select_from(Candidate).where(Candidate.status == "pending_interview")
+    passed_count = (await db.execute(
+        select(func.count()).select_from(Candidate).where(Candidate.status == "passed")
+    )).scalar() or 0
+    first_interview = (await db.execute(
+        select(func.count()).select_from(Candidate).where(Candidate.status == "first_interview")
     )).scalar() or 0
     second = (await db.execute(
         select(func.count()).select_from(Candidate).where(Candidate.status == "second_interview")
     )).scalar() or 0
-    probation_count = (await db.execute(
-        select(func.count()).select_from(Candidate).where(Candidate.status == "probation")
+    # 兼容历史状态
+    legacy_passed = (await db.execute(
+        select(func.count()).select_from(Candidate).where(
+            Candidate.status.in_(["pending_interview", "probation", "onboarded"])
+        )
     )).scalar() or 0
-    onboarded = (await db.execute(
-        select(func.count()).select_from(Candidate).where(Candidate.status == "onboarded")
-    )).scalar() or 0
+    passed = passed_count + legacy_passed
     failed = (await db.execute(
         select(func.count()).select_from(Candidate).where(Candidate.status == "failed")
     )).scalar() or 0
@@ -82,15 +86,15 @@ async def get_operations(db: AsyncSession = Depends(get_db)):
                 "text": f"当前系统共有 {total_resumes} 份简历，{total_employees} 名在职员工。候选人平均匹配度 {avg_score} 分。",
                 "stats": [
                     {"label": "候选人总数", "value": str(total_resumes), "meta": "累计入库", "tone": "blue"},
-                    {"label": "待面试", "value": str(pending), "meta": "一面待安排", "tone": "amber"},
+                    {"label": "已通过", "value": str(passed), "meta": "初筛通过", "tone": "green"},
+                    {"label": "一面中", "value": str(first_interview), "meta": "面试进行中", "tone": "blue"},
                     {"label": "二面中", "value": str(second), "meta": "深度评估", "tone": "purple"},
-                    {"label": "已入职", "value": str(onboarded), "meta": "招聘闭环", "tone": "blue"},
                 ],
             },
             "metrics": [
                 {"label": "简历总量", "value": str(total_resumes), "meta": "份", "tone": "blue"},
                 {"label": "平均匹配度", "value": str(avg_score), "meta": "/100", "tone": "purple"},
-                {"label": "试用期员工", "value": str(probation_count), "meta": "人", "tone": "amber"},
+                {"label": "已通过", "value": str(passed), "meta": "人", "tone": "green"},
                 {"label": "未通过", "value": str(failed), "meta": "人", "tone": "red"},
             ],
             "risks": [
@@ -104,15 +108,14 @@ async def get_operations(db: AsyncSession = Depends(get_db)):
             ] if job_hunting > 10 else [],
             "funnel": [
                 {"name": "求职中", "value": job_hunting, "ratio": round(job_hunting / max(total_resumes, 1) * 100)},
-                {"name": "待面试", "value": pending, "ratio": round(pending / max(total_resumes, 1) * 100)},
+                {"name": "已通过", "value": passed, "ratio": round(passed / max(total_resumes, 1) * 100)},
+                {"name": "一面中", "value": first_interview, "ratio": round(first_interview / max(total_resumes, 1) * 100)},
                 {"name": "二面中", "value": second, "ratio": round(second / max(total_resumes, 1) * 100)},
-                {"name": "试用期", "value": probation_count, "ratio": round(probation_count / max(total_resumes, 1) * 100)},
-                {"name": "已入职", "value": onboarded, "ratio": round(onboarded / max(total_resumes, 1) * 100)},
             ],
             "insights": [
                 {
                     "title": "招聘漏斗分析",
-                    "reason": f"从求职到入职的转化率为 {round(onboarded / max(total_resumes, 1) * 100)}%",
+                    "reason": f"从求职到通过的转化率为 {round(passed / max(total_resumes, 1) * 100)}%",
                     "advice": "关注各阶段流失率，优化面试流程",
                     "actions": ["查看详细漏斗", "优化筛选策略"],
                 },

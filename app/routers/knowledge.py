@@ -10,7 +10,7 @@ from sqlalchemy.orm import selectinload
 from pydantic import BaseModel
 from openai import OpenAI
 from app.database import get_db
-from app.models.knowledge import KnowledgeCategory, KnowledgeItem, KnowledgeTrainingJob
+from app.models.knowledge import KnowledgeCategory, KnowledgeItem
 from app.models.user import User
 from app.routers.auth import get_current_user
 from app.config import get_settings
@@ -227,28 +227,12 @@ async def get_knowledge_stats(db: AsyncSession = Depends(get_db)):
     )
     new_count = new_result.scalar() or 0
 
-    # Last training job
-    job_result = await db.execute(
-        select(KnowledgeTrainingJob)
-        .order_by(KnowledgeTrainingJob.finished_at.desc().nullslast())
-        .limit(1)
-    )
-    last_job = job_result.scalar_one_or_none()
-
-    trained_result = await db.execute(
-        select(func.count()).select_from(KnowledgeItem)
-        .where(KnowledgeItem.training_status == "trained")
-    )
-    trained_count = trained_result.scalar() or 0
-
     return {
         "code": 0,
         "message": "ok",
         "data": {
             "total": total,
             "newThisMonth": new_count,
-            "trainingStatus": "已完成" if (trained_count >= total and total > 0) else "待训练",
-            "lastTrainedAt": last_job.finished_at.strftime("%Y-%m-%d %H:%M") if last_job and last_job.finished_at else "",
         },
     }
 
@@ -270,7 +254,6 @@ async def get_categories(db: AsyncSession = Depends(get_db)):
 async def list_knowledge(
     categoryKey: str = Query("all"),
     keyword: str = Query(""),
-    trainingStatus: str = Query("all"),
     sortBy: str = Query("updateTime"),
     page: int = Query(1),
     pageSize: int = Query(10),
@@ -280,8 +263,6 @@ async def list_knowledge(
 
     if categoryKey and categoryKey != "all":
         query = query.where(KnowledgeItem.category_key == categoryKey)
-    if trainingStatus and trainingStatus != "all":
-        query = query.where(KnowledgeItem.training_status == trainingStatus)
     if keyword:
         query = query.where(KnowledgeItem.name.ilike(f"%{keyword}%"))
 
@@ -308,7 +289,6 @@ async def list_knowledge(
                     "type": item.type,
                     "recallCount": item.recall_count or 0,
                     "updateTime": item.updated_at.strftime("%Y-%m-%d %H:%M") if item.updated_at else "",
-                    "trainingStatus": item.training_status or "pending",
                     "content": item.content,
                 }
                 for item in items
@@ -362,10 +342,18 @@ async def create_knowledge_item(
         type=body.get("type", "interview"),
         file_path=file_path,
         content=content_text,
-        training_status="pending",
     )
     db.add(item)
     await db.flush()
+
+    if content_text:
+        item.milvus_ids = store_in_milvus(
+            str(item.id),
+            item.category_key or "",
+            item.type or "interview",
+            content_text,
+        )
+
     await db.refresh(item)
 
     return {
@@ -379,7 +367,6 @@ async def create_knowledge_item(
             "type": item.type,
             "recallCount": item.recall_count or 0,
             "updateTime": item.updated_at.strftime("%Y-%m-%d %H:%M") if item.updated_at else "",
-            "trainingStatus": item.training_status or "pending",
         },
     }
 
@@ -416,7 +403,6 @@ async def update_knowledge_item(
             "type": item.type,
             "recallCount": item.recall_count or 0,
             "updateTime": item.updated_at.strftime("%Y-%m-%d %H:%M") if item.updated_at else "",
-            "trainingStatus": item.training_status or "pending",
         },
     }
 
@@ -468,45 +454,3 @@ async def recall_test(body: dict, db: AsyncSession = Depends(get_db)):
                 item.recall_count = (item.recall_count or 0) + 1
 
     return {"code": 0, "message": "ok", "data": results}
-
-
-@router.post("/knowledge/train")
-async def train_knowledge(
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    """Trigger training job — embeds all untrained items into Milvus."""
-    # Create training job
-    job = KnowledgeTrainingJob(status="running", started_at=datetime.utcnow())
-    db.add(job)
-    await db.flush()
-
-    # Get items to train
-    result = await db.execute(
-        select(KnowledgeItem).where(KnowledgeItem.training_status != "trained")
-    )
-    items = result.scalars().all()
-
-    total_chunks = 0
-    for item in items:
-        content = item.content
-        if not content and item.file_path and os.path.exists(item.file_path):
-            content = extract_file_text(item.file_path)
-
-        if content:
-            milvus_ids = store_in_milvus(
-                str(item.id),
-                item.category_key or "",
-                item.type or "interview",
-                content,
-            )
-            item.milvus_ids = milvus_ids
-            item.training_status = "trained"
-            total_chunks += len(milvus_ids)
-
-    job.total_chunks = total_chunks
-    job.status = "completed"
-    job.finished_at = datetime.utcnow()
-    await db.flush()
-
-    return {"code": 0, "message": "ok", "data": None}

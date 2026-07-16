@@ -51,7 +51,7 @@ TOOL_REGISTRY = {
             "type": "object",
             "properties": {
                 "id": {"type": "string", "description": "候选人ID"},
-                "status": {"type": "string", "description": "新状态：job_hunting/pending_interview/..."},
+                "status": {"type": "string", "description": "新状态：job_hunting/passed/first_interview/..."},
                 "fields": {"type": "object", "description": "要更新的字段"},
             },
             "required": ["id"],
