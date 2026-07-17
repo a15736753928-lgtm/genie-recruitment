@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from sqlalchemy.orm import selectinload
 from pydantic import BaseModel
-from openai import OpenAI
+from openai import AsyncOpenAI
 from app.database import get_db
 from app.models.probation import (
     Employee, ProbationTask, ProbationWeek1Assessment, ProbationConversion
@@ -19,7 +19,7 @@ from app.config import get_settings
 router = APIRouter(tags=["试用期"])
 settings = get_settings()
 
-llm_client = OpenAI(
+llm_client = AsyncOpenAI(
     api_key=settings.deepseek_api_key,
     base_url=settings.deepseek_base_url,
 )
@@ -481,7 +481,7 @@ async def ai_evaluate_probation(employee_id: str, db: AsyncSession = Depends(get
 只返回JSON。"""
 
     try:
-        response = llm_client.chat.completions.create(
+        response = await llm_client.chat.completions.acreate(
             model=settings.deepseek_model,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3,

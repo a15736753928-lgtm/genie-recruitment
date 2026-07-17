@@ -10,6 +10,7 @@ engine = create_async_engine(
     pool_size=20,
     max_overflow=10,
     pool_pre_ping=True,
+    pool_timeout=10,       # fail fast when pool is exhausted (vs. hang forever)
 )
 
 async_session_factory = async_sessionmaker(
@@ -47,6 +48,7 @@ _sync_engine = _create_sync_engine(
     pool_size=5,
     max_overflow=5,
     pool_pre_ping=True,
+    pool_timeout=10,
 )
 
 SyncSessionFactory = _sync_sessionmaker(

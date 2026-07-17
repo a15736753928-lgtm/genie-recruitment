@@ -1,6 +1,7 @@
 import os
 import uuid
 import json
+import asyncio
 from typing import Optional, List
 from datetime import datetime
 from fastapi import APIRouter, Depends, File, Form, Query, UploadFile
@@ -347,7 +348,8 @@ async def create_knowledge_item(
     await db.flush()
 
     if content_text:
-        item.milvus_ids = store_in_milvus(
+        item.milvus_ids = await asyncio.to_thread(
+            store_in_milvus,
             str(item.id),
             item.category_key or "",
             item.type or "interview",
@@ -439,7 +441,7 @@ async def recall_test(body: dict, db: AsyncSession = Depends(get_db)):
         return {"code": 400, "message": "请提供查询文本", "data": []}
 
     # Search Milvus
-    results = search_milvus(query, top_k=5)
+    results = await asyncio.to_thread(search_milvus, query, 5)
 
     # Enrich with source names
     for r in results:

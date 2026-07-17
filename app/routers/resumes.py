@@ -4,6 +4,7 @@ import json
 import shutil
 import logging
 import re
+import asyncio
 from datetime import date
 from typing import Optional, List, Tuple
 from fastapi import APIRouter, Depends, File, Form, UploadFile, Query
@@ -12,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, or_, func, desc, asc
 from sqlalchemy.orm import selectinload
 from pydantic import BaseModel
-from openai import OpenAI
+from openai import AsyncOpenAI
 from app.database import get_db
 from app.models.candidate import (
     Candidate, Position, CandidateSkill, CandidateEducation,
@@ -38,7 +39,7 @@ NO_WORK_EXPERIENCE_VALUES = {
 os.makedirs(settings.upload_dir, exist_ok=True)
 
 # ── LLM Client ──────────────────────────────────────────
-llm_client = OpenAI(
+llm_client = AsyncOpenAI(
     api_key=settings.deepseek_api_key,
     base_url=settings.deepseek_base_url,
 )
@@ -272,7 +273,10 @@ def augment_gender_from_portrait(parsed: dict, resume_file: str) -> dict:
     if not resolved:
         return parsed
 
-    portrait_gender = infer_gender_from_resume_file(resolved, client=llm_client)
+    # Pass client=None so infer_gender_from_vision creates its own sync
+    # OpenAI client (the async llm_client in this module is not usable
+    # from sync code).
+    portrait_gender = infer_gender_from_resume_file(resolved, client=None)
     if portrait_gender in ("男", "女"):
         parsed["gender"] = portrait_gender
     return parsed
@@ -318,7 +322,7 @@ async def parse_resume_with_llm(text: str, position_name: str = "") -> Tuple[dic
 
 注意：age字段不要自行填写，留null即可；若识别到出生日期请填入birthDate，系统会自动计算年龄。"""
     try:
-        response = llm_client.chat.completions.create(
+        response = await llm_client.chat.completions.acreate(
             model=settings.deepseek_model,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3,
@@ -456,7 +460,7 @@ async def run_resume_parse(candidate: Candidate, position_name: str = "", db: As
         return "AI 未能解析简历内容"
 
     parsed = enrich_parsed_fields(parsed, text)
-    parsed = augment_gender_from_portrait(parsed, candidate.resume_file or "")
+    parsed = await asyncio.to_thread(augment_gender_from_portrait, parsed, candidate.resume_file or "")
 
     if db is None:
         return "内部错误：缺少数据库会话"

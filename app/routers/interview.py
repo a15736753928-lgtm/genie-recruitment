@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, and_, case, or_
 from sqlalchemy.orm import selectinload
 from pydantic import BaseModel
-from openai import OpenAI
+from openai import AsyncOpenAI
 from app.database import get_db
 from app.models.candidate import Candidate, Position
 from app.models.interview import InterviewQuestion, InterviewEvaluation, InterviewTranscript
@@ -19,7 +19,7 @@ from app.config import get_settings
 router = APIRouter(tags=["面试"])
 settings = get_settings()
 
-llm_client = OpenAI(
+llm_client = AsyncOpenAI(
     api_key=settings.deepseek_api_key,
     base_url=settings.deepseek_base_url,
 )
@@ -86,7 +86,7 @@ async def generate_questions_with_llm(
 请返回纯JSON对象：{{"category": "...", "difficulty": "...", "content": "..."}}"""
 
     try:
-        response = llm_client.chat.completions.create(
+        response = await llm_client.chat.completions.acreate(
             model=settings.deepseek_model,
             messages=[{"role": "system", "content": system_prompt}],
             temperature=0.7,
@@ -666,7 +666,7 @@ async def ai_score_question(
 返回格式：{{"score": 总分, "dimensions": [{{"name": "维度名", "score": 分数}}]}}
 只返回JSON。"""
 
-        response = llm_client.chat.completions.create(
+        response = await llm_client.chat.completions.acreate(
             model=settings.deepseek_model,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3,

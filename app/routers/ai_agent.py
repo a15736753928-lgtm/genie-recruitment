@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc
 from sqlalchemy.orm import selectinload
 from pydantic import BaseModel
-from openai import OpenAI
+from openai import AsyncOpenAI
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from app.database import get_db
 from app.models.user import User
@@ -24,7 +24,7 @@ import os
 router = APIRouter(tags=["AI Agent"])
 settings = get_settings()
 
-llm_client = OpenAI(
+llm_client = AsyncOpenAI(
     api_key=settings.deepseek_api_key,
     base_url=settings.deepseek_base_url,
 )
@@ -559,6 +559,7 @@ async def agent_chat(
     async def event_stream() -> AsyncGenerator[str, None]:
         result = AgentResult()
         full_thinking = ""
+        task = None
 
         try:
             # Send initial thinking
@@ -603,7 +604,15 @@ async def agent_chat(
             lc_messages.append(HumanMessage(content=message + material_context))
 
             # ── Stream agent execution ──
+            # If the client disconnects, Starlette cancels this generator
+            # (now that the event loop is no longer blocked by sync LLM calls),
+            # which raises asyncio.CancelledError — handled by the finally
+            # block below so the socket is closed cleanly instead of leaking
+            # in CLOSE_WAIT.
             async for sse_str in stream_agent_response(graph, lc_messages, result):
+                # Stop early if the client has closed the connection.
+                if await request.is_disconnected():
+                    break
                 yield sse_str
 
             # ── Save assistant message ──
@@ -621,7 +630,7 @@ async def agent_chat(
             if is_new_session or session.title == "新对话":
                 try:
                     title_prompt = f"根据以下对话内容，生成一个简短的标题（10个字以内，不要引号）：\n用户：{message[:200]}\nAI：{result.full_content[:200]}"
-                    title_resp = llm_client.chat.completions.create(
+                    title_resp = await llm_client.chat.completions.acreate(
                         model=settings.deepseek_model,
                         messages=[{"role": "user", "content": title_prompt}],
                         temperature=0.7,
@@ -649,8 +658,27 @@ async def agent_chat(
 
             yield sse_event("done", {})
 
+        except asyncio.CancelledError:
+            # Client disconnected — mark the task as cancelled so it does not
+            # stay "running" forever, then re-raise so Starlette closes the
+            # stream and the socket is released (prevents CLOSE_WAIT leak).
+            try:
+                if task is not None:
+                    task.status = "cancelled"
+                    task.finished_at = datetime.utcnow()
+                await db.commit()
+            except Exception:
+                await db.rollback()
+            raise
         except Exception as e:
             yield sse_event("error", {"message": str(e)})
+        finally:
+            # Always commit any pending writes (assistant message, task, etc.)
+            # so the DB session is returned to the pool.
+            try:
+                await db.commit()
+            except Exception:
+                await db.rollback()
 
     return StreamingResponse(
         event_stream(),

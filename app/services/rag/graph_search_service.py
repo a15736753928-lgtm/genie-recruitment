@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 import logging
 from typing import Optional
-from openai import OpenAI
+from openai import AsyncOpenAI
 from app.config import get_settings
 from app.database import async_session_factory
 from app.models.knowledge import GraphCommunity
@@ -30,7 +30,7 @@ from sqlalchemy import select
 settings = get_settings()
 logger = logging.getLogger(__name__)
 
-llm_client = OpenAI(
+llm_client = AsyncOpenAI(
     api_key=settings.deepseek_api_key,
     base_url=settings.deepseek_base_url,
 )
@@ -47,7 +47,7 @@ _ENTITY_EXTRACT_SYSTEM = """你是一个查询分析专家。从用户问题中�
 async def _extract_entities_from_query(query: str) -> list[str]:
     """Use LLM to extract key entities from a search query."""
     try:
-        response = llm_client.chat.completions.create(
+        response = await llm_client.chat.completions.acreate(
             model=settings.deepseek_model,
             messages=[
                 {"role": "system", "content": _ENTITY_EXTRACT_SYSTEM},

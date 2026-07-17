@@ -73,11 +73,15 @@ def build_agent_graph(
     llm = _create_llm()
     llm_with_tools = llm.bind_tools(tools)
 
-    def call_model(state: AgentState) -> dict:
+    async def call_model(state: AgentState) -> dict:
         messages = list(state["messages"])
         if not messages or not isinstance(messages[0], SystemMessage):
             messages = [SystemMessage(content=system_prompt)] + messages
-        response = llm_with_tools.invoke(messages)
+        # Must use ainvoke (not invoke) so the event loop is not blocked
+        # while waiting for the LLM. A synchronous invoke here freezes
+        # the entire async server, which is why the frontend stops
+        # receiving data while any AI task is running.
+        response = await llm_with_tools.ainvoke(messages)
         return {"messages": [response]}
 
     def should_continue(state: AgentState) -> str:
