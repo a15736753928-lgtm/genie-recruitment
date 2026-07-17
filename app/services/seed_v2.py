@@ -721,8 +721,11 @@ QUESTION_BANKS = {
 }
 
 
-async def seed_positions_v2():
-    """Seed all 6 positions with full data from the handbook."""
+async def seed_positions_v2(create_missing: bool = True):
+    """Seed handbook positions.
+
+    create_missing=False 时只更新仍存在的岗位，不会把用户已删除的岗位再插回库。
+    """
     async with async_session_factory() as db:
         for pos_data in POSITIONS_DATA:
             result = await db.execute(
@@ -743,8 +746,8 @@ async def seed_positions_v2():
                 existing.conversion_criteria = CONVERSION_CRITERIA_COMMON
                 position = existing
                 print(f"Updated: {pos_data['name']}")
-            else:
-                # Create new position
+            elif create_missing:
+                # Create new position (first install only)
                 position = Position(
                     name=pos_data["name"],
                     **{k: v for k, v in pos_data.items() if k != "name"},
@@ -757,6 +760,9 @@ async def seed_positions_v2():
                 await db.flush()
                 await db.refresh(position)
                 print(f"Created: {pos_data['name']}")
+            else:
+                print(f"Skipped (not recreating deleted): {pos_data['name']}")
+                continue
 
             # ── Seed question banks ──
             qb = QUESTION_BANKS.get(pos_data["name"], {})

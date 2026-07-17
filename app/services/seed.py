@@ -1,7 +1,7 @@
 """Seed database with root user, default categories, and default settings."""
 import uuid
 from datetime import date
-from sqlalchemy import select
+from sqlalchemy import select, func
 from app.database import async_session_factory, Base, engine
 from app.models.user import User
 from app.models.candidate import Position
@@ -10,6 +10,28 @@ from app.models.settings import SystemSetting
 from passlib.context import CryptContext
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+# 标记岗位已完成首次初始化；之后启动不再按名称重建用户已删除的岗位
+POSITIONS_SEEDED_KEY = "positions_seeded"
+
+
+async def _should_create_seed_positions(db) -> bool:
+    """仅在空库首次安装时创建种子岗位；已有数据或已标记则不再补建。"""
+    flag = await db.execute(
+        select(SystemSetting).where(SystemSetting.key == POSITIONS_SEEDED_KEY)
+    )
+    if flag.scalar_one_or_none():
+        return False
+    count_result = await db.execute(select(func.count()).select_from(Position))
+    return (count_result.scalar() or 0) == 0
+
+
+async def _ensure_positions_seeded_flag(db) -> None:
+    existing = await db.execute(
+        select(SystemSetting).where(SystemSetting.key == POSITIONS_SEEDED_KEY)
+    )
+    if existing.scalar_one_or_none() is None:
+        db.add(SystemSetting(key=POSITIONS_SEEDED_KEY, value={"done": True}))
 
 DEFAULT_SETTINGS = {
     "systemName": "Genie 智能招聘系统",
@@ -68,7 +90,11 @@ DEFAULT_POSITIONS = [
 async def seed_all():
     # Also seed V2 positions from the handbook
     from app.services.seed_v2 import seed_positions_v2
-    await seed_positions_v2()
+
+    async with async_session_factory() as db:
+        create_missing_positions = await _should_create_seed_positions(db)
+
+    await seed_positions_v2(create_missing=create_missing_positions)
 
     async with async_session_factory() as db:
         # ── Root user ────────────────────────────────
@@ -94,15 +120,17 @@ async def seed_all():
             if not result.scalar_one_or_none():
                 db.add(KnowledgeCategory(**cat))
 
-        # ── Default positions ────────────────────────
-        for name in DEFAULT_POSITIONS:
-            result = await db.execute(select(Position).where(Position.name == name))
-            if not result.scalar_one_or_none():
-                db.add(Position(name=name))
+        # ── Default positions（仅首次空库创建，避免删掉后又被启动脚本写回）──
+        if create_missing_positions:
+            for name in DEFAULT_POSITIONS:
+                result = await db.execute(select(Position).where(Position.name == name))
+                if not result.scalar_one_or_none():
+                    db.add(Position(name=name))
 
         # ── Default settings ─────────────────────────
         result = await db.execute(select(SystemSetting).where(SystemSetting.key == "global"))
         if not result.scalar_one_or_none():
             db.add(SystemSetting(key="global", value=DEFAULT_SETTINGS))
 
+        await _ensure_positions_seeded_flag(db)
         await db.commit()

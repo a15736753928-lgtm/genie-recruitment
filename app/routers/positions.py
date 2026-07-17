@@ -134,6 +134,8 @@ async def delete_position(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    from sqlalchemy import text
+
     result = await db.execute(select(Position).where(Position.id == position_id))
     position = result.scalar_one_or_none()
     if not position:
@@ -143,9 +145,20 @@ async def delete_position(
         select(Candidate).where(Candidate.position_id == position_id).limit(1)
     )
     if candidate_result.scalar_one_or_none():
-        return {"code": 409, "message": "该岗位下有关联候选人，无法删除", "data": None}
+        return {"code": 409, "message": "该岗位下有关联候选人，请先删除或转移相关简历后再删除岗位", "data": None}
+
+    # talent_pool / employees 外键是 NO ACTION，先解除引用再删岗位
+    await db.execute(
+        text("UPDATE talent_pool SET position_id = NULL WHERE position_id = :pid"),
+        {"pid": position_id},
+    )
+    await db.execute(
+        text("UPDATE employees SET position_id = NULL WHERE position_id = :pid"),
+        {"pid": position_id},
+    )
 
     await db.delete(position)
+    await db.flush()
     return {"code": 0, "message": "ok", "data": None}
 
 
