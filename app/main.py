@@ -11,9 +11,13 @@ settings = get_settings()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
-    # Seed root user and default data
-    from app.services.seed import seed_all
-    await seed_all()
+    # Seed root user and default data (non-fatal on error)
+    try:
+        from app.services.seed import seed_all
+        await seed_all()
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"Seed skipped (data may already exist): {e}")
     yield
 
 

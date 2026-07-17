@@ -66,6 +66,10 @@ DEFAULT_POSITIONS = [
 
 
 async def seed_all():
+    # Also seed V2 positions from the handbook
+    from app.services.seed_v2 import seed_positions_v2
+    await seed_positions_v2()
+
     async with async_session_factory() as db:
         # ── Root user ────────────────────────────────
         result = await db.execute(select(User).where(User.username == "admin"))

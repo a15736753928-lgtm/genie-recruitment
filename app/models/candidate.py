@@ -13,10 +13,42 @@ class Position(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     name = Column(String(128), unique=True, nullable=False)
-    jd_content = Column(Text)
+    chapter_number = Column(Integer, nullable=True)
+    department = Column(String(64), nullable=True)
+    jd_content = Column(Text, nullable=True)
+    jd_responsibilities = Column(Text, nullable=True)
+    jd_requirements = Column(Text, nullable=True)
+    jd_preferred = Column(Text, nullable=True)
+    jd_tech_stack = Column(Text, nullable=True)
+    screening_criteria = Column(JSON, nullable=True)
+    interview_criteria_r1 = Column(JSON, nullable=True)
+    interview_criteria_r2 = Column(JSON, nullable=True)
+    week1_project_requirement = Column(JSON, nullable=True)
+    weeks_2_4_plan = Column(JSON, nullable=True)
+    later_week_scoring = Column(JSON, nullable=True)
+    conversion_criteria = Column(JSON, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     candidates = relationship("Candidate", back_populates="position")
+    questions = relationship("PositionQuestion", back_populates="position", cascade="all, delete-orphan")
+    employees = relationship("Employee", back_populates="position")
+
+
+class PositionQuestion(Base):
+    __tablename__ = "position_questions"
+    __table_args__ = (UniqueConstraint("position_id", "round", "index_num"),)
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    position_id = Column(UUID(as_uuid=True), ForeignKey("positions.id", ondelete="CASCADE"), nullable=False)
+    round = Column(String(8), nullable=False)
+    index_num = Column(Integer, nullable=False)
+    content = Column(Text, nullable=False)
+    category = Column(String(64), nullable=True)
+    difficulty = Column(String(8), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    position = relationship("Position", back_populates="questions")
 
 
 class Candidate(Base):
@@ -37,6 +69,13 @@ class Candidate(Base):
     status = Column(String(32), nullable=False, default="job_hunting")
     resume_file = Column(String(512))
     upload_time = Column(Date, default=date.today)
+    # Screening dual-dimension fields
+    screening_ai_score = Column(Integer, nullable=True)
+    screening_manual_confirmed = Column(Boolean, default=False)
+    screening_confirmed_by = Column(String(64), nullable=True)
+    # Interview tracking
+    interviewer = Column(String(64), nullable=True)
+    interview_round = Column(String(8), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -116,3 +155,16 @@ class CandidateAIAnalysis(Base):
     analyzed_at = Column(DateTime, default=datetime.utcnow)
 
     candidate = relationship("Candidate", back_populates="ai_analysis")
+
+
+class TalentPool(Base):
+    __tablename__ = "talent_pool"
+    __table_args__ = (UniqueConstraint("candidate_id"),)
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    candidate_id = Column(UUID(as_uuid=True), ForeignKey("candidates.id", ondelete="CASCADE"), nullable=False)
+    position_id = Column(UUID(as_uuid=True), ForeignKey("positions.id"), nullable=True)
+    score = Column(Integer, nullable=True)
+    source_round = Column(String(8), nullable=True)
+    added_at = Column(DateTime, default=datetime.utcnow)
+    notes = Column(Text, nullable=True)
