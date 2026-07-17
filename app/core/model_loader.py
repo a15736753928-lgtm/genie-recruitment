@@ -18,6 +18,10 @@ import threading
 import numpy as np
 from typing import List
 
+import onnxruntime as ort
+from huggingface_hub import hf_hub_download
+from transformers import AutoTokenizer
+
 from app.config import get_settings
 
 settings = get_settings()
@@ -33,10 +37,6 @@ _lock = threading.Lock()
 def _load_onnx_model():
     """Download and load the ONNX INT8 quantized BGE-M3 model."""
     global _onnx_session, _tokenizer
-
-    import onnxruntime as ort
-    from huggingface_hub import hf_hub_download
-    from transformers import AutoTokenizer
 
     logger.info("加载 BGE-M3 tokenizer: %s", settings.embedding_model)
     _tokenizer = AutoTokenizer.from_pretrained(

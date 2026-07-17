@@ -185,7 +185,7 @@ async def check_kuzu_graph(settings: Settings) -> CheckResult:
     try:
         import kuzu
         with tempfile.TemporaryDirectory() as tmpdir:
-            db = kuzu.Database(tmpdir)
+            db = kuzu.Database(os.path.join(tmpdir, "health_check"))
             conn = kuzu.Connection(db)
             conn.execute(
                 "CREATE NODE TABLE IF NOT EXISTS _health_check("
@@ -351,6 +351,72 @@ async def check_database_url_format(settings: Settings) -> CheckResult:
 # Runner
 # ═══════════════════════════════════════════════════════════════════
 
+def _ensure_imports() -> None:
+    """Pre-import packages used by concurrent check threads.
+
+    Without this, ``asyncio.to_thread(…)`` calls in phase 2 can race on the
+    Python import lock and produce ``cannot import name 'AutoTokenizer' from
+    'transformers'`` (the module is only partially initialised in the losing
+    thread).
+    """
+    try:
+        __import__("transformers")
+    except Exception:
+        pass
+    try:
+        __import__("sentence_transformers")
+    except Exception:
+        pass
+    try:
+        __import__("onnxruntime")
+    except Exception:
+        pass
+
+
+# Per-category timeout (seconds). A check that exceeds this is reported as
+# timed out so a single stuck dependency can't block startup forever.
+_CHECK_TIMEOUTS = {
+    "critical": 15.0,   # DB — fail-fast, refuse to start
+    "optional": 60.0,   # RAG models — slow to load, warn and continue
+    "config": 10.0,     # config validation — warn and continue
+}
+
+
+async def _run_check(check_fn: CheckFn, settings: Settings, category: str) -> CheckResult:
+    """Run one check with progress logging + a per-category timeout.
+
+    Logs the check name *before* it runs, so a hang shows exactly which check
+    is stuck as the last ``▶`` line. On timeout, critical checks FAIL (refuse
+    startup); optional/config checks WARN (let the app start anyway).
+    """
+    name = check_fn.__name__
+    timeout = _CHECK_TIMEOUTS.get(category)
+    logger.info("▶ %s ...", name)
+    t0 = time.perf_counter()
+    try:
+        result = await asyncio.wait_for(check_fn(settings), timeout=timeout)
+        elapsed = (time.perf_counter() - t0) * 1000
+        if result.elapsed_ms == 0.0:
+            result.elapsed_ms = elapsed
+        logger.info("  %s %s — %s (%.0fms)",
+                    _STATUS_ICON[result.status], result.name,
+                    result.detail[:60], result.elapsed_ms)
+        return result
+    except asyncio.TimeoutError:
+        elapsed = (time.perf_counter() - t0) * 1000
+        status = CheckStatus.FAIL if category == "critical" else CheckStatus.WARN
+        detail = f"Timed out after {timeout:.0f}s"
+        logger.warning("  %s %s — %s (%.0fms)",
+                       _STATUS_ICON[status], name, detail, elapsed)
+        return CheckResult(name=name, category=category, status=status,
+                           detail=detail, elapsed_ms=elapsed)
+    except Exception as e:
+        elapsed = (time.perf_counter() - t0) * 1000
+        logger.error("  ✗ %s — crashed: %s (%.0fms)", name, e, elapsed)
+        return CheckResult(name=name, category=category, status=CheckStatus.FAIL,
+                           detail=f"Check crashed: {e}", elapsed_ms=elapsed)
+
+
 async def run_startup_checks(settings: Settings) -> list[CheckResult]:
     """Run all startup checks. Every check runs — none skipped on early failure.
 
@@ -380,44 +446,33 @@ async def run_startup_checks(settings: Settings) -> list[CheckResult]:
         check_cors_origins,
     ]
 
+    # Pre-import heavy modules to avoid import race conditions when
+    # concurrent check threads import from the same package (transformers).
+    _ensure_imports()
+
+    total = len(checks_phase1) + len(checks_phase2) + len(checks_phase3)
+    logger.info("开始启动健康检查（共 %d 项）...", total)
+
     results: list[CheckResult] = []
 
-    # Phase 1: Infrastructure (sequential, but don't stop on failure)
+    # Phase 1: Infrastructure (sequential — DB before everything else)
+    logger.info("── Phase 1: 基础设施（critical，超时即拒绝启动）──")
     for check_fn in checks_phase1:
-        result = await check_fn(settings)
-        results.append(result)
+        results.append(await _run_check(check_fn, settings, "critical"))
 
     # Phase 2: RAG stack (concurrent)
+    logger.info("── Phase 2: RAG 栈（optional，超时降级为 WARN）──")
     phase2_results = await asyncio.gather(
-        *(check_fn(settings) for check_fn in checks_phase2),
-        return_exceptions=True,
+        *(_run_check(fn, settings, "optional") for fn in checks_phase2),
     )
-    for i, res in enumerate(phase2_results):
-        if isinstance(res, Exception):
-            results.append(CheckResult(
-                name=checks_phase2[i].__name__,
-                category="optional",
-                status=CheckStatus.FAIL,
-                detail=f"Check crashed: {res}",
-            ))
-        else:
-            results.append(res)
+    results.extend(phase2_results)
 
     # Phase 3: Config validation (concurrent)
+    logger.info("── Phase 3: 配置校验（config，超时降级为 WARN）──")
     config_results = await asyncio.gather(
-        *(check_fn(settings) for check_fn in checks_phase3),
-        return_exceptions=True,
+        *(_run_check(fn, settings, "config") for fn in checks_phase3),
     )
-    for i, res in enumerate(config_results):
-        if isinstance(res, Exception):
-            results.append(CheckResult(
-                name=checks_phase3[i].__name__,
-                category="config",
-                status=CheckStatus.FAIL,
-                detail=f"Check crashed: {res}",
-            ))
-        else:
-            results.append(res)
+    results.extend(config_results)
 
     return results
 
@@ -429,7 +484,7 @@ async def run_startup_checks(settings: Settings) -> list[CheckResult]:
 _STATUS_ICON = {
     CheckStatus.PASS: "✓",
     CheckStatus.FAIL: "✗",
-    CheckStatus.FAIL: "⚠",
+    CheckStatus.WARN: "⚠",
 }
 
 
@@ -448,7 +503,7 @@ def print_check_summary(results: list[CheckResult]) -> None:
         )
 
     passed = sum(1 for r in results if r.status == CheckStatus.PASS)
-    warned = sum(1 for r in results if r.status == CheckStatus.FAIL)
+    warned = sum(1 for r in results if r.status == CheckStatus.WARN)
     failed = sum(1 for r in results if r.status == CheckStatus.FAIL)
 
     logger.info("-" * 70)

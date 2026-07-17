@@ -71,10 +71,32 @@ async def init_db():
         await conn.run_sync(_run_migrations)
 
 
+def _add_column_if_missing(connection, table: str, column: str, ddl_type: str) -> None:
+    """Add a column if absent; skip entirely when it already exists.
+
+    Querying ``information_schema`` takes no lock on the target table, so a
+    normal restart (column already present) doesn't request an ACCESS EXCLUSIVE
+    lock and won't block behind an idle-in-transaction session. When the column
+    genuinely needs adding, ``SET LOCAL lock_timeout = '3s'`` makes the DDL
+    fail fast instead of hanging startup — the caller surfaces a clear error
+    rather than waiting out the async timeout.
+    """
+    from sqlalchemy import text
+    exists = connection.execute(text(
+        "SELECT EXISTS ("
+        "  SELECT 1 FROM information_schema.columns"
+        "  WHERE table_name = :table AND column_name = :column"
+        ")"
+    ), {"table": table, "column": column}).scalar()
+    if exists:
+        return
+    connection.execute(text("SET LOCAL lock_timeout = '3s'"))
+    connection.execute(text(
+        f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {ddl_type}"
+    ))
+
+
 def _run_migrations(connection):
     """Idempotent schema migrations for existing databases."""
-    from sqlalchemy import text
     # v1: Add owner_id column for KB ownership (security)
-    connection.execute(text(
-        "ALTER TABLE knowledge_bases ADD COLUMN IF NOT EXISTS owner_id VARCHAR(36)"
-    ))
+    _add_column_if_missing(connection, "knowledge_bases", "owner_id", "VARCHAR(36)")
