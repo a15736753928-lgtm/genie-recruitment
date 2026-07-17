@@ -437,11 +437,14 @@ async def upload_material(
             if text.strip():
                 parsed, _ = await parse_resume_with_llm(text)
                 analysis_data = parsed.get("analysis", {}) if parsed else {}
+                # 维度评分由 5 个独立子 Agent 计算（教育背景走规则，其余走 LLM）。
+                from app.services.resume_agents import score_all
+                dimensions = await score_all(text, parsed or {}, "")
                 analysis = {
                     "overallScore": analysis_data.get("overallScore"),
                     "summary": analysis_data.get("summary", ""),
                     "keywords": analysis_data.get("keywords", []),
-                    "dimensions": analysis_data.get("dimensions", []),
+                    "dimensions": dimensions,
                     "highlights": analysis_data.get("highlights", []),
                     "risks": analysis_data.get("risks", []),
                     "recommendation": analysis_data.get("recommendation", ""),
