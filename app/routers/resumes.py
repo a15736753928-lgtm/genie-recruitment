@@ -182,14 +182,42 @@ def infer_age_from_text(text: str) -> Optional[int]:
     return None
 
 
+def infer_age_from_education(parsed: dict) -> Optional[int]:
+    """出生日期缺失时，从教育经历反推年龄。
+
+    按国内常规"18 岁上大学"估算：age = 当前年份 - 入学年份 + 18。
+    取教育经历里最早的入学年份（通常是本科入学），并排除高中/中学条目。
+    """
+    today = date.today()
+    start_years: list[int] = []
+    for edu in (parsed.get("educationHistory") or []):
+        if not isinstance(edu, dict):
+            continue
+        degree = str(edu.get("degree") or "")
+        school = str(edu.get("school") or "")
+        if "高中" in degree or "中学" in school or "高中" in school:
+            continue
+        years = re.findall(r"(20\d{2}|19\d{2})", str(edu.get("period") or ""))
+        start_years.extend(int(y) for y in years)
+    if not start_years:
+        return None
+    enrollment_year = min(start_years)
+    age = today.year - enrollment_year + 18
+    return age if 16 <= age <= 70 else None
+
+
 def resolve_age(parsed: dict, raw_text: str) -> Optional[int]:
-    """优先从出生日期计算年龄，其次才使用解析结果中的年龄字段。"""
+    """优先从出生日期计算年龄；缺失则从教育经历按"18岁上大学"反推；最后才用解析结果中的年龄字段。"""
     for source in (raw_text, str(parsed.get("birthDate") or "")):
         if not source.strip():
             continue
         inferred = infer_age_from_text(source)
         if inferred is not None:
             return inferred
+
+    edu_age = infer_age_from_education(parsed)
+    if edu_age is not None:
+        return edu_age
 
     age = parsed.get("age")
     if age in (None, "", UNKNOWN, 0, "0"):
