@@ -9,6 +9,7 @@ from datetime import date
 from typing import Optional, List, Tuple
 from fastapi import APIRouter, Depends, File, Form, UploadFile, Query
 from fastapi.responses import FileResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, or_, func, desc, asc
 from sqlalchemy.orm import selectinload
@@ -21,6 +22,7 @@ from app.models.candidate import (
 )
 from app.models.settings import SystemSetting
 from app.config import get_settings
+from app.core import minio_storage
 from app.services.portrait_gender import infer_gender_from_resume_file
 
 router = APIRouter(tags=["简历"])
@@ -55,59 +57,66 @@ MIME_TYPES = {
 
 
 def resolve_resume_file_path(stored_path: str) -> Optional[str]:
-    """Resolve stored resume path, checking legacy relative locations."""
+    """Resolve a stored resume reference to a local file path.
+
+    ``stored_path`` is now a MinIO object key (e.g. ``resumes/<uuid>.pdf``).
+    For backward compatibility, legacy absolute on-disk paths are still honored.
+    The returned temp file (when downloaded from MinIO) is the caller's
+    responsibility to remove. For a cleanup-free alternative use
+    ``minio_storage.resolved_local_path``.
+    """
     if not stored_path:
         return None
+    # Legacy on-disk path
     if os.path.isabs(stored_path) and os.path.exists(stored_path):
         return stored_path
-
-    candidates = [
-        stored_path,
-        os.path.join(settings.upload_dir, os.path.basename(stored_path)),
-        os.path.join(settings.upload_dir, stored_path),
-        os.path.join(os.path.dirname(os.path.dirname(__file__)), stored_path),
-        os.path.join(os.path.dirname(os.path.dirname(__file__)), "app", stored_path),
-    ]
-    for path in candidates:
-        if path and os.path.exists(path):
-            return os.path.abspath(path)
-    return None
+    # MinIO object key — download to a temp file
+    try:
+        ext = os.path.splitext(stored_path)[1] or ""
+        return minio_storage.download_to_temp(stored_path, suffix=ext)
+    except Exception as e:
+        logger.warning("从 MinIO 下载简历失败: %s (key=%s)", e, stored_path)
+        return None
 
 
 def extract_text_from_file(file_path: str) -> Tuple[str, Optional[str]]:
-    """Extract text from PDF, DOCX, or plain text files. Returns (text, error)."""
-    resolved = resolve_resume_file_path(file_path)
-    if not resolved:
-        return "", f"简历文件不存在: {file_path}"
+    """Extract text from PDF, DOCX, or plain text files. Returns (text, error).
 
-    ext = os.path.splitext(resolved)[1].lower()
-    try:
-        if ext == ".pdf":
-            from PyPDF2 import PdfReader
-            reader = PdfReader(resolved)
-            pages = [page.extract_text() or "" for page in reader.pages]
-            text = "\n".join(pages).strip()
-            if not text:
-                return "", "PDF 未提取到文本，可能是扫描件或图片简历，请上传可搜索文本的 PDF"
-            return text, None
-        if ext in (".docx",):
-            from docx import Document
-            doc = Document(resolved)
-            text = "\n".join(p.text for p in doc.paragraphs).strip()
-            if not text:
-                return "", "Word 文档未提取到文本"
-            return text, None
-        if ext == ".doc":
-            return "", "暂不支持旧版 .doc 格式，请转换为 .docx 或 PDF 后重新上传"
-        if ext in (".txt", ".md"):
-            with open(resolved, "r", encoding="utf-8", errors="ignore") as f:
-                return f.read().strip(), None
-        return "", f"不支持的文件格式: {ext}"
-    except ImportError as e:
-        return "", f"缺少文件解析依赖: {e}"
-    except Exception as e:
-        logger.exception("Failed to extract text from %s", resolved)
-        return "", f"文件解析失败: {e}"
+    ``file_path`` may be a MinIO object key or a legacy local path. The file is
+    materialized locally (temp file) only for the duration of extraction.
+    """
+    with minio_storage.resolved_local_path(file_path) as resolved:
+        if not resolved:
+            return "", f"简历文件不存在: {file_path}"
+
+        ext = os.path.splitext(resolved)[1].lower()
+        try:
+            if ext == ".pdf":
+                from PyPDF2 import PdfReader
+                reader = PdfReader(resolved)
+                pages = [page.extract_text() or "" for page in reader.pages]
+                text = "\n".join(pages).strip()
+                if not text:
+                    return "", "PDF 未提取到文本，可能是扫描件或图片简历，请上传可搜索文本的 PDF"
+                return text, None
+            if ext in (".docx",):
+                from docx import Document
+                doc = Document(resolved)
+                text = "\n".join(p.text for p in doc.paragraphs).strip()
+                if not text:
+                    return "", "Word 文档未提取到文本"
+                return text, None
+            if ext == ".doc":
+                return "", "暂不支持旧版 .doc 格式，请转换为 .docx 或 PDF 后重新上传"
+            if ext in (".txt", ".md"):
+                with open(resolved, "r", encoding="utf-8", errors="ignore") as f:
+                    return f.read().strip(), None
+            return "", f"不支持的文件格式: {ext}"
+        except ImportError as e:
+            return "", f"缺少文件解析依赖: {e}"
+        except Exception as e:
+            logger.exception("Failed to extract text from %s", resolved)
+            return "", f"文件解析失败: {e}"
 
 
 def normalize_text_field(value, default: str = UNKNOWN) -> str:
@@ -267,16 +276,16 @@ def augment_gender_from_portrait(parsed: dict, resume_file: str) -> dict:
     if parsed.get("gender") in ("男", "女"):
         return parsed
 
-    resolved = resolve_resume_file_path(resume_file or "")
-    if not resolved:
-        return parsed
+    with minio_storage.resolved_local_path(resume_file or "") as resolved:
+        if not resolved:
+            return parsed
 
-    # Pass client=None so infer_gender_from_vision creates its own sync
-    # OpenAI client (the async llm_client in this module is not usable
-    # from sync code).
-    portrait_gender = infer_gender_from_resume_file(resolved, client=None)
-    if portrait_gender in ("男", "女"):
-        parsed["gender"] = portrait_gender
+        # Pass client=None so infer_gender_from_vision creates its own sync
+        # OpenAI client (the async llm_client in this module is not usable
+        # from sync code).
+        portrait_gender = infer_gender_from_resume_file(resolved, client=None)
+        if portrait_gender in ("男", "女"):
+            parsed["gender"] = portrait_gender
     return parsed
 
 
@@ -386,8 +395,8 @@ def display_text(value, default: str = UNKNOWN) -> str:
 
 def serialize_candidate(c: Candidate) -> dict:
     """Convert ORM Candidate + relationships to frontend-expected dict."""
-    resume_path = resolve_resume_file_path(c.resume_file or "")
-    resume_ext = os.path.splitext(resume_path or "")[1].lower() if resume_path else ""
+    resume_path = c.resume_file or ""
+    resume_ext = os.path.splitext(resume_path)[1].lower() if resume_path else ""
     gender = c.gender if c.gender in ("男", "女") else UNKNOWN
     data = {
         "id": str(c.id),
@@ -623,19 +632,48 @@ async def get_resume_file(resume_id: str, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(Candidate).where(Candidate.id == resume_id))
     candidate = result.scalar_one_or_none()
     if not candidate or not candidate.resume_file:
-        return {"code": 404, "message": "简历文件不存在", "data": None}
+        return JSONResponse(
+            status_code=404,
+            content={"code": 404, "message": "简历文件不存在", "data": None},
+        )
 
-    file_path = resolve_resume_file_path(candidate.resume_file)
-    if not file_path:
-        return {"code": 404, "message": "简历文件不存在", "data": None}
+    stored = candidate.resume_file
+    filename = os.path.basename(stored) or stored
 
-    ext = os.path.splitext(file_path)[1].lower()
+    # Legacy on-disk path — serve directly
+    if os.path.isabs(stored) and os.path.exists(stored):
+        ext = os.path.splitext(stored)[1].lower()
+        media_type = MIME_TYPES.get(ext, "application/octet-stream")
+        return FileResponse(
+            stored,
+            media_type=media_type,
+            filename=filename,
+            headers={"Content-Disposition": f'inline; filename="{filename}"'},
+        )
+
+    # MinIO object key — stream from object storage
+    try:
+        response = await asyncio.to_thread(minio_storage.get_object_stream, stored)
+    except Exception as e:
+        return JSONResponse(
+            status_code=404,
+            content={"code": 404, "message": f"简历文件不存在: {e}", "data": None},
+        )
+
+    ext = os.path.splitext(filename)[1].lower()
     media_type = MIME_TYPES.get(ext, "application/octet-stream")
-    filename = os.path.basename(file_path)
-    return FileResponse(
-        file_path,
+
+    def _iter():
+        try:
+            for chunk in response.stream(amt=64 * 1024):
+                yield chunk
+        finally:
+            response.close()
+            response.release_conn()
+
+    return StreamingResponse(
+        _iter(),
         media_type=media_type,
-        filename=filename,
         headers={"Content-Disposition": f'inline; filename="{filename}"'},
     )
 
@@ -672,21 +710,24 @@ async def upload_resume(
     if not position:
         return {"code": 404, "message": "岗位不存在", "data": None}
 
-    # Save file
+    # Save file to MinIO (object key: resumes/<uuid>.<ext>)
     original_name = file.filename or "resume.pdf"
     file_ext = os.path.splitext(original_name)[1].lower() or ".pdf"
-    saved_name = f"{uuid.uuid4()}{file_ext}"
-    file_path = os.path.join(settings.upload_dir, saved_name)
-    with open(file_path, "wb") as f:
-        content = await file.read()
-        f.write(content)
+    object_key = f"resumes/{uuid.uuid4()}{file_ext}"
+    content = await file.read()
+    try:
+        await asyncio.to_thread(
+            minio_storage.upload_bytes, object_key, content, "application/octet-stream"
+        )
+    except Exception as e:
+        return {"code": 500, "message": f"简历存储失败: {e}", "data": None}
 
     # Create candidate
     candidate = Candidate(
         name=original_name,
         position_id=positionId,
         status="job_hunting",
-        resume_file=file_path,
+        resume_file=object_key,
         upload_time=date.today(),
     )
     db.add(candidate)
@@ -878,12 +919,16 @@ async def delete_resume(
     if not candidate:
         return {"code": 404, "message": "候选人不存在", "data": None}
 
-    # Delete resume file if exists
-    if candidate.resume_file and os.path.exists(candidate.resume_file):
-        try:
-            os.remove(candidate.resume_file)
-        except Exception:
-            pass
+    # Delete resume file from MinIO (if it's a MinIO key; legacy local paths
+    # are also cleaned up best-effort).
+    if candidate.resume_file:
+        if os.path.isabs(candidate.resume_file) and os.path.exists(candidate.resume_file):
+            try:
+                os.remove(candidate.resume_file)
+            except Exception:
+                pass
+        else:
+            await asyncio.to_thread(minio_storage.delete_object, candidate.resume_file)
 
     await db.delete(candidate)
     return {"code": 0, "message": "ok", "data": None}

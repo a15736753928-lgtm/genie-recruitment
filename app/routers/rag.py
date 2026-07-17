@@ -12,6 +12,7 @@ from typing import Optional, List
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, File, Form, Query, UploadFile
+from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, desc, delete
 
@@ -202,16 +203,14 @@ async def delete_knowledge_base(
     )
     milvus_pks = [r[0] for r in chunk_result.fetchall() if r[0] > 0]
 
-    # Delete files for documents in this KB
+    # Delete files for documents in this KB (stored in MinIO)
     doc_result = await db.execute(
         select(KnowledgeDocument).where(KnowledgeDocument.kb_id == kb_id)
     )
+    from app.core import minio_storage
     for doc in doc_result.scalars().all():
-        if doc.object_key and os.path.exists(doc.object_key):
-            try:
-                os.remove(doc.object_key)
-            except Exception:
-                pass
+        if doc.object_key:
+            await asyncio.to_thread(minio_storage.delete_object, doc.object_key)
 
     # Cascade delete (PG handles via FK ON DELETE CASCADE)
     await db.delete(kb)
@@ -267,19 +266,27 @@ async def upload_document(
             "data": None,
         }
 
-    # Save file
+    # Save file to MinIO (object key: rag/<uuid>.<ext>)
     file_ext = os.path.splitext(file.filename or "document")[1] or ".txt"
-    saved_name = f"{uuid.uuid4()}{file_ext}"
-    file_path = os.path.join(settings.upload_dir, saved_name)
-    with open(file_path, "wb") as f:
-        f.write(content)
+    object_key = f"rag/{uuid.uuid4()}{file_ext}"
+    try:
+        from app.core import minio_storage
+        await asyncio.to_thread(
+            minio_storage.upload_bytes,
+            object_key,
+            content,
+            "application/octet-stream",
+        )
+    except Exception as e:
+        return {"code": 500, "message": f"文件存储失败: {e}", "data": None}
 
-    # Start async ingestion
+    # Start async ingestion (downloads from MinIO inside the worker thread)
     try:
         doc_id, task_id = ingest_file_async(
-            file_path=file_path,
+            file_path=object_key,
             file_name=file.filename or "unknown",
             kb_id=kb_id,
+            file_size=len(content),
         )
     except ValueError as e:
         return {"code": 400, "message": str(e), "data": None}
@@ -406,6 +413,61 @@ async def get_document(
     }
 
 
+@router.get("/documents/{doc_id}/file")
+async def get_document_file(
+    doc_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Stream a document's original file content from MinIO (preview / download)."""
+    result = await db.execute(
+        select(KnowledgeDocument).where(KnowledgeDocument.id == doc_id)
+    )
+    doc = result.scalar_one_or_none()
+    if not doc or not doc.object_key:
+        return JSONResponse(
+            status_code=404,
+            content={"code": 404, "message": "文档或原始文件不存在", "data": None},
+        )
+
+    from app.core import minio_storage
+    from starlette.responses import StreamingResponse
+
+    try:
+        response = await asyncio.to_thread(minio_storage.get_object_stream, doc.object_key)
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"code": 500, "message": f"读取文件失败: {e}", "data": None},
+        )
+
+    ext = os.path.splitext(doc.file_name or "")[1].lower()
+    media_type = {
+        ".pdf": "application/pdf",
+        ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ".md": "text/markdown",
+        ".txt": "text/plain",
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+    }.get(ext, "application/octet-stream")
+
+    filename = doc.file_name or f"{doc.id}{ext}"
+
+    def _iter():
+        try:
+            for chunk in response.stream(amt=64 * 1024):
+                yield chunk
+        finally:
+            response.close()
+            response.release_conn()
+
+    return StreamingResponse(
+        _iter(),
+        media_type=media_type,
+        headers={"Content-Disposition": f'inline; filename="{filename}"'},
+    )
+
+
 @router.delete("/documents/{doc_id}")
 async def delete_document(
     doc_id: str,
@@ -438,12 +500,10 @@ async def delete_document(
         kb.chunk_count = max(0, (kb.chunk_count or 0) - (doc.chunk_count or 0))
         kb.updated_at = _now_ms()
 
-    # Delete file
-    if doc.object_key and os.path.exists(doc.object_key):
-        try:
-            os.remove(doc.object_key)
-        except Exception:
-            pass
+    # Delete file from MinIO
+    from app.core import minio_storage
+    if doc.object_key:
+        await asyncio.to_thread(minio_storage.delete_object, doc.object_key)
 
     # Delete document (PG cascade deletes chunks)
     await db.delete(doc)

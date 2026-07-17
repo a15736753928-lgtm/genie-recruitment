@@ -1,6 +1,7 @@
 import os
 import json
 import uuid
+import asyncio
 from typing import Optional, List
 from fastapi import APIRouter, Depends, File, Form, Query, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -13,6 +14,7 @@ from app.models.candidate import Candidate, Position
 from app.models.interview import InterviewQuestion, InterviewEvaluation, InterviewTranscript
 from app.models.settings import SystemSetting
 from app.config import get_settings
+from app.core import minio_storage
 
 router = APIRouter(tags=["面试"])
 settings = get_settings()
@@ -21,8 +23,6 @@ llm_client = AsyncOpenAI(
     api_key=settings.deepseek_api_key,
     base_url=settings.deepseek_base_url,
 )
-
-os.makedirs(settings.upload_dir, exist_ok=True)
 
 INTERVIEW_ELIGIBLE_STATUSES = {"passed", "first_interview", "second_interview", "pending_interview"}
 
@@ -121,6 +121,14 @@ def extract_text(file_path: str) -> str:
     return ""
 
 
+def _resume_text(stored: str) -> str:
+    """Extract text from a stored resume reference (MinIO key or legacy path)."""
+    with minio_storage.resolved_local_path(stored or "") as local:
+        if not local:
+            return ""
+        return extract_text(local)
+
+
 async def get_or_generate_questions(candidate_id: str, round: str, db: AsyncSession) -> List[InterviewQuestion]:
     """Get existing questions or auto-generate them."""
     cand_result = await db.execute(
@@ -147,7 +155,7 @@ async def get_or_generate_questions(candidate_id: str, round: str, db: AsyncSess
     rag_text = ""
     if candidate.resume_file:
         try:
-            rag_text = extract_text(candidate.resume_file)
+            rag_text = await asyncio.to_thread(_resume_text, candidate.resume_file)
         except Exception:
             pass
 
@@ -305,7 +313,7 @@ async def replace_question(question_id: str, body: dict, db: AsyncSession = Depe
         rag_text = ""
         if candidate.resume_file:
             try:
-                rag_text = extract_text(candidate.resume_file)
+                rag_text = await asyncio.to_thread(_resume_text, candidate.resume_file)
             except Exception:
                 pass
 
@@ -524,15 +532,30 @@ async def upload_transcript(
     round: str = Form(...),
     db: AsyncSession = Depends(get_db),
 ):
-    # Save and parse file
+    # Save to MinIO and parse file. We keep the bytes in memory to both upload
+    # to MinIO and extract text via a temp file (no re-download needed).
     file_ext = os.path.splitext(file.filename or "transcript")[1] or ".txt"
-    saved_name = f"{uuid.uuid4()}{file_ext}"
-    file_path = os.path.join(settings.upload_dir, saved_name)
-    with open(file_path, "wb") as f:
-        content = await file.read()
-        f.write(content)
+    object_key = f"interview/{uuid.uuid4()}{file_ext}"
+    content = await file.read()
+    try:
+        await asyncio.to_thread(
+            minio_storage.upload_bytes, object_key, content, "application/octet-stream"
+        )
+    except Exception as e:
+        return {"code": 500, "message": f"转写文件存储失败: {e}", "data": None}
 
-    transcript_text = extract_text(file_path)
+    # Extract text from the in-memory bytes via a temp file
+    import tempfile
+    fd, tmp_path = tempfile.mkstemp(suffix=file_ext)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(content)
+        transcript_text = extract_text(tmp_path)
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
 
     # Save transcript
     t_result = await db.execute(

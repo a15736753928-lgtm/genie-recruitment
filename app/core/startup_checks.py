@@ -307,6 +307,44 @@ async def check_rapidocr(settings: Settings) -> CheckResult:
         )
 
 
+async def check_minio(settings: Settings) -> CheckResult:
+    """Verify MinIO is reachable and the bucket is ready.
+
+    Critical — MinIO is a hard dependency for all document uploads. If it is
+    unreachable the server refuses to start (fail-fast), rather than limping
+    along with broken upload/preview/download endpoints.
+    """
+    t0 = time.perf_counter()
+    try:
+        from app.core import minio_storage
+        if not settings.minio_enabled:
+            return CheckResult(
+                "MinIO", "critical", CheckStatus.FAIL,
+                "MINIO_ENABLED=false — but MinIO is a required dependency; "
+                "set MINIO_ENABLED=true and start MinIO before launching",
+                (time.perf_counter() - t0) * 1000,
+            )
+        ok = await asyncio.to_thread(minio_storage.ensure_bucket)
+        if ok:
+            return CheckResult(
+                "MinIO", "critical", CheckStatus.PASS,
+                f"Connected, bucket '{settings.minio_bucket}' ready",
+                (time.perf_counter() - t0) * 1000,
+            )
+        return CheckResult(
+            "MinIO", "critical", CheckStatus.FAIL,
+            f"Unreachable at {settings.minio_endpoint} — start MinIO before "
+            f"launching the backend (mc alias set myminio http://{settings.minio_endpoint} admin 12345678)",
+            (time.perf_counter() - t0) * 1000,
+        )
+    except Exception as e:
+        return CheckResult(
+            "MinIO", "critical", CheckStatus.FAIL,
+            f"Init error: {e}",
+            (time.perf_counter() - t0) * 1000,
+        )
+
+
 # ═══════════════════════════════════════════════════════════════════
 # Config validation checks (non-blocking — WARN on issues)
 # ═══════════════════════════════════════════════════════════════════
@@ -506,6 +544,7 @@ async def run_startup_checks(settings: Settings) -> list[CheckResult]:
         check_database_async,
         check_database_sync,
         check_upload_dir,
+        check_minio,
     ]
     checks_phase2: list[CheckFn] = [
         check_milvus_lite,

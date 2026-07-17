@@ -13,6 +13,7 @@ from openai import OpenAI
 from app.database import get_db
 from app.models.knowledge import KnowledgeCategory, KnowledgeItem
 from app.config import get_settings
+from app.core import minio_storage
 
 router = APIRouter(tags=["知识库"])
 settings = get_settings()
@@ -21,8 +22,6 @@ llm_client = OpenAI(
     api_key=settings.deepseek_api_key,
     base_url=settings.deepseek_base_url,
 )
-
-os.makedirs(settings.upload_dir, exist_ok=True)
 
 # ── Milvus Lite setup ───────────────────────────────────
 try:
@@ -182,16 +181,20 @@ def search_milvus(query: str, top_k: int = 5, category_key: str = "") -> List[di
 # ── Helpers ─────────────────────────────────────────────
 
 def extract_file_text(file_path: str) -> str:
-    ext = os.path.splitext(file_path)[1].lower()
-    if ext == '.pdf':
-        from PyPDF2 import PdfReader
-        return "\n".join(page.extract_text() or "" for page in PdfReader(file_path).pages)
-    elif ext in ('.docx', '.doc'):
-        from docx import Document
-        return "\n".join(p.text for p in Document(file_path).paragraphs)
-    elif ext in ('.txt', '.md'):
-        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-            return f.read()
+    """Extract text from a stored file reference (MinIO key or legacy path)."""
+    with minio_storage.resolved_local_path(file_path or "") as local:
+        if not local:
+            return ""
+        ext = os.path.splitext(local)[1].lower()
+        if ext == '.pdf':
+            from PyPDF2 import PdfReader
+            return "\n".join(page.extract_text() or "" for page in PdfReader(local).pages)
+        elif ext in ('.docx', '.doc'):
+            from docx import Document
+            return "\n".join(p.text for p in Document(local).paragraphs)
+        elif ext in ('.txt', '.md'):
+            with open(local, 'r', encoding='utf-8', errors='ignore') as f:
+                return f.read()
     return ""
 
 
@@ -302,17 +305,20 @@ async def list_knowledge(
 @router.post("/knowledge/upload")
 async def upload_knowledge_file(file: UploadFile = File(...)):
     file_ext = os.path.splitext(file.filename or "knowledge")[1] or ".pdf"
-    saved_name = f"{uuid.uuid4()}{file_ext}"
-    file_path = os.path.join(settings.upload_dir, saved_name)
-    with open(file_path, "wb") as f:
-        content = await file.read()
-        f.write(content)
+    object_key = f"knowledge/{uuid.uuid4()}{file_ext}"
+    content = await file.read()
+    try:
+        await asyncio.to_thread(
+            minio_storage.upload_bytes, object_key, content, "application/octet-stream"
+        )
+    except Exception as e:
+        return {"code": 500, "message": f"文件存储失败: {e}", "data": None}
 
     return {
         "code": 0,
         "message": "ok",
         "data": {
-            "fileId": saved_name,
+            "fileId": object_key,
             "fileName": file.filename or "unknown",
             "size": len(content),
         },
@@ -329,9 +335,12 @@ async def create_knowledge_item(
     content_text = ""
 
     if file_id:
-        file_path = os.path.join(settings.upload_dir, file_id)
-        if os.path.exists(file_path):
-            content_text = extract_file_text(file_path)
+        # file_id is now a MinIO object key (or a legacy local path).
+        file_path = file_id
+        if minio_storage.object_exists(file_id) or (
+            os.path.isabs(file_id) and os.path.exists(file_id)
+        ):
+            content_text = await asyncio.to_thread(extract_file_text, file_path)
 
     item = KnowledgeItem(
         name=body.get("name", "未命名素材"),
@@ -418,12 +427,15 @@ async def delete_knowledge_item(
     # Delete from Milvus
     delete_from_milvus(str(item.id))
 
-    # Delete file
-    if item.file_path and os.path.exists(item.file_path):
-        try:
-            os.remove(item.file_path)
-        except Exception:
-            pass
+    # Delete file from MinIO (or legacy local path)
+    if item.file_path:
+        if os.path.isabs(item.file_path) and os.path.exists(item.file_path):
+            try:
+                os.remove(item.file_path)
+            except Exception:
+                pass
+        else:
+            await asyncio.to_thread(minio_storage.delete_object, item.file_path)
 
     await db.delete(item)
     return {"code": 0, "message": "ok", "data": None}

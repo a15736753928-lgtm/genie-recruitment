@@ -28,6 +28,16 @@ class Settings(BaseSettings):
     upload_dir: str = os.path.join(_PROJECT_ROOT, "uploads")
     max_upload_size: int = 52428800  # 50MB
 
+    # MinIO — object storage for uploaded documents (PDF/Word/MD/images)
+    minio_endpoint: str = "127.0.0.1:9000"
+    minio_access_key: str = ""
+    minio_secret_key: str = ""
+    minio_bucket: str = "genie-recruitment"
+    minio_secure: bool = False
+    # When true, uploads go to MinIO. When false (e.g. MinIO unreachable), fall
+    # back to the local upload_dir so the app stays usable in dev.
+    minio_enabled: bool = True
+
     # Milvus
     milvus_db_path: str = "milvus_lite.db"
     milvus_collection_name: str = "hr_knowledge_chunks"

@@ -276,25 +276,37 @@ def _build_graph_index(doc_id: str, kb_id: str, chunks: list[str], milvus_ids: l
 def _run_ingest_sync(
     doc_id: str,
     task_id: str,
-    file_path: str,
+    object_key: str,
     file_name: str,
     kb_id: str,
     file_size: int = 0,
 ):
     """Full ingestion pipeline (runs in background thread).
 
-    Uses sync DB session to avoid event-loop conflicts with async FastAPI.
+    ``object_key`` is a MinIO object key — the file is downloaded to a local
+    temp file for parsing/extraction and removed when done. Uses a sync DB
+    session to avoid event-loop conflicts with async FastAPI.
     """
     now = _now_ms()
     db = get_sync_db()
     doc = None
     task = None
+    local_path = ""
 
     try:
+        # Download the original file from MinIO to a temp file for parsing.
+        ext = os.path.splitext(file_name)[1] or ".txt"
+        from app.core import minio_storage
+        try:
+            local_path = minio_storage.download_to_temp(object_key, suffix=ext)
+        except Exception as e:
+            logger.error("从 MinIO 下载文件失败: %s (key=%s)", e, object_key)
+            raise
+
         # Compute file hash for dedup
         file_hash = ""
-        if os.path.exists(file_path):
-            with open(file_path, "rb") as f:
+        if os.path.exists(local_path):
+            with open(local_path, "rb") as f:
                 file_hash = hashlib.sha256(f.read()).hexdigest()
 
         # 1. Create document + task records
@@ -303,8 +315,8 @@ def _run_ingest_sync(
             kb_id=kb_id,
             file_name=file_name,
             file_size=file_size,
-            file_type=get_file_type(file_path),
-            object_key=file_path,
+            file_type=get_file_type(file_name),
+            object_key=object_key,
             file_hash=file_hash,
             status="pending",
             uploaded_at=now,
@@ -337,7 +349,7 @@ def _run_ingest_sync(
 
         # 2. Parse → raw text (3-layer pipeline)
         _update("parsing", 10)
-        raw_text = _extract_text(file_path)
+        raw_text = _extract_text(local_path)
         if not raw_text or not raw_text.strip():
             doc.status = "failed"
             _update("failed", 0, "无法解析文件内容")
@@ -434,17 +446,35 @@ def _run_ingest_sync(
             pass
     finally:
         db.close()
+        # Clean up the temp file downloaded from MinIO
+        if local_path:
+            try:
+                os.remove(local_path)
+            except OSError:
+                pass
 
 
 # ── Public API ──────────────────────────────────────────────
 
-def ingest_file_async(file_path: str, file_name: str, kb_id: str):
+def ingest_file_async(file_path: str, file_name: str, kb_id: str, file_size: int = 0):
     """Launch ingestion in a background thread.
+
+    ``file_path`` is a MinIO object key. The worker downloads it to a temp file
+    for parsing and removes the temp file when done.
 
     Returns (doc_id, task_id) immediately.
     Client polls GET /api/v1/rag/ingest-tasks/{task_id} for progress.
     """
-    file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
+    if file_size <= 0:
+        # Best-effort: stat the MinIO object to get its size if not provided.
+        try:
+            from app.core import minio_storage
+            stat = minio_storage._get_client().stat_object(
+                minio_storage.settings.minio_bucket, file_path
+            )
+            file_size = stat.size or 0
+        except Exception:
+            file_size = 0
     if file_size > settings.max_file_size:
         raise ValueError(f"文件过大: {file_size} > {settings.max_file_size}")
 

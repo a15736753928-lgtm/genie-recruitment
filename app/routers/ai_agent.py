@@ -16,6 +16,7 @@ from app.models.agent import AgentSession, AgentMessage, AgentMaterial, AgentTas
 from app.agent.tools import create_langchain_tools
 from app.agent.graph import build_agent_graph, stream_agent_response, AgentResult
 from app.config import get_settings
+from app.core import minio_storage
 from app.routers.resumes import extract_text_from_file, parse_resume_with_llm
 import os
 
@@ -28,8 +29,6 @@ llm_client = AsyncOpenAI(
     timeout=60.0,
     max_retries=0,
 )
-
-os.makedirs(settings.upload_dir, exist_ok=True)
 
 # Agent configurations
 AGENT_CONFIGS = {
@@ -345,6 +344,14 @@ async def delete_session(
     if not session:
         return {"code": 404, "message": "对话不存在", "data": None}
 
+    # Clean up MinIO objects for the session's materials before cascade delete
+    mat_result = await db.execute(
+        select(AgentMaterial).where(AgentMaterial.session_id == session_id)
+    )
+    for mat in mat_result.scalars().all():
+        if mat.file_path and not (os.path.isabs(mat.file_path)):
+            await asyncio.to_thread(minio_storage.delete_object, mat.file_path)
+
     await db.delete(session)
     return {"code": 0, "message": "ok", "data": None}
 
@@ -398,11 +405,15 @@ async def upload_material(
     material_path = ""
     if file:
         file_ext = os.path.splitext(file.filename or "material")[1] or ".pdf"
-        saved_name = f"{uuid.uuid4()}{file_ext}"
-        material_path = os.path.join(settings.upload_dir, saved_name)
-        with open(material_path, "wb") as f:
-            content = await file.read()
-            f.write(content)
+        object_key = f"agent/{uuid.uuid4()}{file_ext}"
+        content = await file.read()
+        try:
+            await asyncio.to_thread(
+                minio_storage.upload_bytes, object_key, content, "application/octet-stream"
+            )
+        except Exception as e:
+            return {"code": 500, "message": f"资料存储失败: {e}", "data": None}
+        material_path = object_key
         material_name = file.filename or "material"
     elif knowledgeName:
         material_name = knowledgeName
@@ -420,7 +431,7 @@ async def upload_material(
 
     # If uploading a resume, trigger AI analysis
     analysis = None
-    if type in ("resume", "file") and material_path and os.path.exists(material_path):
+    if type in ("resume", "file") and material_path:
         try:
             text, extract_error = extract_text_from_file(material_path)
             if text.strip():
@@ -502,7 +513,7 @@ async def agent_chat(
                 lines = ["\n\n--- 附件资料 ---"]
                 for mat in attached_materials:
                     lines.append(f"\n[{mat.type}] {mat.name}")
-                    if mat.file_path and os.path.exists(mat.file_path):
+                    if mat.file_path:
                         try:
                             file_text, _ = extract_text_from_file(mat.file_path)
                             if file_text.strip():
