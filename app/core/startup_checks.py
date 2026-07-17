@@ -115,6 +115,77 @@ async def check_upload_dir(settings: Settings) -> CheckResult:
         )
 
 
+def _find_port_owner(port: int) -> str:
+    """Best-effort lookup of the PID holding a port, for a friendly error hint.
+
+    Parses ``netstat -ano`` output (Windows). Distinguishes a live process
+    (suggest ``taskkill``) from a dead-process ghost socket (needs a reboot).
+    Returns an empty string if the owner can't be determined.
+    """
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["netstat", "-ano"], capture_output=True, text=True, timeout=5,
+        ).stdout
+    except Exception:
+        return ""
+    pids = set()
+    for line in out.splitlines():
+        if f":{port}" in line and "LISTENING" in line.upper():
+            parts = line.split()
+            if parts:
+                pids.add(parts[-1])
+    if not pids:
+        return ""
+
+    live, ghost = [], []
+    for pid in sorted(pids):
+        # tasklist exit code 0 means the PID is still a running process.
+        ret = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if ret.returncode == 0 and pid in ret.stdout:
+            live.append(pid)
+        else:
+            ghost.append(pid)
+    if live:
+        return (f" — held by PID {', '.join(live)}; "
+                f"run: taskkill /F /PID <pid>")
+    return (" — held by ghost socket from dead PID "
+            f"{', '.join(ghost)} (taskkill won't help; reboot to clear)")
+
+
+async def check_port_available(settings: Settings) -> CheckResult:
+    """Fail fast if the app port is already in use.
+
+    Runs as a preflight BEFORE model loading, so a port conflict surfaces in
+    milliseconds rather than after ~20s of model loading. Does NOT set
+    SO_REUSEADDR — on Windows that would let two processes share the port and
+    hide the conflict; we want to detect it the way uvicorn will.
+    """
+    import socket
+    port = settings.app_port
+    t0 = time.perf_counter()
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind(("0.0.0.0", port))
+        return CheckResult(
+            f"Port {port}", "critical", CheckStatus.PASS,
+            "Available",
+            (time.perf_counter() - t0) * 1000,
+        )
+    except OSError as e:
+        hint = await asyncio.to_thread(_find_port_owner, port)
+        return CheckResult(
+            f"Port {port}", "critical", CheckStatus.FAIL,
+            f"Already in use{hint}",
+            (time.perf_counter() - t0) * 1000,
+        )
+    finally:
+        sock.close()
+
+
 # ═══════════════════════════════════════════════════════════════════
 # Optional / RAG stack checks (non-blocking — WARN on failure)
 # ═══════════════════════════════════════════════════════════════════
@@ -420,12 +491,15 @@ async def _run_check(check_fn: CheckFn, settings: Settings, category: str) -> Ch
 async def run_startup_checks(settings: Settings) -> list[CheckResult]:
     """Run all startup checks. Every check runs — none skipped on early failure.
 
+    Preflight: port availability (fail-fast — aborts before model loading).
     Phase 1: Infrastructure checks (sequential — DB before everything else)
     Phase 2: RAG stack checks (concurrent)
     Phase 3: Config validation (concurrent)
 
     All phases always run to completion so the user sees the full picture
-    of what's broken in one restart cycle.
+    of what's broken in one restart cycle — EXCEPT the port preflight, which
+    aborts immediately on failure (a port conflict is a hard blocker; loading
+    ~20s of models first would be pure waste).
     """
     checks_phase1: list[CheckFn] = [
         check_database_url_format,
@@ -446,14 +520,22 @@ async def run_startup_checks(settings: Settings) -> list[CheckResult]:
         check_cors_origins,
     ]
 
+    results: list[CheckResult] = []
+
+    # Preflight: port availability — BEFORE _ensure_imports and model loading,
+    # so a port conflict fails in milliseconds instead of after ~20s.
+    port_result = await _run_check(check_port_available, settings, "critical")
+    results.append(port_result)
+    if port_result.status == CheckStatus.FAIL:
+        logger.error("端口被占用，跳过其余检查以快速失败。")
+        return results
+
     # Pre-import heavy modules to avoid import race conditions when
     # concurrent check threads import from the same package (transformers).
     _ensure_imports()
 
-    total = len(checks_phase1) + len(checks_phase2) + len(checks_phase3)
-    logger.info("开始启动健康检查（共 %d 项）...", total)
-
-    results: list[CheckResult] = []
+    total = (len(checks_phase1) + len(checks_phase2) + len(checks_phase3)) + 1
+    logger.info("开始启动健康检查（共 %d 项，含端口预检）...", total)
 
     # Phase 1: Infrastructure (sequential — DB before everything else)
     logger.info("── Phase 1: 基础设施（critical，超时即拒绝启动）──")

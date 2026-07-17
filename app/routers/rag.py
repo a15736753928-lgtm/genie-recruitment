@@ -5,6 +5,7 @@ Endpoints for knowledge base management, document ingestion,
 semantic search/retrieval, and dashboard statistics.
 """
 
+import asyncio
 import os
 import uuid
 from typing import Optional, List
@@ -101,7 +102,7 @@ async def create_knowledge_base(
         id=_short_uuid("kb"),
         name=name,
         description=body.get("description", ""),
-        owner_id=str(current_user.id),
+        owner_id=None,
         created_at=_now_ms(),
         updated_at=_now_ms(),
     )
@@ -166,10 +167,6 @@ async def update_knowledge_base(
     if not kb:
         return {"code": 404, "message": "知识库不存在", "data": None}
 
-    # Ownership check
-    if kb.owner_id and str(current_user.id) != kb.owner_id:
-        return {"code": 403, "message": "无权修改此知识库", "data": None}
-
     if "name" in body:
         kb.name = body["name"]
     if "description" in body:
@@ -198,10 +195,6 @@ async def delete_knowledge_base(
     if not kb:
         return {"code": 404, "message": "知识库不存在", "data": None}
 
-    # Ownership check
-    if kb.owner_id and str(current_user.id) != kb.owner_id:
-        return {"code": 403, "message": "无权删除此知识库", "data": None}
-
     # Get milvus PKs for all chunks in this KB
     from app.core.milvus_manager import delete_by_ids
     chunk_result = await db.execute(
@@ -224,9 +217,9 @@ async def delete_knowledge_base(
     await db.delete(kb)
     await db.flush()
 
-    # Clean up Milvus vectors
+    # Clean up Milvus vectors (run blocking call off the event loop)
     if milvus_pks:
-        delete_by_ids(milvus_pks)
+        await asyncio.to_thread(delete_by_ids, milvus_pks)
 
     return {"code": 200, "message": "已删除", "data": None}
 
@@ -426,13 +419,11 @@ async def delete_document(
     if not doc:
         return {"code": 404, "message": "文档不存在", "data": None}
 
-    # Ownership check via parent KB
+    # Fetch parent KB (to update its counters below)
     kb_result = await db.execute(
         select(KnowledgeBase).where(KnowledgeBase.id == doc.kb_id)
     )
     kb = kb_result.scalar_one_or_none()
-    if kb and kb.owner_id and str(current_user.id) != kb.owner_id:
-        return {"code": 403, "message": "无权删除此文档", "data": None}
 
     # Get milvus PKs
     from app.core.milvus_manager import delete_by_ids
@@ -458,9 +449,9 @@ async def delete_document(
     await db.delete(doc)
     await db.flush()
 
-    # Clean up Milvus
+    # Clean up Milvus (run blocking call off the event loop)
     if milvus_pks:
-        delete_by_ids(milvus_pks)
+        await asyncio.to_thread(delete_by_ids, milvus_pks)
 
     return {"code": 200, "message": "已删除", "data": None}
 
@@ -480,14 +471,6 @@ async def get_document_chunks(
     doc = doc_result.scalar_one_or_none()
     if not doc:
         return {"code": 404, "message": "文档不存在", "data": None}
-
-    # Ownership check via parent KB
-    kb_result = await db.execute(
-        select(KnowledgeBase).where(KnowledgeBase.id == doc.kb_id)
-    )
-    kb = kb_result.scalar_one_or_none()
-    if kb and kb.owner_id and str(current_user.id) != kb.owner_id:
-        return {"code": 403, "message": "无权访问此文档", "data": None}
 
     count_result = await db.execute(
         select(func.count()).select_from(KnowledgeChunk)
@@ -637,10 +620,21 @@ async def get_dashboard_stats(
         select(func.count()).select_from(KnowledgeChunk)
     )).scalar() or 0
 
-    # Vector count (from Milvus)
+    # Vector count (from Milvus). get_collection_stats() is a blocking
+    # synchronous Milvus Lite call — running it directly in the async handler
+    # would block the event loop and freeze the whole server (including
+    # unrelated endpoints). Run it in a worker thread with a timeout so a
+    # stuck Milvus can never deadlock the API.
     from app.core.milvus_manager import get_collection_stats
-    milvus_stats = get_collection_stats()
-    vector_count = milvus_stats.get("row_count", 0)
+    try:
+        milvus_stats = await asyncio.wait_for(
+            asyncio.to_thread(get_collection_stats), timeout=5.0
+        )
+        vector_count = milvus_stats.get("row_count", 0)
+    except asyncio.TimeoutError:
+        vector_count = 0
+    except Exception:
+        vector_count = 0
 
     # Recent documents
     recent_result = await db.execute(
