@@ -229,6 +229,80 @@ def resolve_age(parsed: dict, raw_text: str) -> Optional[int]:
         return None
 
 
+# ── 教育背景规则化打分 ──────────────────────────────────────────────
+# 学校层次（行）× 学历层次（列），0-100。取最高学历所在学校的层次查表。
+# 表内已固化所有规则：博士=100、985/清北=100、硕士≥85、本科≥60。
+EDU_SCORE_TABLE = {
+    "清北":   {"本科": 100, "硕士": 100, "博士": 100},
+    "985":    {"本科": 100, "硕士": 100, "博士": 100},
+    "211":    {"本科": 95,  "硕士": 95,  "博士": 100},
+    "一本":   {"本科": 90,  "硕士": 90,  "博士": 100},
+    "二本":   {"本科": 80,  "硕士": 90,  "博士": 100},
+    "民办本": {"本科": 70,  "硕士": 85,  "博士": 100},
+    "专科":   {"专科": 60},
+}
+
+
+def classify_degree_level(degree: str) -> str:
+    """从学位字符串判断学历层次：博士/硕士/本科/专科。"""
+    d = (degree or "").strip()
+    if "博士" in d:
+        return "博士"
+    if "硕士" in d:
+        return "硕士"
+    if "专科" in d or "大专" in d or "高职" in d:
+        return "专科"
+    if "本科" in d or "学士" in d:
+        return "本科"
+    return "本科"  # 大学条目默认按本科
+
+
+def _pick_highest_education(parsed: dict) -> Optional[dict]:
+    """返回 educationHistory 中学历层次最高的那条（用于教育背景打分）。"""
+    rank = {"博士": 4, "硕士": 3, "本科": 2, "专科": 1}
+    best, best_rank = None, 0
+    for edu in (parsed.get("educationHistory") or []):
+        if not isinstance(edu, dict):
+            continue
+        lvl = classify_degree_level(str(edu.get("degree") or ""))
+        r = rank.get(lvl, 0)
+        if r > best_rank:
+            best_rank, best = r, edu
+    return best
+
+
+async def score_education_background(parsed: dict) -> Optional[int]:
+    """按"最高学历的学校层次 × 学历层次"查表得到教育背景分数。"""
+    edu = _pick_highest_education(parsed)
+    if not edu:
+        return None
+    school = str(edu.get("school") or "").strip()
+    if not school or school in ("未知", "null", "None"):
+        return None
+    degree_level = classify_degree_level(str(edu.get("degree") or ""))
+    from app.services.school_tier import classify_school_tier
+    tier = await classify_school_tier(school)
+    row = EDU_SCORE_TABLE.get(tier)
+    if not row:
+        return None
+    return row.get(degree_level)
+
+
+def apply_education_score(parsed: dict, edu_score: Optional[int]) -> None:
+    """用规则化分数覆盖 analysis.dimensions 里的"教育背景"维度。"""
+    if edu_score is None:
+        return
+    analysis = parsed.setdefault("analysis", {})
+    if not isinstance(analysis, dict):
+        return
+    dims = analysis.setdefault("dimensions", [])
+    for d in dims:
+        if isinstance(d, dict) and "教育" in str(d.get("name") or ""):
+            d["score"] = edu_score
+            return
+    dims.insert(0, {"name": "教育背景", "score": edu_score})
+
+
 def infer_native_place_from_text(text: str) -> Optional[str]:
     patterns = [
         r"籍贯[：:\s]*([^\n\r，,；;]{2,20})",
@@ -496,6 +570,10 @@ async def run_resume_parse(candidate: Candidate, position_name: str = "", db: As
 
     parsed = enrich_parsed_fields(parsed, text)
     parsed = await asyncio.to_thread(augment_gender_from_portrait, parsed, candidate.resume_file or "")
+
+    # 教育背景维度改用规则化打分（学校层次 × 学历层次），覆盖 LLM 给的分。
+    edu_score = await score_education_background(parsed)
+    apply_education_score(parsed, edu_score)
 
     if db is None:
         return "内部错误：缺少数据库会话"
