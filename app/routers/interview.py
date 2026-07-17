@@ -84,7 +84,7 @@ async def generate_questions_with_llm(
 请返回纯JSON对象：{{"category": "...", "difficulty": "...", "content": "..."}}"""
 
     try:
-        response = await llm_client.chat.completions.acreate(
+        response = await llm_client.chat.completions.create(
             model=settings.deepseek_model,
             messages=[{"role": "system", "content": system_prompt}],
             temperature=0.7,
@@ -686,7 +686,7 @@ async def ai_score_question(
 返回格式：{{"score": 总分, "dimensions": [{{"name": "维度名", "score": 分数}}]}}
 只返回JSON。"""
 
-        response = await llm_client.chat.completions.acreate(
+        response = await llm_client.chat.completions.create(
             model=settings.deepseek_model,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3,

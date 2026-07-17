@@ -20,13 +20,12 @@ logger = logging.getLogger(__name__)
 settings = get_settings()
 
 MODEL_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "assets", "face_models")
-MODEL_FILES = {
-    "deploy.prototxt": "https://raw.githubusercontent.com/opencv/opencv/master/samples/dnn/face_detector/deploy.prototxt",
-    "res10_300x300_ssd_iter_140000.caffemodel": "https://raw.githubusercontent.com/opencv/opencv_3rdparty/dnn_samples_face_detector_20170830/res10_300x300_ssd_iter_140000.caffemodel",
-    "gender_deploy.prototxt": "https://raw.githubusercontent.com/spmallick/learnopencv/master/AgeGender/gender_deploy.prototxt",
-    "gender_net.caffemodel": "https://github.com/spmallick/learnopencv/raw/master/AgeGender/gender_net.caffemodel",
-}
-MODEL_MEAN_VALUES = (78.4263377603, 87.7689143744, 114.895847746)
+# Gender classifier (PaddlePaddle LCNet, exported to ONNX, ~2.4 MB).
+# Fetched from the HuggingFace mirror (hf-mirror.com) which is reachable in CN.
+GENDER_ONNX_FILE = "gender_lcnet.onnx"
+GENDER_ONNX_URL = "https://hf-mirror.com/kunkunlin1221/face-gender-lcnet-050/resolve/main/gender_detection_lcnet_050.onnx"
+# ONNX input is 112x112 RGB; label order verified empirically: 0=male, 1=female.
+GENDER_INPUT_SIZE = 112
 
 
 def _image_metrics(data: bytes) -> Optional[Tuple[int, int, int, float]]:
@@ -121,15 +120,17 @@ def extract_portrait_from_file(file_path: str) -> Optional[bytes]:
     return _pick_portrait(images)
 
 
-def _ensure_face_models() -> str:
-    os.makedirs(MODEL_DIR, exist_ok=True)
-    for filename, url in MODEL_FILES.items():
-        target = os.path.join(MODEL_DIR, filename)
-        if os.path.exists(target) and os.path.getsize(target) > 0:
-            continue
-        logger.info("Downloading face model %s", filename)
+def _download_if_missing(filename: str, url: str) -> str:
+    target = os.path.join(MODEL_DIR, filename)
+    if not (os.path.exists(target) and os.path.getsize(target) > 0):
+        os.makedirs(MODEL_DIR, exist_ok=True)
+        logger.info("Downloading model %s <- %s", filename, url)
         urllib.request.urlretrieve(url, target)
-    return MODEL_DIR
+    return target
+
+
+def _ensure_gender_model() -> str:
+    return _download_if_missing(GENDER_ONNX_FILE, GENDER_ONNX_URL)
 
 
 def _parse_gender_answer(answer: str) -> Optional[str]:
@@ -156,23 +157,21 @@ def _guess_mime(data: bytes) -> str:
 
 
 @lru_cache(maxsize=1)
-def _load_face_nets():
-    import cv2
+def _load_gender_classifier():
+    import onnxruntime as ort
 
-    model_dir = _ensure_face_models()
-    face_net = cv2.dnn.readNetFromCaffe(
-        os.path.join(model_dir, "deploy.prototxt"),
-        os.path.join(model_dir, "res10_300x300_ssd_iter_140000.caffemodel"),
-    )
-    gender_net = cv2.dnn.readNetFromCaffe(
-        os.path.join(model_dir, "gender_deploy.prototxt"),
-        os.path.join(model_dir, "gender_net.caffemodel"),
-    )
-    return face_net, gender_net
+    path = _ensure_gender_model()
+    return ort.InferenceSession(path, providers=["CPUExecutionProvider"])
 
 
 def infer_gender_local(image_bytes: bytes) -> Optional[str]:
-    """Infer gender from portrait using OpenCV face + gender models."""
+    """Infer gender from a resume portrait via the ONNX LCNet classifier.
+
+    Resume headshots (证件照) are tight crops where the face fills most of the
+    frame, so the classifier is fed the whole picked portrait resized to 112x112
+    — no separate face-detection model is needed (OpenCV 5.0 also dropped the
+    Caffe reader we'd otherwise use).
+    """
     try:
         import cv2
     except ImportError:
@@ -184,42 +183,23 @@ def infer_gender_local(image_bytes: bytes) -> Optional[str]:
         return None
 
     try:
-        face_net, gender_net = _load_face_nets()
+        gender_sess = _load_gender_classifier()
     except Exception as exc:
-        logger.warning("Failed to load face models: %s", exc)
+        logger.warning("Failed to load gender ONNX model: %s", exc)
         return None
 
-    height, width = frame.shape[:2]
-    blob = cv2.dnn.blobFromImage(frame, 1.0, (300, 300), (104.0, 177.0, 123.0))
-    face_net.setInput(blob)
-    detections = face_net.forward()
+    # BGR -> RGB, resize to 112x112, /255, NCHW float32.
+    face_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    resized = cv2.resize(face_rgb, (GENDER_INPUT_SIZE, GENDER_INPUT_SIZE), interpolation=cv2.INTER_LINEAR)
+    arr = resized.astype(np.float32) / 255.0
+    x = arr.transpose(2, 0, 1)[None]  # 1x3x112x112
 
-    best_conf = 0.0
-    best_box = None
-    for index in range(detections.shape[2]):
-        confidence = float(detections[0, 0, index, 2])
-        if confidence < 0.45 or confidence <= best_conf:
-            continue
-        box = detections[0, 0, index, 3:7] * np.array([width, height, width, height])
-        best_conf = confidence
-        best_box = box.astype(int)
-
-    if best_box is None:
-        return None
-
-    x1, y1, x2, y2 = best_box
-    face = frame[max(0, y1):max(0, y2), max(0, x1):max(0, x2)]
-    if face.size == 0:
-        return None
-
-    blob = cv2.dnn.blobFromImage(
-        face, 1.0, (227, 227), MODEL_MEAN_VALUES, swapRB=False, crop=False
-    )
-    gender_net.setInput(blob)
-    prediction = gender_net.forward()[0]
-    gender_index = int(np.argmax(prediction))
+    in_name = gender_sess.get_inputs()[0].name
+    logits = gender_sess.run(None, {in_name: x})[0][0]
+    gender_index = int(np.argmax(logits))
+    # Label order verified empirically: 0=male, 1=female.
     gender = "男" if gender_index == 0 else "女"
-    logger.info("Local portrait gender inferred as %s (confidence=%.2f)", gender, best_conf)
+    logger.info("Local portrait gender inferred as %s (logits=%s)", gender, logits.tolist())
     return gender
 
 
@@ -264,11 +244,26 @@ def infer_gender_from_vision(image_bytes: bytes, client: Optional[OpenAI] = None
         return None
 
 
+def _vision_configured() -> bool:
+    """True only when a real vision model is configured (not the bogus default)."""
+    if not settings.vision_enabled or not settings.vision_model:
+        return False
+    if settings.vision_model == "deepseek-v4-flash":
+        return False  # DeepSeek has no vision model; skip the failing call.
+    return True
+
+
 def infer_gender_from_portrait(image_bytes: bytes, client: Optional[OpenAI] = None) -> Optional[str]:
-    gender = infer_gender_from_vision(image_bytes, client=client)
+    # Local ONNX is the primary path: fully offline, fast, no API.
+    gender = infer_gender_local(image_bytes)
     if gender in ("男", "女"):
         return gender
-    return infer_gender_local(image_bytes)
+    # Fall back to a vision LLM only when one is genuinely configured.
+    if _vision_configured():
+        gender = infer_gender_from_vision(image_bytes, client=client)
+        if gender in ("男", "女"):
+            return gender
+    return None
 
 
 def infer_gender_from_resume_file(file_path: str, client: Optional[OpenAI] = None) -> Optional[str]:

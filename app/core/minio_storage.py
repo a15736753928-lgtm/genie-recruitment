@@ -100,9 +100,16 @@ def object_exists(object_name: str) -> bool:
 
 
 def download_to_temp(object_name: str, suffix: str = "") -> str:
-    """Download an object to a temp file and return its path. Caller must remove it."""
+    """Download an object to a temp file and return its path. Caller must remove it.
+
+    When ``suffix`` is empty, it is derived from the object key's extension so
+    that the temp file keeps its ``.pdf``/``.docx``/... suffix — many parsers
+    (and our own ``extract_text`` helpers) branch on the file extension.
+    """
     if not object_name:
         raise ValueError("empty object name")
+    if not suffix:
+        suffix = os.path.splitext(object_name)[1]
     response = _get_client().get_object(settings.minio_bucket, object_name)
     try:
         fd, tmp_path = tempfile.mkstemp(suffix=suffix or "")

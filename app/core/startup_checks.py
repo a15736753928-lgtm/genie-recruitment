@@ -345,6 +345,53 @@ async def check_minio(settings: Settings) -> CheckResult:
         )
 
 
+async def check_portrait_gender(settings: Settings) -> CheckResult:
+    """Verify the portrait gender-recognition capability is available.
+
+    Critical — resume parsing relies on this to infer gender from the headshot
+    when the resume text doesn't state it. Requires ``cv2`` and ``onnxruntime``
+    plus the LCNet ONNX gender model (auto-downloaded from the HF mirror on
+    first start). If any piece is missing/unloadable the server refuses to
+    start, rather than silently producing "未知" genders.
+    """
+    t0 = time.perf_counter()
+    try:
+        import cv2  # noqa: F401
+    except ImportError:
+        return CheckResult(
+            "Portrait Gender", "critical", CheckStatus.FAIL,
+            "opencv-python (cv2) not installed — needed for headshot gender inference",
+            (time.perf_counter() - t0) * 1000,
+        )
+    try:
+        import onnxruntime  # noqa: F401
+    except ImportError:
+        return CheckResult(
+            "Portrait Gender", "critical", CheckStatus.FAIL,
+            "onnxruntime not installed — needed to run the gender ONNX model",
+            (time.perf_counter() - t0) * 1000,
+        )
+
+    def _obtain_and_load():
+        from app.services.portrait_gender import _ensure_gender_model, _load_gender_classifier
+        _ensure_gender_model()          # download the ONNX file if missing
+        _load_gender_classifier()        # load + cache the InferenceSession
+
+    try:
+        await asyncio.to_thread(_obtain_and_load)
+        return CheckResult(
+            "Portrait Gender", "critical", CheckStatus.PASS,
+            "cv2 + onnxruntime ready, LCNet gender model loaded",
+            (time.perf_counter() - t0) * 1000,
+        )
+    except Exception as e:
+        return CheckResult(
+            "Portrait Gender", "critical", CheckStatus.FAIL,
+            f"Failed to obtain/load gender model: {e}",
+            (time.perf_counter() - t0) * 1000,
+        )
+
+
 # ═══════════════════════════════════════════════════════════════════
 # Config validation checks (non-blocking — WARN on issues)
 # ═══════════════════════════════════════════════════════════════════
@@ -545,6 +592,7 @@ async def run_startup_checks(settings: Settings) -> list[CheckResult]:
         check_database_sync,
         check_upload_dir,
         check_minio,
+        check_portrait_gender,
     ]
     checks_phase2: list[CheckFn] = [
         check_milvus_lite,

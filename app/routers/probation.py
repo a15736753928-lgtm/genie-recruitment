@@ -474,7 +474,7 @@ async def ai_evaluate_probation(employee_id: str, db: AsyncSession = Depends(get
 只返回JSON。"""
 
     try:
-        response = await llm_client.chat.completions.acreate(
+        response = await llm_client.chat.completions.create(
             model=settings.deepseek_model,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3,

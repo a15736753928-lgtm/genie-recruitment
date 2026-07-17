@@ -329,7 +329,7 @@ async def parse_resume_with_llm(text: str, position_name: str = "") -> Tuple[dic
 
 注意：age字段不要自行填写，留null即可；若识别到出生日期请填入birthDate，系统会自动计算年龄。"""
     try:
-        response = await llm_client.chat.completions.acreate(
+        response = await llm_client.chat.completions.create(
             model=settings.deepseek_model,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3,

@@ -47,7 +47,7 @@ _ENTITY_EXTRACT_SYSTEM = """你是一个查询分析专家。从用户问题中�
 async def _extract_entities_from_query(query: str) -> list[str]:
     """Use LLM to extract key entities from a search query."""
     try:
-        response = await llm_client.chat.completions.acreate(
+        response = await llm_client.chat.completions.create(
             model=settings.deepseek_model,
             messages=[
                 {"role": "system", "content": _ENTITY_EXTRACT_SYSTEM},
