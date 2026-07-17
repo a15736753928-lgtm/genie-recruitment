@@ -7,7 +7,6 @@ async def main():
     from app.database import engine, Base, async_session_factory
     from app.services.seed import seed_all
     # Import all models to register them with Base
-    from app.models.user import User, AuditLog
     from app.models.candidate import Position, Candidate, CandidateSkill, CandidateEducation
     from app.models.candidate import CandidateWorkExperience, CandidateProjectExperience, CandidateAIAnalysis
     from app.models.interview import InterviewQuestion, InterviewEvaluation, InterviewTranscript
@@ -30,7 +29,7 @@ async def main():
     # Verify
     from sqlalchemy import select, func
     async with async_session_factory() as db:
-        tables = ["users", "positions", "candidates", "interview_questions",
+        tables = ["positions", "candidates", "interview_questions",
                    "employees", "knowledge_categories", "system_settings"]
         for t in tables:
             result = await db.execute(select(func.count()).select_from(getattr(

@@ -12,13 +12,11 @@ class AgentSession(Base):
     __tablename__ = "agent_sessions"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"))
     title = Column(String(128))
     agent_id = Column(String(32))
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
-    user = relationship("User", back_populates="sessions")
     messages = relationship("AgentMessage", back_populates="session", cascade="all, delete-orphan")
     tasks = relationship("AgentTask", back_populates="session", cascade="all, delete-orphan")
     materials = relationship("AgentMaterial", back_populates="session", cascade="all, delete-orphan")
@@ -47,7 +45,6 @@ class AgentMaterial(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     session_id = Column(UUID(as_uuid=True), ForeignKey("agent_sessions.id"))
-    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"))
     name = Column(String(256))
     type = Column(String(16))
     knowledge_id = Column(UUID(as_uuid=True), ForeignKey("knowledge_items.id"))

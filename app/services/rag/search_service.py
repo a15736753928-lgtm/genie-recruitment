@@ -11,6 +11,7 @@ Pipeline:
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Optional, List
 
@@ -57,17 +58,19 @@ async def search(
     # 1. Normalize query
     query_normalized = normalize_query(clean_text(query))
 
-    # 2. Dense recall
-    query_dense = encode_query_dense(query_normalized)
+    # 2. Dense recall (ONNX inference + Milvus search are blocking — run off
+    #    the event loop so other requests stay responsive and the streaming
+    #    generator stays cancellable if the client disconnects.)
+    query_dense = await asyncio.to_thread(encode_query_dense, query_normalized)
     all_dense = []
     if kb_ids:
         for kb_id in kb_ids:
-            hits = search_dense(query_dense, rerank_top_k, kb_id=kb_id)
+            hits = await asyncio.to_thread(search_dense, query_dense, rerank_top_k, kb_id)
             for h in hits:
                 h["source"] = "dense"
             all_dense.extend(hits)
     else:
-        hits = search_dense(query_dense, rerank_top_k)
+        hits = await asyncio.to_thread(search_dense, query_dense, rerank_top_k)
         for h in hits:
             h["source"] = "dense"
         all_dense = hits
@@ -76,16 +79,16 @@ async def search(
     all_sparse = []
     if settings.sparse_vector_enabled:
         try:
-            query_sparse = encode_query_sparse(query_normalized)
+            query_sparse = await asyncio.to_thread(encode_query_sparse, query_normalized)
             if query_sparse:
                 if kb_ids:
                     for kb_id in kb_ids:
-                        hits = search_sparse(query_sparse, rerank_top_k, kb_id=kb_id)
+                        hits = await asyncio.to_thread(search_sparse, query_sparse, rerank_top_k, kb_id)
                         for h in hits:
                             h["source"] = "sparse"
                         all_sparse.extend(hits)
                 else:
-                    hits = search_sparse(query_sparse, rerank_top_k)
+                    hits = await asyncio.to_thread(search_sparse, query_sparse, rerank_top_k)
                     for h in hits:
                         h["source"] = "sparse"
                     all_sparse = hits
@@ -113,12 +116,12 @@ async def search(
         fallback = []
         if kb_ids:
             for kb_id in kb_ids:
-                hits = search_dense(query_dense, fallback_k, kb_id=kb_id)
+                hits = await asyncio.to_thread(search_dense, query_dense, fallback_k, kb_id)
                 for h in hits:
                     h["source"] = "dense_fallback"
                 fallback.extend(hits)
         else:
-            hits = search_dense(query_dense, fallback_k)
+            hits = await asyncio.to_thread(search_dense, query_dense, fallback_k)
             for h in hits:
                 h["source"] = "dense_fallback"
             fallback = hits
@@ -133,7 +136,7 @@ async def search(
     # 8. Rerank
     if settings.rerank_enabled and len(enriched) > 1:
         texts = [r["content"] for r in enriched]
-        ranked = rerank(query_normalized, texts, top_k=top_k)
+        ranked = await asyncio.to_thread(rerank, query_normalized, texts, top_k)
         reranked = []
         for idx, score in ranked:
             item = enriched[idx].copy()

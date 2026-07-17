@@ -19,11 +19,6 @@ class Settings(BaseSettings):
     vision_enabled: bool = True
     vision_model: str = "deepseek-v4-flash"
 
-    # JWT — set via JWT_SECRET_KEY in .env
-    jwt_secret_key: str = ""
-    jwt_algorithm: str = "HS256"
-    jwt_expire_minutes: int = 1440
-
     # App
     app_host: str = "0.0.0.0"
     app_port: int = 8000
@@ -43,7 +38,6 @@ class Settings(BaseSettings):
     # BGE-M3 ONNX
     bge_onnx_model_name: str = "gpahal/bge-m3-onnx-int8"
     bge_onnx_filename: str = "model_quantized.onnx"
-    model_cache_dir: str = "storage/cache"
     sparse_vector_enabled: bool = True
 
     # RAG — Chunking
@@ -81,10 +75,6 @@ class Settings(BaseSettings):
     # RAG — OCR (RapidOCR for image/PDF fallback)
     ocr_enabled: bool = True
     ocr_fallback_threshold: int = 100  # chars below which OCR is triggered
-
-    # Root User — set via ROOT_USERNAME / ROOT_PASSWORD in .env
-    root_username: str = ""
-    root_password: str = ""
 
     class Config:
         env_file = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")

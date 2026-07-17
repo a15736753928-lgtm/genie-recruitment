@@ -11,10 +11,8 @@ from sqlalchemy.orm import selectinload
 from pydantic import BaseModel
 from openai import AsyncOpenAI
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
-from app.database import get_db
-from app.models.user import User
+from app.database import get_db, async_session_factory
 from app.models.agent import AgentSession, AgentMessage, AgentMaterial, AgentTask
-from app.routers.auth import get_current_user, get_optional_user
 from app.agent.tools import create_langchain_tools
 from app.agent.graph import build_agent_graph, stream_agent_response, AgentResult
 from app.config import get_settings
@@ -27,6 +25,8 @@ settings = get_settings()
 llm_client = AsyncOpenAI(
     api_key=settings.deepseek_api_key,
     base_url=settings.deepseek_base_url,
+    timeout=60.0,
+    max_retries=0,
 )
 
 os.makedirs(settings.upload_dir, exist_ok=True)
@@ -283,11 +283,9 @@ async def get_ai_agent_overview(db: AsyncSession = Depends(get_db)):
 @router.get("/ai-agent/sessions")
 async def list_sessions(
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
 ):
     result = await db.execute(
         select(AgentSession)
-        .where(AgentSession.user_id == current_user.id)
         .order_by(desc(AgentSession.updated_at))
         .limit(50)
     )
@@ -311,11 +309,9 @@ async def list_sessions(
 @router.post("/ai-agent/sessions")
 async def create_session(
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
 ):
     """Create a new empty chat session."""
     session = AgentSession(
-        user_id=current_user.id,
         title="新对话",
         agent_id="recruit",
     )
@@ -339,12 +335,10 @@ async def create_session(
 async def delete_session(
     session_id: str,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
 ):
     result = await db.execute(
         select(AgentSession).where(
             AgentSession.id == session_id,
-            AgentSession.user_id == current_user.id,
         )
     )
     session = result.scalar_one_or_none()
@@ -389,15 +383,14 @@ async def upload_material(
     knowledgeId: str = Form(None),
     knowledgeName: str = Form(None),
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
 ):
     # Get or create session
     session_result = await db.execute(
-        select(AgentSession).where(AgentSession.user_id == current_user.id).order_by(desc(AgentSession.updated_at)).limit(1)
+        select(AgentSession).order_by(desc(AgentSession.updated_at)).limit(1)
     )
     session = session_result.scalar_one_or_none()
     if not session:
-        session = AgentSession(user_id=current_user.id, title="新对话", agent_id="recruit")
+        session = AgentSession(title="新对话", agent_id="recruit")
         db.add(session)
         await db.flush()
 
@@ -416,7 +409,6 @@ async def upload_material(
 
     material = AgentMaterial(
         session_id=session.id,
-        user_id=current_user.id,
         name=material_name,
         type=type,
         knowledge_id=knowledgeId,
@@ -469,7 +461,6 @@ async def upload_material(
 async def trigger_suggestion(
     suggestion_id: str,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
 ):
     return {"code": 0, "message": "ok", "data": None}
 
@@ -478,24 +469,35 @@ async def trigger_suggestion(
 async def agent_chat(
     request: Request,
     body: dict,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
 ):
-    """Main SSE streaming chat endpoint."""
+    """Main SSE streaming chat endpoint.
+
+    This endpoint deliberately does NOT use ``Depends(get_db)``. Holding a DB
+    session for the whole streaming duration leaks connections: if the client
+    disconnects while the generator is blocked inside a long LLM call or a
+    sync tool call, the generator cannot be cancelled and the session is
+    never returned to the pool. After a few such leaks the PostgreSQL pool is
+    exhausted and every other API call hangs ("前端点几次就收不到请求").
+
+    Instead, all DB work is done in short-lived sessions (``async with
+    async_session_factory()``) that are committed and closed immediately, so
+    no connection is held while the SSE stream is open.
+    """
     message = body.get("message", "")
     session_id = body.get("sessionId")
     agent_id = body.get("agentId", "recruit")
     mentioned_agent_ids = body.get("mentionedAgentIds", [])
     material_ids = body.get("materialIds", [])
 
-    # Fetch attached materials and build context
+    # ── Fetch attached materials and build context ──
     material_context = ""
     if material_ids:
         try:
-            mat_result = await db.execute(
-                select(AgentMaterial).where(AgentMaterial.id.in_(material_ids))
-            )
-            attached_materials = mat_result.scalars().all()
+            async with async_session_factory() as db:
+                mat_result = await db.execute(
+                    select(AgentMaterial).where(AgentMaterial.id.in_(material_ids))
+                )
+                attached_materials = mat_result.scalars().all()
             if attached_materials:
                 lines = ["\n\n--- 附件资料 ---"]
                 for mat in attached_materials:
@@ -504,7 +506,6 @@ async def agent_chat(
                         try:
                             file_text, _ = extract_text_from_file(mat.file_path)
                             if file_text.strip():
-                                # Truncate long files to avoid blowing context
                                 truncated = file_text[:3000] + ("..." if len(file_text) > 3000 else "")
                                 lines.append(f"内容:\n{truncated}")
                         except Exception:
@@ -513,60 +514,77 @@ async def agent_chat(
         except Exception:
             pass
 
-    # Get or create session
-    session = None
-    if session_id:
-        try:
-            result = await db.execute(select(AgentSession).where(AgentSession.id == session_id))
-            session = result.scalar_one_or_none()
-        except Exception:
-            session = None
-
+    # ── Get or create session, save user message, fetch history ──
     is_new_session = False
-    if not session:
-        is_new_session = True
-        session = AgentSession(
-            user_id=current_user.id,
-            title="新对话",
-            agent_id=agent_id,
+    session_title = "新对话"
+    history_rows: list[tuple[str, str]] = []
+
+    async with async_session_factory() as db:
+        session = None
+        if session_id:
+            try:
+                result = await db.execute(select(AgentSession).where(AgentSession.id == session_id))
+                session = result.scalar_one_or_none()
+            except Exception:
+                session = None
+
+        if not session:
+            is_new_session = True
+            session = AgentSession(
+                title="新对话",
+                agent_id=agent_id,
+            )
+            db.add(session)
+            await db.flush()
+            session_id = str(session.id)
+
+        # Save user message
+        user_msg = AgentMessage(
+            session_id=session.id,
+            role="user",
+            content=message,
         )
-        db.add(session)
+        db.add(user_msg)
         await db.flush()
-        session_id = str(session.id)
 
-    # Save user message
-    user_msg = AgentMessage(
-        session_id=session.id,
-        role="user",
-        content=message,
-    )
-    db.add(user_msg)
-    await db.flush()
+        # Update session title
+        if session.title in ("新对话", None, ""):
+            session.title = message[:50] if message else "新对话"
+        session_title = session.title or "新对话"
 
-    # Update session title
-    if session.title in ("新对话", None, ""):
-        session.title = message[:50] if message else "新对话"
+        # Fetch conversation history (last 20)
+        history_result = await db.execute(
+            select(AgentMessage)
+            .where(AgentMessage.session_id == session.id)
+            .order_by(AgentMessage.created_at)
+            .limit(20)
+        )
+        history = history_result.scalars().all()
+        for h in history[:-1]:  # exclude the just-saved user message
+            history_rows.append((h.role, h.content or ""))
 
-    # Build conversation history
-    history_result = await db.execute(
-        select(AgentMessage)
-        .where(AgentMessage.session_id == session.id)
-        .order_by(AgentMessage.created_at)
-        .limit(20)
-    )
-    history = history_result.scalars().all()
+        await db.commit()
+        session_obj_id = session.id
+
+    # ── Build LangChain message history from plain data ──
+    lc_messages = []
+    for role, content in history_rows:
+        if role == "user":
+            lc_messages.append(HumanMessage(content=content))
+        elif role == "assistant":
+            lc_messages.append(AIMessage(content=content))
+    lc_messages.append(HumanMessage(content=message + material_context))
 
     async def event_stream() -> AsyncGenerator[str, None]:
         result = AgentResult()
-        full_thinking = ""
-        task = None
+        task_id = None
 
         try:
             # Send initial thinking
             thinking_text = f"收到任务，正在作为{AGENT_CONFIGS.get(agent_id, {}).get('name', 'AI Agent')}分析您的指令..."
             yield sse_event("thinking", {"text": thinking_text, "append": False})
 
-            # If sub-agents are mentioned, send handoff events
+            # Sub-agent handoffs
             for mid in mentioned_agent_ids:
                 agent_info = AGENT_CONFIGS.get(mid, {})
                 yield sse_event("agent_handoff", {
@@ -575,80 +593,80 @@ async def agent_chat(
                     "reason": f"需要{agent_info.get('description', '协作处理')}",
                 })
 
-            # Create task for tracking
-            task = AgentTask(
-                session_id=session.id,
-                title=message[:50] if message else "处理中",
-                description=message,
-                progress=0,
-                status="running",
-                started_at=datetime.utcnow(),
-            )
-            db.add(task)
-            await db.flush()
+            # Create task for tracking (short-lived session)
+            async with async_session_factory() as db:
+                task = AgentTask(
+                    session_id=session_obj_id,
+                    title=message[:50] if message else "处理中",
+                    description=message,
+                    progress=0,
+                    status="running",
+                    started_at=datetime.utcnow(),
+                )
+                db.add(task)
+                await db.flush()
+                task_id = task.id
+                await db.commit()
 
-            # ── Build LangGraph agent ──
+            # Build LangGraph agent
             langchain_tools = create_langchain_tools(agent_id)
             system_prompt = build_system_prompt(agent_id)
             graph = build_agent_graph(langchain_tools, system_prompt)
 
-            # ── Build LangChain message history ──
-            lc_messages = []
-            for h in history[:-1]:  # Exclude the just-saved user message
-                if h.role == "user":
-                    lc_messages.append(HumanMessage(content=h.content or ""))
-                elif h.role == "assistant":
-                    lc_messages.append(AIMessage(content=h.content or ""))
-                # Skip system/tool role messages from old format
-            # Append current user message with material context
-            lc_messages.append(HumanMessage(content=message + material_context))
-
-            # ── Stream agent execution ──
-            # If the client disconnects, Starlette cancels this generator
-            # (now that the event loop is no longer blocked by sync LLM calls),
-            # which raises asyncio.CancelledError — handled by the finally
-            # block below so the socket is closed cleanly instead of leaking
-            # in CLOSE_WAIT.
+            # Stream agent execution
             async for sse_str in stream_agent_response(graph, lc_messages, result):
-                # Stop early if the client has closed the connection.
                 if await request.is_disconnected():
                     break
                 yield sse_str
 
-            # ── Save assistant message ──
-            assistant_msg = AgentMessage(
-                session_id=session.id,
-                role="assistant",
-                content=result.full_content,
-                thinking=full_thinking,
-                tool_blocks=result.tool_blocks if result.tool_blocks else None,
-            )
-            db.add(assistant_msg)
-            await db.flush()
+            # Save assistant message + update task (short-lived session)
+            async with async_session_factory() as db:
+                assistant_msg = AgentMessage(
+                    session_id=session_obj_id,
+                    role="assistant",
+                    content=result.full_content,
+                    thinking=None,
+                    tool_blocks=result.tool_blocks if result.tool_blocks else None,
+                )
+                db.add(assistant_msg)
+                await db.flush()
 
-            # ── AI generates session title ──
-            if is_new_session or session.title == "新对话":
-                try:
-                    title_prompt = f"根据以下对话内容，生成一个简短的标题（10个字以内，不要引号）：\n用户：{message[:200]}\nAI：{result.full_content[:200]}"
-                    title_resp = await llm_client.chat.completions.acreate(
-                        model=settings.deepseek_model,
-                        messages=[{"role": "user", "content": title_prompt}],
-                        temperature=0.7,
-                        max_tokens=32,
-                    )
-                    new_title = title_resp.choices[0].message.content.strip().strip('"').strip("'")
-                    if new_title and len(new_title) > 1:
-                        session.title = new_title[:50]
-                        await db.flush()
-                except Exception:
-                    pass
+                # AI-generated session title
+                if is_new_session or session_title == "新对话":
+                    try:
+                        title_prompt = (
+                            f"根据以下对话内容，生成一个简短的标题（10个字以内，不要引号）：\n"
+                            f"用户：{message[:200]}\nAI：{result.full_content[:200]}"
+                        )
+                        title_resp = await llm_client.chat.completions.create(
+                            model=settings.deepseek_model,
+                            messages=[{"role": "user", "content": title_prompt}],
+                            temperature=0.7,
+                            max_tokens=32,
+                        )
+                        new_title = title_resp.choices[0].message.content.strip().strip('"').strip("'")
+                        if new_title and len(new_title) > 1:
+                            sess_result = await db.execute(
+                                select(AgentSession).where(AgentSession.id == session_obj_id)
+                            )
+                            sess = sess_result.scalar_one_or_none()
+                            if sess:
+                                sess.title = new_title[:50]
+                                await db.flush()
+                    except Exception:
+                        pass
 
-            # ── Update task ──
-            task.status = "done"
-            task.progress = 100
-            task.finished_at = datetime.utcnow()
+                # Update task status
+                if task_id is not None:
+                    task_result = await db.execute(select(AgentTask).where(AgentTask.id == task_id))
+                    task_obj = task_result.scalar_one_or_none()
+                    if task_obj:
+                        task_obj.status = "done"
+                        task_obj.progress = 100
+                        task_obj.finished_at = datetime.utcnow()
 
-            # ── Send phase result ──
+                await db.commit()
+
             yield sse_event("phase_result", {
                 "id": f"phase_{uuid.uuid4().hex[:6]}",
                 "tone": "success",
@@ -659,26 +677,22 @@ async def agent_chat(
             yield sse_event("done", {})
 
         except asyncio.CancelledError:
-            # Client disconnected — mark the task as cancelled so it does not
-            # stay "running" forever, then re-raise so Starlette closes the
-            # stream and the socket is released (prevents CLOSE_WAIT leak).
+            # Client disconnected — mark the task cancelled (short-lived session),
+            # then re-raise so Starlette closes the stream and the socket is released.
             try:
-                if task is not None:
-                    task.status = "cancelled"
-                    task.finished_at = datetime.utcnow()
-                await db.commit()
+                async with async_session_factory() as db:
+                    if task_id is not None:
+                        task_result = await db.execute(select(AgentTask).where(AgentTask.id == task_id))
+                        task_obj = task_result.scalar_one_or_none()
+                        if task_obj:
+                            task_obj.status = "cancelled"
+                            task_obj.finished_at = datetime.utcnow()
+                    await db.commit()
             except Exception:
-                await db.rollback()
+                pass
             raise
         except Exception as e:
             yield sse_event("error", {"message": str(e)})
-        finally:
-            # Always commit any pending writes (assistant message, task, etc.)
-            # so the DB session is returned to the pool.
-            try:
-                await db.commit()
-            except Exception:
-                await db.rollback()
 
     return StreamingResponse(
         event_stream(),

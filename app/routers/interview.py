@@ -11,9 +11,7 @@ from openai import AsyncOpenAI
 from app.database import get_db
 from app.models.candidate import Candidate, Position
 from app.models.interview import InterviewQuestion, InterviewEvaluation, InterviewTranscript
-from app.models.user import User
 from app.models.settings import SystemSetting
-from app.routers.auth import get_current_user
 from app.config import get_settings
 
 router = APIRouter(tags=["面试"])
@@ -209,7 +207,7 @@ async def get_questions(
 
 
 @router.put("/interview/questions")
-async def save_questions(body: dict, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
+async def save_questions(body: dict, db: AsyncSession = Depends(get_db)):
     candidate_id = body.get("candidateId")
     round = body.get("round")
     questions = body.get("questions", [])
@@ -487,7 +485,6 @@ async def save_evaluation(
     candidate_id: str,
     body: dict,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
 ):
     round = body.get("round", "first")
     scores = body.get("scores", [])

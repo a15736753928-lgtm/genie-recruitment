@@ -4,17 +4,14 @@ version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
     "asyncpg>=0.31.0",
-    "bcrypt>=4.0,<5.0",
     "fastapi>=0.139.1",
     "openai>=2.45.0",
     "opencv-python-headless>=4.10.0",
     "numpy>=2.0.0",
-    "passlib[bcrypt]>=1.7.4",
     "pydantic-settings>=2.14.2",
     "PyPDF2>=3.0.1",
     "pillow>=10.0.0",
     "python-docx>=1.1.2",
-    "python-jose>=3.5.0",
     "python-multipart>=0.0.19",
     "sqlalchemy>=2.0.51",
     "uvicorn>=0.51.0",

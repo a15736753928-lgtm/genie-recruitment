@@ -12,8 +12,6 @@ from app.models.probation import (
     Employee, ProbationTask, ProbationWeek1Assessment, ProbationConversion
 )
 from app.models.candidate import Candidate, Position
-from app.models.user import User
-from app.routers.auth import get_current_user
 from app.config import get_settings
 
 router = APIRouter(tags=["试用期"])
@@ -215,7 +213,6 @@ class CreateEmployeeRequest(BaseModel):
 async def create_employee(
     req: CreateEmployeeRequest,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
 ):
     emp = Employee(
         candidate_id=req.candidateId,
@@ -253,7 +250,6 @@ async def save_week1_assessment(
     employee_id: str,
     req: Week1AssessmentRequest,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
 ):
     emp_result = await db.execute(
         select(Employee).where(Employee.id == employee_id)
@@ -323,7 +319,6 @@ async def save_conversion(
     employee_id: str,
     req: ConversionRequest,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
 ):
     emp_result = await db.execute(
         select(Employee).where(Employee.id == employee_id)
@@ -397,7 +392,6 @@ async def save_conversion(
 async def create_probation_task(
     body: dict,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
 ):
     employee_id = body.get("employeeId")
     week_number = body.get("weekNumber")
@@ -430,7 +424,6 @@ async def update_probation_task(
     task_id: str,
     body: dict,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
 ):
     result = await db.execute(select(ProbationTask).where(ProbationTask.id == task_id))
     task = result.scalar_one_or_none()
@@ -508,7 +501,6 @@ async def update_probation_status(
     employee_id: str,
     body: dict,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
 ):
     result = await db.execute(
         select(Employee).options(selectinload(Employee.tasks)).where(Employee.id == employee_id)
@@ -527,7 +519,6 @@ async def manual_review(
     employee_id: str,
     body: dict,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
 ):
     result = await db.execute(
         select(Employee).options(selectinload(Employee.tasks)).where(Employee.id == employee_id)

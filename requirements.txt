@@ -11,11 +11,6 @@ asyncpg==0.30.0
 psycopg2-binary==2.9.10
 alembic==1.14.0
 
-# Auth
-python-jose[cryptography]==3.3.0
-passlib[bcrypt]==1.7.4
-bcrypt==4.2.1
-
 # AI & Vector
 langgraph>=0.2.0
 langchain-openai>=0.2.0

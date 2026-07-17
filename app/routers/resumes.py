@@ -19,9 +19,7 @@ from app.models.candidate import (
     Candidate, Position, CandidateSkill, CandidateEducation,
     CandidateWorkExperience, CandidateProjectExperience, CandidateAIAnalysis
 )
-from app.models.user import User
 from app.models.settings import SystemSetting
-from app.routers.auth import get_current_user
 from app.config import get_settings
 from app.services.portrait_gender import infer_gender_from_resume_file
 
@@ -757,7 +755,6 @@ async def update_resume(
     resume_id: str,
     body: dict,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
 ):
     result = await db.execute(
         select(Candidate)
@@ -875,7 +872,6 @@ async def reanalyze_resume(resume_id: str, db: AsyncSession = Depends(get_db)):
 async def delete_resume(
     resume_id: str,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
 ):
     result = await db.execute(select(Candidate).where(Candidate.id == resume_id))
     candidate = result.scalar_one_or_none()

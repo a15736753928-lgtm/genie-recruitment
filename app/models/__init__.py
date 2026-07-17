@@ -1,4 +1,3 @@
-from app.models.user import User, AuditLog
 from app.models.candidate import (
     Position, Candidate, CandidateSkill, CandidateEducation,
     CandidateWorkExperience, CandidateProjectExperience, CandidateAIAnalysis
@@ -17,7 +16,6 @@ from app.models.agent import (
 from app.models.settings import SystemSetting
 
 __all__ = [
-    "User", "AuditLog",
     "Position", "Candidate", "CandidateSkill", "CandidateEducation",
     "CandidateWorkExperience", "CandidateProjectExperience", "CandidateAIAnalysis",
     "InterviewQuestion", "InterviewEvaluation", "InterviewTranscript",

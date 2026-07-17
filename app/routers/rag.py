@@ -16,11 +16,9 @@ from sqlalchemy import select, func, desc, delete
 
 from app.database import get_db
 from app.config import get_settings
-from app.models.user import User
 from app.models.knowledge import (
     KnowledgeBase, KnowledgeDocument, KnowledgeChunk, IngestionTask, _now_ms, _short_uuid,
 )
-from app.routers.auth import get_current_user
 from app.services.rag.search_service import search, get_chunk_content
 from app.services.rag.ingest_service import ingest_file_async
 from app.services.rag.utils import (
@@ -86,7 +84,6 @@ async def list_knowledge_bases(
 async def create_knowledge_base(
     body: dict,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
 ):
     """Create a new knowledge base."""
     name = body.get("name", "").strip()
@@ -160,7 +157,6 @@ async def update_knowledge_base(
     kb_id: str,
     body: dict,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
 ):
     """Update knowledge base name/description."""
     result = await db.execute(
@@ -190,7 +186,6 @@ async def update_knowledge_base(
 async def delete_knowledge_base(
     kb_id: str,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
 ):
     """Delete a knowledge base and all its documents/chunks (cascade).
 
@@ -242,7 +237,6 @@ async def delete_knowledge_base(
 async def upload_document(
     file: UploadFile = File(...),
     kb_id: str = Form(...),
-    current_user: User = Depends(get_current_user),
 ):
     """Upload a file and start async ingestion.
 
@@ -423,7 +417,6 @@ async def get_document(
 async def delete_document(
     doc_id: str,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
 ):
     """Delete a document, its chunks (PG + Milvus), and its file."""
     result = await db.execute(
@@ -478,7 +471,6 @@ async def get_document_chunks(
     page: int = Query(1),
     page_size: int = Query(50),
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
 ):
     """Get chunks for a document (paginated preview)."""
     # Verify document exists and check ownership

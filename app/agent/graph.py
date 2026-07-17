@@ -53,6 +53,8 @@ def _create_llm(temperature: float = 0.7) -> ChatOpenAI:
         base_url=settings.deepseek_base_url,
         temperature=temperature,
         streaming=True,
+        timeout=60,
+        max_retries=0,
     )
 
 

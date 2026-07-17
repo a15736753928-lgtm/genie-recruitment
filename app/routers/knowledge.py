@@ -12,8 +12,6 @@ from pydantic import BaseModel
 from openai import OpenAI
 from app.database import get_db
 from app.models.knowledge import KnowledgeCategory, KnowledgeItem
-from app.models.user import User
-from app.routers.auth import get_current_user
 from app.config import get_settings
 
 router = APIRouter(tags=["知识库"])
@@ -325,7 +323,6 @@ async def upload_knowledge_file(file: UploadFile = File(...)):
 async def create_knowledge_item(
     body: dict,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
 ):
     file_id = body.get("fileId")
     file_path = ""
@@ -378,7 +375,6 @@ async def update_knowledge_item(
     item_id: str,
     body: dict,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
 ):
     result = await db.execute(select(KnowledgeItem).where(KnowledgeItem.id == item_id))
     item = result.scalar_one_or_none()
@@ -413,7 +409,6 @@ async def update_knowledge_item(
 async def delete_knowledge_item(
     item_id: str,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
 ):
     result = await db.execute(select(KnowledgeItem).where(KnowledgeItem.id == item_id))
     item = result.scalar_one_or_none()

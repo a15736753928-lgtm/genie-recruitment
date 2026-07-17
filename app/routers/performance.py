@@ -7,8 +7,6 @@ from pydantic import BaseModel
 from app.database import get_db
 from app.models.performance import PerformanceRecord, PerformanceQuarter
 from app.models.probation import Employee
-from app.models.user import User
-from app.routers.auth import get_current_user
 from app.config import get_settings
 
 router = APIRouter(tags=["绩效"])
@@ -208,7 +206,6 @@ async def get_quarter_trends(db: AsyncSession = Depends(get_db)):
 async def initiate_appraisal(
     body: dict,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
 ):
     quarter = body.get("quarter")
     employee_ids = body.get("employeeIds", [])
@@ -254,7 +251,6 @@ async def update_bonus(
     employee_id: str,
     body: dict,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
 ):
     bonus = body.get("bonus", 0)
     # Find most recent performance record

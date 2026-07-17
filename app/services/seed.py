@@ -1,15 +1,11 @@
-"""Seed database with root user, default categories, and default settings."""
+"""Seed database with default categories, positions, and settings."""
 import uuid
 from datetime import date
 from sqlalchemy import select, func
 from app.database import async_session_factory, Base, engine
-from app.models.user import User
 from app.models.candidate import Position
 from app.models.knowledge import KnowledgeCategory
 from app.models.settings import SystemSetting
-from passlib.context import CryptContext
-
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 # 标记岗位已完成首次初始化；之后启动不再按名称重建用户已删除的岗位
 POSITIONS_SEEDED_KEY = "positions_seeded"
@@ -97,21 +93,6 @@ async def seed_all():
     await seed_positions_v2(create_missing=create_missing_positions)
 
     async with async_session_factory() as db:
-        # ── Root user ────────────────────────────────
-        result = await db.execute(select(User).where(User.username == "admin"))
-        if not result.scalar_one_or_none():
-            user = User(
-                id=uuid.uuid4(),
-                username="admin",
-                password_hash=pwd_context.hash("12345678"),
-                display_name="HR 管理员",
-                email="admin@genietech.com",
-                role="hr_admin",
-                department="人力资源部",
-                is_active=True,
-            )
-            db.add(user)
-
         # ── Default categories ───────────────────────
         for cat in DEFAULT_CATEGORIES:
             result = await db.execute(

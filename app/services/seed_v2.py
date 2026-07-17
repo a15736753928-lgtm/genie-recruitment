@@ -8,12 +8,6 @@ from datetime import date
 from sqlalchemy import select
 from app.database import async_session_factory
 from app.models.candidate import Position, PositionQuestion
-from app.models.user import User
-from app.models.knowledge import KnowledgeCategory
-from app.models.settings import SystemSetting
-from passlib.context import CryptContext
-
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 # ══════════════════════════════════════════════════════════════
 # Common scoring criteria (used by all positions)

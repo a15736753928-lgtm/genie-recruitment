@@ -6,9 +6,6 @@ from sqlalchemy.orm import selectinload
 from pydantic import BaseModel
 from app.database import get_db
 from app.models.candidate import Position, Candidate, PositionQuestion
-from app.models.user import User
-from app.routers.auth import get_current_user
-
 router = APIRouter(tags=["岗位"])
 
 
@@ -86,7 +83,6 @@ async def get_position(position_id: str, db: AsyncSession = Depends(get_db)):
 async def create_position(
     req: CreatePositionRequest,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
 ):
     existing = await db.execute(select(Position).where(Position.name == req.name))
     if existing.scalar_one_or_none():
@@ -112,7 +108,6 @@ async def update_position(
     position_id: str,
     req: UpdatePositionRequest,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
 ):
     result = await db.execute(select(Position).where(Position.id == position_id))
     position = result.scalar_one_or_none()
@@ -132,7 +127,6 @@ async def update_position(
 async def delete_position(
     position_id: str,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
 ):
     from sqlalchemy import text
 
@@ -199,7 +193,6 @@ async def save_position_questions(
     position_id: str,
     body: dict,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
 ):
     round = body.get("round", "first")
     questions = body.get("questions", [])
