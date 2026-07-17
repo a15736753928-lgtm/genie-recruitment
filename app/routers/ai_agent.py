@@ -10,11 +10,13 @@ from sqlalchemy import select, desc
 from sqlalchemy.orm import selectinload
 from pydantic import BaseModel
 from openai import OpenAI
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from app.database import get_db
 from app.models.user import User
 from app.models.agent import AgentSession, AgentMessage, AgentMaterial, AgentTask
 from app.routers.auth import get_current_user, get_optional_user
-from app.agent.tools import get_tools_for_agent, TOOL_REGISTRY
+from app.agent.tools import create_langchain_tools
+from app.agent.graph import build_agent_graph, stream_agent_response, AgentResult
 from app.config import get_settings
 from app.routers.resumes import extract_text_from_file, parse_resume_with_llm
 import os
@@ -554,16 +556,8 @@ async def agent_chat(
     )
     history = history_result.scalars().all()
 
-    messages = [{"role": "system", "content": build_system_prompt(agent_id)}]
-    for h in history[:-1]:  # Exclude the just-saved user message
-        messages.append({"role": h.role, "content": h.content or ""})
-
-    # Get tools for this agent
-    tools = get_tools_for_agent(agent_id)
-
     async def event_stream() -> AsyncGenerator[str, None]:
-        tool_blocks = []
-        full_content = ""
+        result = AgentResult()
         full_thinking = ""
 
         try:
@@ -592,142 +586,41 @@ async def agent_chat(
             db.add(task)
             await db.flush()
 
-            # Call DeepSeek API with tool streaming
-            # First, check if the message requires tool calls by asking the model
-            tool_choice_prompt = f"""用户指令：「{message}」{material_context}
+            # ── Build LangGraph agent ──
+            langchain_tools = create_langchain_tools(agent_id)
+            system_prompt = build_system_prompt(agent_id)
+            graph = build_agent_graph(langchain_tools, system_prompt)
 
-请判断是否需要调用工具来获取数据或执行操作。如果需要，列出应调用的工具名称和参数（JSON数组）。
-如果不需要工具，回复 "NO_TOOLS"。
+            # ── Build LangChain message history ──
+            lc_messages = []
+            for h in history[:-1]:  # Exclude the just-saved user message
+                if h.role == "user":
+                    lc_messages.append(HumanMessage(content=h.content or ""))
+                elif h.role == "assistant":
+                    lc_messages.append(AIMessage(content=h.content or ""))
+                # Skip system/tool role messages from old format
+            # Append current user message with material context
+            lc_messages.append(HumanMessage(content=message + material_context))
 
-可用工具：{json.dumps([{ 'name': t['name'], 'description': t['description'] } for t in tools], ensure_ascii=False)}
+            # ── Stream agent execution ──
+            async for sse_str in stream_agent_response(graph, lc_messages, result):
+                yield sse_str
 
-格式：["tool_name", {{"param": "value"}}] 或 NO_TOOLS"""
-
-            tool_response = llm_client.chat.completions.create(
-                model=settings.deepseek_model,
-                messages=[
-                    {"role": "system", "content": build_system_prompt(agent_id)},
-                    {"role": "user", "content": tool_choice_prompt},
-                ],
-                temperature=0.3,
-                max_tokens=1024,
-            )
-
-            tool_text = tool_response.choices[0].message.content.strip()
-            needs_tools = tool_text != "NO_TOOLS" and not tool_text.startswith("NO_TOOLS")
-
-            parsed_tools = []
-            if needs_tools:
-                try:
-                    if tool_text.startswith("```"):
-                        tool_text = tool_text.split("\n", 1)[1].rsplit("\n", 1)[0]
-                    parsed_tools = json.loads(tool_text)
-                    if isinstance(parsed_tools, dict):
-                        parsed_tools = [parsed_tools]
-                except Exception:
-                    parsed_tools = []
-
-            # Execute tools
-            for tool_item in parsed_tools:
-                if isinstance(tool_item, list) and len(tool_item) >= 2:
-                    tool_name = tool_item[0]
-                    tool_params = tool_item[1]
-                elif isinstance(tool_item, dict) and "name" in tool_item:
-                    tool_name = tool_item["name"]
-                    tool_params = tool_item.get("params", {})
-                else:
-                    continue
-
-                if tool_name not in [t["name"] for t in tools]:
-                    continue
-
-                tool_id = f"tool_{uuid.uuid4().hex[:8]}"
-                yield sse_event("tool_call", {
-                    "id": tool_id,
-                    "name": tool_name,
-                    "params": tool_params,
-                })
-
-                yield sse_event("task_progress", {
-                    "title": f"正在执行 {tool_name}",
-                    "description": str(tool_params)[:100],
-                    "progress": 30,
-                    "elapsed": "执行中...",
-                })
-
-                # Execute
-                result_text = await execute_tool_call(tool_name, tool_params, db)
-
-                yield sse_event("tool_result", {
-                    "id": tool_id,
-                    "result": result_text,
-                })
-
-                tool_blocks.append({
-                    "id": tool_id,
-                    "name": tool_name,
-                    "params": tool_params,
-                    "result": result_text,
-                    "status": "done",
-                })
-
-            # Generate final response
-            tool_context = ""
-            if tool_blocks:
-                tool_context = "\n\n工具执行结果：\n" + "\n".join(
-                    f"- {tb['name']}: {tb.get('result', '')}" for tb in tool_blocks
-                )
-
-            final_messages = [
-                {"role": "system", "content": build_system_prompt(agent_id)},
-            ]
-            for h in history[:-1]:
-                final_messages.append({"role": h.role, "content": h.content or ""})
-            final_messages.append({"role": "user", "content": message + material_context + tool_context})
-
-            # Stream final response
-            stream = llm_client.chat.completions.create(
-                model=settings.deepseek_model,
-                messages=final_messages,
-                temperature=0.7,
-                max_tokens=2048,
-                stream=True,
-            )
-
-            for chunk in stream:
-                if chunk.choices and chunk.choices[0].delta.content:
-                    delta = chunk.choices[0].delta.content
-                    full_content += delta
-                    yield sse_event("content", {"delta": delta})
-
-            # Send phase result
-            yield sse_event("phase_result", {
-                "id": f"phase_{uuid.uuid4().hex[:6]}",
-                "tone": "success",
-                "title": "任务完成",
-                "description": message[:80] + ("..." if len(message) > 80 else ""),
-            })
-
-            # Update task
-            task.status = "done"
-            task.progress = 100
-            task.finished_at = datetime.utcnow()
-
-            # Save assistant message
+            # ── Save assistant message ──
             assistant_msg = AgentMessage(
                 session_id=session.id,
                 role="assistant",
-                content=full_content,
+                content=result.full_content,
                 thinking=full_thinking,
-                tool_blocks=tool_blocks if tool_blocks else None,
+                tool_blocks=result.tool_blocks if result.tool_blocks else None,
             )
             db.add(assistant_msg)
             await db.flush()
 
-            # AI generates session title from the conversation
+            # ── AI generates session title ──
             if is_new_session or session.title == "新对话":
                 try:
-                    title_prompt = f"根据以下对话内容，生成一个简短的标题（10个字以内，不要引号）：\n用户：{message[:200]}\nAI：{full_content[:200]}"
+                    title_prompt = f"根据以下对话内容，生成一个简短的标题（10个字以内，不要引号）：\n用户：{message[:200]}\nAI：{result.full_content[:200]}"
                     title_resp = llm_client.chat.completions.create(
                         model=settings.deepseek_model,
                         messages=[{"role": "user", "content": title_prompt}],
@@ -740,6 +633,19 @@ async def agent_chat(
                         await db.flush()
                 except Exception:
                     pass
+
+            # ── Update task ──
+            task.status = "done"
+            task.progress = 100
+            task.finished_at = datetime.utcnow()
+
+            # ── Send phase result ──
+            yield sse_event("phase_result", {
+                "id": f"phase_{uuid.uuid4().hex[:6]}",
+                "tone": "success",
+                "title": "任务完成",
+                "description": message[:80] + ("..." if len(message) > 80 else ""),
+            })
 
             yield sse_event("done", {})
 

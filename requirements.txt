@@ -17,7 +17,9 @@ passlib[bcrypt]==1.7.4
 bcrypt==4.2.1
 
 # AI & Vector
-agno==1.2.8
+langgraph>=0.2.0
+langchain-openai>=0.2.0
+langchain-core>=0.3.0
 openai==1.59.6
 pymilvus==2.5.0
 milvus-lite==2.5.0
