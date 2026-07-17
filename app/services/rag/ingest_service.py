@@ -255,6 +255,22 @@ def _merge_texts(fast_text: str, ocr_text: str) -> str:
     return ocr  # fallback: whatever we have
 
 
+# ── Graph Index Building ───────────────────────────────
+
+def _build_graph_index(doc_id: str, kb_id: str, chunks: list[str], milvus_ids: list[int]):
+    """Build Kuzu graph index for a document's chunks (background, non-blocking).
+
+    Called synchronously in the background thread but failures are non-fatal.
+    """
+    try:
+        from app.services.rag.graph_indexer import index_document_chunks
+        index_document_chunks(doc_id, kb_id, chunks, milvus_ids)
+    except ImportError:
+        logger.debug("graph_indexer 不可用，跳过图谱索引")
+    except Exception as e:
+        logger.warning("图谱索引异常: %s", e)
+
+
 # ── Background Ingestion ────────────────────────────────────
 
 def _run_ingest_sync(
@@ -337,19 +353,29 @@ def _run_ingest_sync(
         if not chunks:
             chunks = [cleaned[: settings.chunk_size]]
 
-        # 5. Encode in batches with real embeddings
+        # 5. Encode in batches — dual vectors (dense + sparse)
         _update("encoding", 60)
-        all_vectors = []
+        from app.services.rag.embedding import encode_dense, encode_sparse
+
+        all_dense = []
+        all_sparse = []
         bsize = settings.ingest_batch_size
         for i in range(0, len(chunks), bsize):
             batch = chunks[i : i + bsize]
-            all_vectors.extend(encode_batch(batch))
+            all_dense.extend(encode_dense(batch))
+            if settings.sparse_vector_enabled:
+                try:
+                    all_sparse.extend(encode_sparse(batch))
+                except Exception:
+                    all_sparse.extend([{} for _ in batch])
+            else:
+                all_sparse.extend([{} for _ in batch])
             pct = 60 + int(25 * (i + len(batch)) / max(len(chunks), 1))
             _update("encoding", min(pct, 85))
 
-        # 6. Insert vectors → Milvus
+        # 6. Insert dual vectors → Milvus
         _update("indexing", 85)
-        milvus_ids = insert_vectors(all_vectors, [kb_id] * len(all_vectors))
+        milvus_ids = insert_vectors(all_dense, all_sparse, [kb_id] * len(all_dense))
 
         # 7. Store chunks → PostgreSQL
         _update("indexing", 95)
@@ -377,6 +403,14 @@ def _run_ingest_sync(
             kb.doc_count = (kb.doc_count or 0) + 1
             kb.chunk_count = (kb.chunk_count or 0) + len(chunks)
             kb.updated_at = _now_ms()
+
+        # 9. Background: graph index + community detection
+        if settings.graph_index_enabled and settings.kuzu_enabled:
+            try:
+                _update("completed", 98, "启动图谱索引...")
+                _build_graph_index(doc_id, kb_id, chunks, milvus_ids)
+            except Exception as e:
+                logger.warning("图谱索引失败 (非致命): %s", e)
 
         _update("completed", 100, f"入库完成，共 {len(chunks)} 个分片")
         logger.info(

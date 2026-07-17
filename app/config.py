@@ -36,9 +36,15 @@ class Settings(BaseSettings):
     # Milvus
     milvus_db_path: str = "milvus_lite.db"
     milvus_collection_name: str = "hr_knowledge_chunks"
-    embedding_dim: int = 512   # bge-small-zh-v1.5 embedding dimension
-    embedding_model: str = "BAAI/bge-small-zh-v1.5"  # sentence-transformers model
-    embedding_device: str = "cpu"  # "cpu" or "cuda" — GPU not required
+    embedding_dim: int = 1024  # BGE-M3 dense output dimension
+    embedding_model: str = "BAAI/bge-m3"  # tokenizer name for BGE-M3
+    embedding_device: str = "cuda"  # "cpu" or "cuda"
+
+    # BGE-M3 ONNX
+    bge_onnx_model_name: str = "gpahal/bge-m3-onnx-int8"
+    bge_onnx_filename: str = "model_quantized.onnx"
+    model_cache_dir: str = "storage/cache"
+    sparse_vector_enabled: bool = True
 
     # RAG — Chunking
     chunk_size: int = 500       # default chunk size (characters)
@@ -52,7 +58,21 @@ class Settings(BaseSettings):
     search_ef: int = 64               # HNSW search parameter
     rerank_enabled: bool = True
     rerank_top_k: int = 20   # candidates to fetch before reranking
-    reranker_model: str = "BAAI/bge-reranker-base"  # CrossEncoder reranker
+    reranker_model: str = "BAAI/bge-reranker-v2-m3"  # CrossEncoder reranker
+
+    # RAG — RRF (Reciprocal Rank Fusion)
+    rrf_k: int = 60                   # RRF smoothing constant
+    rrf_dense_weight: float = 0.7     # dense semantic match weight
+    rrf_sparse_weight: float = 0.3    # sparse keyword match weight
+    rrf_graph_weight: float = 0.25    # graph structure weight
+
+    # RAG — Kuzu Graph Database
+    kuzu_data_dir: str = "storage/kuzu_data"
+    kuzu_enabled: bool = True
+    graph_index_enabled: bool = True  # background graph indexing after ingestion
+
+    # RAG — Community Detection
+    community_enabled: bool = True
 
     # RAG — Ingestion
     ingest_batch_size: int = 64     # embedding batch size

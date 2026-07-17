@@ -1,9 +1,11 @@
-"""Semantic-aware text chunking with context bridging.
+"""
+Semantic-aware text chunking with context bridging.
 
 Blueprint alignment: Section 7.4
+
 Two strategies:
-  - sentence_split(): Sentence-boundary-aware splitting for structured docs
-  - semantic_split(): Similarity-based splitting for long documents
+  - split_text_sentence(): Sentence-boundary-aware for structured docs
+  - split_text_semantic(): Embedding-similarity-based for long documents
 
 Both include _bridge_context() for overlap via preceding context.
 """
@@ -14,16 +16,12 @@ from app.config import get_settings
 
 settings = get_settings()
 
-# Sentence boundary pattern (Chinese + English)
-_SENT_PATTERN = re.compile(
-    r'(?<=[。！？.!?\n])\s*'
-)
+_SENT_PATTERN = re.compile(r'(?<=[。！？.!?\n])\s*')
 
 
 def _split_sentences(text: str) -> list[str]:
     """Split text into sentences at punctuation boundaries."""
     raw = _SENT_PATTERN.split(text)
-    # Re-attach the punctuation to each segment
     sentences = []
     buf = ""
     for part in raw:
@@ -36,16 +34,11 @@ def _split_sentences(text: str) -> list[str]:
     return [s.strip() for s in sentences if s.strip()]
 
 
-def _bridge_context(
-    chunks: list[str],
-    overlap: int = 100,
-) -> list[str]:
+def _bridge_context(chunks: list[str], overlap: int = 100) -> list[str]:
     """Prepend tail of previous chunk as context bridge.
 
-    Algorithm from blueprint:
-    - For each chunk (except first), prepend ~overlap chars from prev chunk's tail
-    - Align cut point to nearest sentence boundary
-    - Prevents context from inflating across multiple bridges
+    For each chunk (except first), prepend ~overlap chars from prev chunk's tail,
+    aligned to nearest sentence boundary to avoid mid-sentence cuts.
     """
     if not chunks or overlap <= 0:
         return chunks
@@ -55,19 +48,15 @@ def _bridge_context(
         prev = chunks[i - 1]
         current = chunks[i]
 
-        # Take tail of previous chunk
         ideal_start = max(0, len(prev) - overlap)
-        # Search for best sentence boundary near ideal_start (±margin)
         margin = min(50, overlap // 2)
         search_start = max(0, ideal_start - margin)
         search_end = min(len(prev), ideal_start + margin)
 
-        # Find the nearest sentence boundary
         best_pos = ideal_start
-        for sent_pat in [r'[。！？.!?]', r'\n', r'；;', r'，,']:
-            matches = list(re.finditer(sent_pat, prev[search_start:search_end]))
+        for boundary in [r'[。！？.!?]', r'\n', r'；;', r'，,']:
+            matches = list(re.finditer(boundary, prev[search_start:search_end]))
             if matches:
-                # Pick the boundary closest to ideal_start
                 best = min(matches, key=lambda m: abs((search_start + m.end()) - ideal_start))
                 best_pos = search_start + best.end()
                 break
@@ -81,16 +70,12 @@ def _bridge_context(
     return bridged
 
 
-def split_text(
+def split_text_sentence(
     text: str,
     chunk_size: Optional[int] = None,
     chunk_overlap: Optional[int] = None,
 ) -> list[str]:
-    """Sentence-boundary-aware chunking.
-
-    Splits at sentence boundaries, merges short sentences up to chunk_size,
-    then applies context bridging.
-    """
+    """Sentence-boundary-aware chunking (primary strategy for structured docs)."""
     chunk_size = chunk_size or settings.chunk_size
     chunk_overlap = chunk_overlap or settings.chunk_overlap
 
@@ -106,7 +91,6 @@ def split_text(
         else:
             if current.strip():
                 chunks.append(current.strip())
-            # If a single sentence exceeds chunk_size, force-split it
             if len(sent) > chunk_size:
                 for i in range(0, len(sent), chunk_size - chunk_overlap):
                     piece = sent[i:i + chunk_size]
@@ -119,7 +103,6 @@ def split_text(
     if current.strip():
         chunks.append(current.strip())
 
-    # Merge very short chunks (< 40 chars) into previous
     min_size = settings.min_chunk_size
     merged = []
     for chunk in chunks:
@@ -128,16 +111,77 @@ def split_text(
         else:
             merged.append(chunk)
 
-    # Apply context bridging
     return _bridge_context(merged, chunk_overlap)
 
 
-def split_text_simple(
+def split_text_semantic(
     text: str,
-    chunk_size: int = 500,
-    overlap: int = 100,
+    chunk_size: Optional[int] = None,
+    chunk_overlap: Optional[int] = None,
 ) -> list[str]:
-    """Fixed-size chunking with overlap (fallback for when sentence split fails)."""
+    """Semantic splitting via embedding-similarity breakpoints.
+
+    Uses LlamaIndex SemanticSplitterNodeParser to find natural
+    topic boundaries where adjacent sentence embeddings diverge.
+
+    Falls back to sentence splitting if LlamaIndex is unavailable.
+    """
+    chunk_size = chunk_size or settings.chunk_size
+    chunk_overlap = chunk_overlap or settings.chunk_overlap
+
+    sentences = _split_sentences(text)
+    if len(sentences) <= 1:
+        # Single sentence or empty → use sentence split
+        return split_text_sentence(text, chunk_size, chunk_overlap)
+
+    try:
+        from llama_index.core.node_parser import SemanticSplitterNodeParser
+        from app.core.model_loader import _get_model as _get_embedding
+
+        # Get the embedding model (SentenceTransformer compatible)
+        embed_model = _get_embedding()
+        if embed_model is None:
+            raise RuntimeError("Embedding model not loaded")
+
+        splitter = SemanticSplitterNodeParser(
+            embed_model=embed_model,
+            buffer_size=1,
+            breakpoint_percentile_threshold=95,
+        )
+
+        # LlamaIndex expects Document objects
+        from llama_index.core import Document
+        doc = Document(text=text)
+        nodes = splitter.get_nodes_from_documents([doc])
+
+        chunks = []
+        for node in nodes:
+            node_text = node.get_content()
+            if node_text.strip():
+                chunks.append(node_text.strip())
+
+        if not chunks:
+            return split_text_sentence(text, chunk_size, chunk_overlap)
+
+        # Merge short chunks
+        merged = []
+        for chunk in chunks:
+            if merged and len(chunk) < settings.min_chunk_size:
+                merged[-1] += "\n" + chunk
+            else:
+                merged.append(chunk)
+
+        return _bridge_context(merged, chunk_overlap)
+
+    except ImportError:
+        # LlamaIndex not available → fallback
+        return split_text_sentence(text, chunk_size, chunk_overlap)
+    except Exception:
+        return split_text_sentence(text, chunk_size, chunk_overlap)
+
+
+def split_text_simple(text: str, chunk_size: int = 500, overlap: int = 100) -> list[str]:
+    """Fixed-size chunking with overlap (fallback)."""
     if not text:
         return []
 
@@ -152,7 +196,7 @@ def split_text_simple(
         if start >= text_len:
             break
         if start <= 0:
-            start = chunk_size  # safety
+            start = chunk_size
 
     return chunks
 
@@ -165,8 +209,9 @@ def chunk_document(
 ) -> list[str]:
     """Main entry point: chunk cleaned text for ingestion.
 
-    Uses sentence-boundary split as primary strategy,
-    falls back to fixed-size for very short or unstructured text.
+    Uses semantic splitting for long documents (>2000 chars),
+    sentence-boundary splitting for medium documents,
+    and single-chunk for very short text.
     """
     if not text or not text.strip():
         return []
@@ -174,17 +219,23 @@ def chunk_document(
     chunk_size = chunk_size or settings.chunk_size
     chunk_overlap = chunk_overlap or settings.chunk_overlap
 
-    # For very short text, return as single chunk
     if len(text) <= chunk_size:
         return [text.strip()]
 
-    # Primary: sentence-boundary split
+    # Semantic splitting for long documents
+    if len(text) > 2000:
+        try:
+            chunks = split_text_semantic(text, chunk_size, chunk_overlap)
+            if chunks and len(chunks) >= 1:
+                return chunks
+        except Exception:
+            pass
+
     try:
-        chunks = split_text(text, chunk_size, chunk_overlap)
-        if chunks and len(chunks) > 0:
+        chunks = split_text_sentence(text, chunk_size, chunk_overlap)
+        if chunks:
             return chunks
     except Exception:
         pass
 
-    # Fallback: fixed-size split
     return split_text_simple(text, chunk_size, chunk_overlap)

@@ -1,12 +1,14 @@
-"""Milvus Lite manager — embedded vector database.
+"""
+Milvus Lite manager — dual-vector embedded database.
 
-Blueprint alignment: Section 5.2 / 5.3
-- Collection: single collection with dense_vector (1024-dim COSINE)
-- Schema: id (auto), kb_id (varchar), dense_vector (float_vector)
+Blueprint alignment: Section 5.2
+- Dense vector: 1024-dim FLOAT_VECTOR, HNSW COSINE index
+- Sparse vector: SPARSE_FLOAT_VECTOR, SPARSE_INVERTED_INDEX IP
+- Both in a single collection with kb_id filter field
 - Text stored in PostgreSQL chunks table, linked via milvus_pk
-- HNSW index: M=16, efConstruction=256, metric=COSINE
 
-Uses milvus-lite 3.x (embedded, no server process needed).
+IMPORTANT: After upgrading from the old 512-dim single-vector schema,
+existing collection must be dropped and documents re-ingested.
 """
 
 import re
@@ -14,13 +16,11 @@ import threading
 import numpy as np
 from typing import Optional
 
-from pymilvus import MilvusClient
+from pymilvus import MilvusClient, DataType
 from app.config import get_settings
 
 settings = get_settings()
 
-# Validate kb_id format to prevent filter expression injection
-# Format: kb_ followed by exactly 8 hex characters
 _KB_ID_PATTERN = re.compile(r'^kb_[a-f0-9]{8}$')
 
 _lock = threading.Lock()
@@ -29,7 +29,6 @@ _collection_ready: bool = False
 
 
 def _get_client() -> MilvusClient:
-    """Get or create the MilvusClient (thread-safe)."""
     global _client
     if _client is None:
         with _lock:
@@ -39,7 +38,7 @@ def _get_client() -> MilvusClient:
 
 
 def ensure_collection() -> bool:
-    """Ensure the collection exists with proper schema. Returns True if ready."""
+    """Create dual-vector collection if not exists. Returns True if ready."""
     global _collection_ready
     if _collection_ready:
         return True
@@ -55,45 +54,80 @@ def ensure_collection() -> bool:
                 _collection_ready = True
                 return True
 
-            # Create collection with auto-ID and dense vector
-            client.create_collection(
-                collection_name=coll_name,
-                dimension=settings.embedding_dim,
-                metric_type="COSINE",
+            # Create schema with dual vector fields
+            schema = client.create_schema(
                 auto_id=True,
-                # enable dynamic field for kb_id
+                enable_dynamic_field=False,
+            )
+            schema.add_field(
+                field_name="id",
+                datatype=DataType.INT64,
+                is_primary=True,
+                auto_id=True,
+            )
+            schema.add_field(
+                field_name="kb_id",
+                datatype=DataType.VARCHAR,
+                max_length=128,
+            )
+            schema.add_field(
+                field_name="dense_vector",
+                datatype=DataType.FLOAT_VECTOR,
+                dim=settings.embedding_dim,  # 1024
+            )
+            schema.add_field(
+                field_name="sparse_vector",
+                datatype=DataType.SPARSE_FLOAT_VECTOR,
             )
 
-            # Create HNSW index
+            # Create collection
+            client.create_collection(
+                collection_name=coll_name,
+                schema=schema,
+            )
+
+            # Dense HNSW index (COSINE)
             client.create_index(
                 collection_name=coll_name,
-                field_name="vector",
+                field_name="dense_vector",
                 index_type="HNSW",
                 metric_type="COSINE",
                 params={"M": 16, "efConstruction": 256},
             )
 
+            # Sparse inverted index (IP)
+            client.create_index(
+                collection_name=coll_name,
+                field_name="sparse_vector",
+                index_type="SPARSE_INVERTED_INDEX",
+                metric_type="IP",
+                params={"drop_ratio_build": 0.2},
+            )
+
             _collection_ready = True
             return True
+
         except Exception as e:
             print(f"[Milvus] Failed to init collection: {e}")
             return False
 
 
 def insert_vectors(
-    vectors: list[list[float]],
+    dense_vectors: list[list[float]],
+    sparse_vectors: list[dict[int, float]],
     kb_ids: list[str],
 ) -> list[int]:
-    """Insert dense vectors into Milvus. Returns list of auto-generated IDs.
+    """Insert dual vectors (dense + sparse) into Milvus.
 
     Args:
-        vectors: List of dense vectors, each [dim] float list
-        kb_ids: kb_id per vector for partition/filtering
+        dense_vectors: List of 1024-dim float lists
+        sparse_vectors: List of {token_id: weight} dicts
+        kb_ids: kb_id per vector
 
     Returns:
         List of auto-generated integer IDs (milvus_pk)
     """
-    if not vectors:
+    if not dense_vectors:
         return []
 
     if not ensure_collection():
@@ -103,15 +137,15 @@ def insert_vectors(
     coll_name = settings.milvus_collection_name
 
     data = []
-    for vec, kb_id in zip(vectors, kb_ids):
+    for d_vec, s_vec, kb_id in zip(dense_vectors, sparse_vectors, kb_ids):
         data.append({
-            "vector": vec,
+            "dense_vector": d_vec,
+            "sparse_vector": s_vec,
             "kb_id": kb_id,
         })
 
     try:
         result = client.insert(collection_name=coll_name, data=data)
-        # result is a dict with 'ids' key (list of ints)
         ids = result.get("ids", [])
         return ids if isinstance(ids, list) else list(ids)
     except Exception as e:
@@ -126,13 +160,8 @@ def search_dense(
 ) -> list[dict]:
     """Dense vector search (COSINE similarity).
 
-    Args:
-        query_vector: Normalized dense vector
-        top_k: Number of results
-        kb_id: Optional knowledge base filter
-
     Returns:
-        List of {id: milvus_pk, distance: float, kb_id: str}
+        [{id: milvus_pk, distance: float, kb_id: str}, ...]
     """
     if not ensure_collection():
         return []
@@ -141,10 +170,8 @@ def search_dense(
     coll_name = settings.milvus_collection_name
 
     try:
-        # Build filter expression for kb_id
         filter_expr = None
         if kb_id:
-            # Validate kb_id format to prevent expression injection
             if not _KB_ID_PATTERN.match(kb_id):
                 raise ValueError(f"Invalid kb_id format: {kb_id[:20]}...")
             filter_expr = f'kb_id == "{kb_id}"'
@@ -152,32 +179,86 @@ def search_dense(
         results = client.search(
             collection_name=coll_name,
             data=[query_vector],
+            anns_field="dense_vector",
             limit=top_k,
             filter=filter_expr,
             output_fields=["kb_id"],
-            search_params={"ef": settings.search_ef if hasattr(settings, 'search_ef') else 64},
+            search_params={"ef": settings.search_ef},
         )
 
-        # results is list[list[dict]] — one inner list per query
         if not results or not results[0]:
             return []
 
         hits = []
         for hit in results[0]:
             hits.append({
-                "id": hit["id"],          # milvus auto-id
+                "id": hit["id"],
                 "distance": hit["distance"],
                 "kb_id": hit.get("entity", {}).get("kb_id", ""),
             })
         return hits
 
     except Exception as e:
-        print(f"[Milvus] Search error: {e}")
+        print(f"[Milvus] Dense search error: {e}")
+        return []
+
+
+def search_sparse(
+    sparse_vector: dict[int, float],
+    top_k: int = 10,
+    kb_id: Optional[str] = None,
+) -> list[dict]:
+    """Sparse vector search (IP — inner product).
+
+    Args:
+        sparse_vector: {token_id: weight} dict
+        top_k: Number of results
+        kb_id: Optional KB filter
+
+    Returns:
+        [{id: milvus_pk, distance: float, kb_id: str}, ...]
+    """
+    if not ensure_collection():
+        return []
+
+    client = _get_client()
+    coll_name = settings.milvus_collection_name
+
+    try:
+        filter_expr = None
+        if kb_id:
+            if not _KB_ID_PATTERN.match(kb_id):
+                raise ValueError(f"Invalid kb_id format: {kb_id[:20]}...")
+            filter_expr = f'kb_id == "{kb_id}"'
+
+        results = client.search(
+            collection_name=coll_name,
+            data=[sparse_vector],
+            anns_field="sparse_vector",
+            limit=top_k,
+            filter=filter_expr,
+            output_fields=["kb_id"],
+        )
+
+        if not results or not results[0]:
+            return []
+
+        hits = []
+        for hit in results[0]:
+            hits.append({
+                "id": hit["id"],
+                "distance": hit["distance"],
+                "kb_id": hit.get("entity", {}).get("kb_id", ""),
+            })
+        return hits
+
+    except Exception as e:
+        print(f"[Milvus] Sparse search error: {e}")
         return []
 
 
 def delete_by_ids(ids: list[int]) -> bool:
-    """Delete vectors by their Milvus primary keys."""
+    """Delete vectors by Milvus primary keys."""
     if not ids or not ensure_collection():
         return False
 
@@ -185,7 +266,6 @@ def delete_by_ids(ids: list[int]) -> bool:
     coll_name = settings.milvus_collection_name
 
     try:
-        # Build expression: id in [1, 2, 3, ...]
         id_list = ", ".join(str(i) for i in ids)
         client.delete(collection_name=coll_name, filter=f"id in [{id_list}]")
         return True
@@ -197,7 +277,7 @@ def delete_by_ids(ids: list[int]) -> bool:
 def get_collection_stats() -> dict:
     """Get collection statistics."""
     if not ensure_collection():
-        return {"num_entities": 0}
+        return {"row_count": 0}
 
     client = _get_client()
     coll_name = settings.milvus_collection_name
@@ -207,4 +287,20 @@ def get_collection_stats() -> dict:
         return stats
     except Exception as e:
         print(f"[Milvus] Stats error: {e}")
-        return {"num_entities": 0}
+        return {"row_count": 0}
+
+
+def drop_collection() -> bool:
+    """Drop and recreate the collection (for schema migration)."""
+    global _collection_ready
+    client = _get_client()
+    coll_name = settings.milvus_collection_name
+
+    try:
+        if client.has_collection(coll_name):
+            client.drop_collection(coll_name)
+        _collection_ready = False
+        return ensure_collection()
+    except Exception as e:
+        print(f"[Milvus] Drop error: {e}")
+        return False
