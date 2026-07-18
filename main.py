@@ -6,12 +6,6 @@ import uvicorn
 from app.config import get_settings
 
 settings = get_settings()
-
-# reload=True spawns a worker subprocess. PyCharm's Stop button on Windows
-# only kills the parent reloader, leaving the worker orphaned on port 8000 —
-# so the next Run collides with the orphan and "does nothing" until you click
-# again. Disable reload under PyCharm (it sets PYCHARM_HOSTED=1); keep it on
-# in the terminal where Ctrl+C tears down both processes cleanly.
 _in_pycharm = os.getenv("PYCHARM_HOSTED") == "1"
 _reload = not _in_pycharm
 

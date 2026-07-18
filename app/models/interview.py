@@ -10,7 +10,12 @@ from app.database import Base
 
 class InterviewQuestion(Base):
     __tablename__ = "interview_questions"
-    __table_args__ = (UniqueConstraint("candidate_id", "round", "index_num"),)
+    # 唯一约束包含 source：面试出题(pre_generated)与面试评定转写抽取(transcript)
+    # 两类题目各自独立编号，互不冲突。
+    __table_args__ = (
+        UniqueConstraint("candidate_id", "round", "source", "index_num",
+                         name="uq_interview_questions_cand_round_source_idx"),
+    )
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     candidate_id = Column(UUID(as_uuid=True), ForeignKey("candidates.id", ondelete="CASCADE"))
@@ -19,10 +24,15 @@ class InterviewQuestion(Base):
     content = Column(Text, nullable=False)
     category = Column(String(64))
     difficulty = Column(String(8))
+    # 题目来源：pre_generated=面试出题环节 AI 生成；transcript=从上传的面试转写文本中抽取
+    source = Column(String(16), nullable=False, default="pre_generated")
+    # 当 source='transcript' 时，关联到具体的转写记录（删除记录时级联删除其题目与评分）
+    transcript_id = Column(UUID(as_uuid=True), ForeignKey("interview_transcripts.id", ondelete="CASCADE"), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     candidate = relationship("Candidate", back_populates="questions")
     evaluations = relationship("InterviewEvaluation", back_populates="question", cascade="all, delete-orphan")
+    transcript = relationship("InterviewTranscript", back_populates="questions")
 
 
 class InterviewEvaluation(Base):
@@ -49,13 +59,16 @@ class InterviewEvaluation(Base):
 
 class InterviewTranscript(Base):
     __tablename__ = "interview_transcripts"
-    __table_args__ = (UniqueConstraint("candidate_id", "round"),)
+    # 支持同一候选人同一轮多次上传历史记录，故不再加 (candidate_id, round) 唯一约束。
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     candidate_id = Column(UUID(as_uuid=True), ForeignKey("candidates.id", ondelete="CASCADE"))
     round = Column(String(8), nullable=False)
     content = Column(Text, nullable=False)
     source = Column(String(16))
+    # 原始文件名，用于历史记录展示
+    filename = Column(String(255), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     candidate = relationship("Candidate", back_populates="transcripts")
+    questions = relationship("InterviewQuestion", back_populates="transcript", cascade="all, delete-orphan")

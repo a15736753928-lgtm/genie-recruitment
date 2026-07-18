@@ -145,6 +145,54 @@ def _run_migrations(connection):
     _add_column_if_missing(connection, "knowledge_documents", "source_id", "VARCHAR(64) DEFAULT ''")
     # v4: 修正历史脏状态 low_match —— 该状态不在前端合法状态枚举内，恢复为「求职中」
     _cleanup_low_match_status(connection)
+    # v5: 面试题来源标记（pre_generated/transcript），区分面试出题与面试评定抽取的题目
+    _add_column_if_missing(connection, "interview_questions", "source", "VARCHAR(16) NOT NULL DEFAULT 'pre_generated'")
+    # v6: 唯一约束加入 source，让两类题目各自独立编号互不冲突
+    _migrate_interview_questions_unique_constraint(connection)
+    # v7: 支持面试评定的多次上传历史记录
+    _migrate_transcript_history(connection)
+
+
+def _migrate_transcript_history(connection) -> None:
+    """支持面试评定上传历史记录：
+    1. 删除 interview_transcripts 上的 (candidate_id, round) 唯一约束，允许同轮多次上传。
+    2. 给 interview_transcripts 加 filename 列，记录原始文件名用于历史展示。
+    3. 给 interview_questions 加 transcript_id 列，关联到具体转写记录，删除记录时级联删除题目与评分。
+    幂等：列/约束已存在则跳过。
+    """
+    from sqlalchemy import text
+
+    transcripts_exists = connection.execute(text(
+        "SELECT EXISTS ("
+        "  SELECT 1 FROM information_schema.tables"
+        "  WHERE table_schema = 'public' AND table_name = 'interview_transcripts'"
+        ")"
+    )).scalar()
+    if not transcripts_exists:
+        return
+
+    connection.execute(text("SET LOCAL lock_timeout = '3s'"))
+    # 1. 删除旧唯一约束（PostgreSQL 默认自动生成的名称）
+    connection.execute(text(
+        "ALTER TABLE interview_transcripts "
+        "DROP CONSTRAINT IF EXISTS interview_transcripts_candidate_id_round_key"
+    ))
+
+    # 2. 加 filename 列
+    _add_column_if_missing(connection, "interview_transcripts", "filename", "VARCHAR(255)")
+
+    # 3. 给 interview_questions 加 transcript_id 列（带外键级联删除）
+    questions_exists = connection.execute(text(
+        "SELECT EXISTS ("
+        "  SELECT 1 FROM information_schema.columns"
+        "  WHERE table_name = 'interview_questions' AND column_name = 'transcript_id'"
+        ")"
+    )).scalar()
+    if not questions_exists:
+        connection.execute(text(
+            "ALTER TABLE interview_questions "
+            "ADD COLUMN transcript_id UUID NULL REFERENCES interview_transcripts(id) ON DELETE CASCADE"
+        ))
 
 
 def _cleanup_low_match_status(connection) -> None:
@@ -167,4 +215,44 @@ def _cleanup_low_match_status(connection) -> None:
 
     connection.execute(text(
         "UPDATE candidates SET status = 'job_hunting' WHERE status = 'low_match'"
+    ))
+
+
+def _migrate_interview_questions_unique_constraint(connection) -> None:
+    """把 interview_questions 的唯一约束从 (candidate_id, round, index_num)
+    改为 (candidate_id, round, source, index_num)，让面试出题与面试评定转写抽取
+    两类题目各自独立编号，互不冲突。幂等：新约束已存在则跳过。
+    """
+    from sqlalchemy import text
+
+    table_exists = connection.execute(text(
+        "SELECT EXISTS ("
+        "  SELECT 1 FROM information_schema.tables"
+        "  WHERE table_schema = 'public' AND table_name = 'interview_questions'"
+        ")"
+    )).scalar()
+    if not table_exists:
+        return
+
+    new_constraint_exists = connection.execute(text(
+        "SELECT EXISTS ("
+        "  SELECT 1 FROM information_schema.table_constraints"
+        "  WHERE table_schema = 'public'"
+        "    AND table_name = 'interview_questions'"
+        "    AND constraint_name = 'uq_interview_questions_cand_round_source_idx'"
+        ")"
+    )).scalar()
+    if new_constraint_exists:
+        return
+
+    connection.execute(text("SET LOCAL lock_timeout = '3s'"))
+    # 删除旧约束（PostgreSQL 默认自动生成的名称）
+    connection.execute(text(
+        "ALTER TABLE interview_questions "
+        "DROP CONSTRAINT IF EXISTS interview_questions_candidate_id_round_index_num_key"
+    ))
+    connection.execute(text(
+        "ALTER TABLE interview_questions "
+        "ADD CONSTRAINT uq_interview_questions_cand_round_source_idx "
+        "UNIQUE (candidate_id, round, source, index_num)"
     ))

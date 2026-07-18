@@ -128,6 +128,53 @@ def _resume_text(stored: str) -> str:
         return extract_text(local)
 
 
+async def extract_qa_from_transcript(transcript_text: str, position_name: str) -> List[dict]:
+    """从面试转写文本中抽取「问题 + 回答原文 + 分类」列表。
+
+    面试官实际问的题目可能与「面试出题」环节生成的题目完全不同，这里完全由上传的
+    面试对话驱动，不依赖预生成题目。
+    """
+    if not transcript_text or not transcript_text.strip():
+        return []
+    system_prompt = f"""你是一位资深的面试记录分析专家。请从下面这段面试转写文本中，抽取面试官实际提出的问题以及候选人对应的回答原文。
+
+岗位：{position_name or '未知'}
+
+要求：
+1. 只抽取面试中真实发生的一问一答，不要臆造。
+2. 每条包含：question（面试官问题原文，可适当精简但保留原意）、answer（候选人回答原文，保留关键内容）、category（分类，从「技术能力、项目经验、工程素养、团队协作、架构设计、领导力、沟通表达」中选最贴近的一个）。
+3. 按面试发生顺序输出。
+4. 若文本无法识别出任何问答对，返回空数组 []。
+
+请返回纯JSON数组，格式如下：
+[{{"question": "...", "answer": "...", "category": "..."}}, ...]
+
+面试转写文本：
+{transcript_text[:8000]}"""
+
+    try:
+        response = await llm_client.chat.completions.create(
+            model=settings.deepseek_model,
+            messages=[{"role": "system", "content": system_prompt}],
+            temperature=0.2,
+            max_tokens=4096,
+        )
+        content = response.choices[0].message.content.strip()
+        if content.startswith("```json"):
+            content = content[7:]
+        if content.startswith("```"):
+            content = content[3:]
+        if content.endswith("```"):
+            content = content[:-3]
+        data = json.loads(content.strip())
+        if isinstance(data, dict):
+            data = [data]
+        return [d for d in data if isinstance(d, dict) and d.get("question")]
+    except Exception as e:
+        print(f"Transcript QA extraction error: {e}")
+        return []
+
+
 async def get_or_generate_questions(candidate_id: str, round: str, db: AsyncSession) -> List[InterviewQuestion]:
     """Get existing questions or auto-generate them."""
     cand_result = await db.execute(
@@ -142,6 +189,10 @@ async def get_or_generate_questions(candidate_id: str, round: str, db: AsyncSess
         .where(and_(
             InterviewQuestion.candidate_id == candidate_id,
             InterviewQuestion.round == round,
+            or_(
+                InterviewQuestion.source == "pre_generated",
+                InterviewQuestion.source.is_(None),
+            ),
         ))
         .order_by(InterviewQuestion.index_num)
     )
@@ -391,17 +442,14 @@ async def get_leaderboard(
 ):
     """Get evaluation leaderboard by category (first_result | second_result)."""
     status_map = {
-        "first_result": "passed",
+        "first_result": "first_interview",
         "second_result": "second_interview",
     }
     candidate_status = status_map.get(category)
     if not candidate_status:
         return {"code": 400, "message": "无效的排行榜类型", "data": []}
 
-    if category == "first_result":
-        status_filter = Candidate.status.in_(["passed", "pending_interview"])
-    else:
-        status_filter = Candidate.status == candidate_status
+    status_filter = Candidate.status == candidate_status
 
     # Get candidates with the right status
     result = await db.execute(
@@ -469,20 +517,40 @@ async def get_leaderboard(
 async def get_evaluation(
     candidate_id: str,
     round: str = Query("first"),
+    transcriptId: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
     scoring_mode = await get_setting(db, "defaultScoringMode", "ai")
 
-    # Get questions first
+    # 面试评定页完全由上传的面试对话驱动，只展示从转写文本抽取的题目
+    # （source='transcript'），与「面试出题」环节生成的题目完全独立。
+    # 若指定 transcriptId，只返回该次上传记录的题目；否则取最近一次上传记录。
+    if transcriptId:
+        transcript_filter = InterviewQuestion.transcript_id == transcriptId
+    else:
+        latest_t_result = await db.execute(
+            select(InterviewTranscript.id).where(and_(
+                InterviewTranscript.candidate_id == candidate_id,
+                InterviewTranscript.round == round,
+            )).order_by(InterviewTranscript.created_at.desc()).limit(1)
+        )
+        latest_tid = latest_t_result.scalar_one_or_none()
+        transcript_filter = InterviewQuestion.transcript_id == latest_tid if latest_tid else None
+
+    base_filters = [
+        InterviewQuestion.candidate_id == candidate_id,
+        InterviewQuestion.round == round,
+        InterviewQuestion.source == "transcript",
+    ]
+    if transcript_filter is not None:
+        base_filters.append(transcript_filter)
+
     questions = await db.execute(
-        select(InterviewQuestion).where(and_(
-            InterviewQuestion.candidate_id == candidate_id,
-            InterviewQuestion.round == round,
-        )).order_by(InterviewQuestion.index_num)
+        select(InterviewQuestion).where(and_(*base_filters)).order_by(InterviewQuestion.index_num)
     )
     questions = questions.scalars().all()
 
-    # Get evaluations
+    # Get evaluations for these questions
     eval_result = await db.execute(
         select(InterviewEvaluation).where(and_(
             InterviewEvaluation.candidate_id == candidate_id,
@@ -588,32 +656,177 @@ async def upload_transcript(
         except OSError:
             pass
 
-    # Save transcript
-    t_result = await db.execute(
-        select(InterviewTranscript).where(and_(
-            InterviewTranscript.candidate_id == candidate_id,
-            InterviewTranscript.round == round,
-        ))
+    # Save transcript —— 每次上传创建一条新的历史记录（不再覆盖）
+    t = InterviewTranscript(
+        candidate_id=candidate_id,
+        round=round,
+        content=transcript_text,
+        source="upload",
+        filename=file.filename or "transcript",
     )
-    t = t_result.scalar_one_or_none()
-    if t:
-        t.content = transcript_text
-        t.source = "upload"
-    else:
-        t = InterviewTranscript(
-            candidate_id=candidate_id,
-            round=round,
-            content=transcript_text,
-            source="upload",
-        )
-        db.add(t)
-
+    db.add(t)
     await db.flush()
+    transcript_id = t.id
+
+    # 面试评定完全由上传的面试对话驱动：从转写文本中抽取实际问答，落库为
+    # source='transcript' 的题目（关联到本次上传的 transcript_id），与「面试出题」
+    # 环节生成的题目完全独立，再对每个回答触发 AI 评分。
+    ai_scoring_enabled = await get_setting(db, "aiInterviewScoring", True)
+    scoring_mode = await get_setting(db, "defaultScoringMode", "ai")
+
+    # 读取岗位名用于抽取/评分上下文
+    cand_result = await db.execute(
+        select(Candidate).options(selectinload(Candidate.position)).where(Candidate.id == candidate_id)
+    )
+    candidate = cand_result.scalar_one_or_none()
+    position_name = candidate.position.name if (candidate and candidate.position) else "未知岗位"
+
+    qa_list = await extract_qa_from_transcript(transcript_text, position_name)
+    print(f"[upload_transcript] candidate={candidate_id} round={round} transcript_id={transcript_id} "
+          f"ai_scoring_enabled={ai_scoring_enabled} scoring_mode={scoring_mode} "
+          f"extracted_qa_count={len(qa_list)}")
+
+    if qa_list:
+        # 先落库所有抽取出的题目（关联到本次 transcript_id），拿到 question id
+        created_questions: list[tuple[InterviewQuestion, str]] = []
+        for i, qa in enumerate(qa_list):
+            q = InterviewQuestion(
+                candidate_id=candidate_id,
+                round=round,
+                index_num=i + 1,
+                content=qa.get("question", ""),
+                category=qa.get("category", "综合"),
+                difficulty="medium",
+                source="transcript",
+                transcript_id=transcript_id,
+            )
+            db.add(q)
+            await db.flush()
+            created_questions.append((q, qa.get("answer", "")))
+
+        if ai_scoring_enabled and scoring_mode != "manual":
+            # 并发调用评分 Agent（复制多份并行），一次处理一个问题，多个问题并发跑
+            from app.agent.scoring_agent import score_answers_batch
+
+            fallback = int(await get_setting(db, "passScoreThreshold", 75) or 75)
+            batch_items = [
+                {
+                    "question_content": q.content or "",
+                    "answer": ans,
+                    "category": q.category or "",
+                    "difficulty": q.difficulty or "medium",
+                }
+                for q, ans in created_questions
+            ]
+            print(f"[upload_transcript] 抽取到 {len(batch_items)} 道题，"
+                  f"每题评 3 个维度(表达能力/逻辑思维/技术深度)，"
+                  f"最多 5 道题并行评分")
+            results = await score_answers_batch(
+                batch_items,
+                position_name=position_name,
+                fallback_score=fallback,
+                concurrency=5,
+            )
+
+            # 把并发评分结果落库到对应的 InterviewEvaluation
+            for (q, ans), result in zip(created_questions, results):
+                e_result = await db.execute(
+                    select(InterviewEvaluation).where(
+                        InterviewEvaluation.question_id == q.id
+                    )
+                )
+                e = e_result.scalar_one_or_none()
+                if not e:
+                    e = InterviewEvaluation(
+                        candidate_id=q.candidate_id,
+                        round=q.round,
+                        question_id=q.id,
+                    )
+                    db.add(e)
+                e.ai_score = result.get("score")
+                e.ai_dimensions = result.get("dimensions", [])
+                if not e.answer and ans:
+                    e.answer = ans
+                if not e.status or e.status == "pending":
+                    e.status = "scoring"
+            await db.flush()
+        else:
+            print(f"[upload_transcript] AI scoring skipped (disabled or manual mode) "
+                  f"for {len(created_questions)} questions")
+
     return {
         "code": 0,
         "message": "ok",
-        "data": {"transcript": transcript_text, "stored": True},
+        "data": {
+            "transcript": transcript_text,
+            "stored": True,
+            "qaCount": len(qa_list),
+            "transcriptId": str(transcript_id),
+            "filename": file.filename or "transcript",
+        },
     }
+
+
+@router.get("/interview/evaluation/{candidate_id}/transcripts")
+async def list_transcripts(
+    candidate_id: str,
+    round: str = Query("first"),
+    db: AsyncSession = Depends(get_db),
+):
+    """列出某候选人某轮的所有上传历史记录，按上传时间倒序。
+
+    每条记录含 id、文件名、上传时间、抽取出的题目数。
+    """
+    result = await db.execute(
+        select(InterviewTranscript).where(and_(
+            InterviewTranscript.candidate_id == candidate_id,
+            InterviewTranscript.round == round,
+        )).order_by(InterviewTranscript.created_at.desc())
+    )
+    transcripts = result.scalars().all()
+
+    # 批量统计每条记录下的题目数
+    tids = [t.id for t in transcripts]
+    counts: dict = {}
+    if tids:
+        count_result = await db.execute(
+            select(InterviewQuestion.transcript_id, func.count(InterviewQuestion.id))
+            .where(InterviewQuestion.transcript_id.in_(tids))
+            .group_by(InterviewQuestion.transcript_id)
+        )
+        counts = {row[0]: row[1] for row in count_result.all()}
+
+    return {
+        "code": 0,
+        "message": "ok",
+        "data": [
+            {
+                "id": str(t.id),
+                "filename": t.filename or "transcript",
+                "source": t.source,
+                "createdAt": t.created_at.strftime("%Y-%m-%d %H:%M:%S") if t.created_at else "",
+                "qaCount": counts.get(t.id, 0),
+            }
+            for t in transcripts
+        ],
+    }
+
+
+@router.delete("/interview/evaluation/transcript/{transcript_id}")
+async def delete_transcript(
+    transcript_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """删除一条上传历史记录，级联删除其抽取的题目与评分。"""
+    t_result = await db.execute(
+        select(InterviewTranscript).where(InterviewTranscript.id == transcript_id)
+    )
+    t = t_result.scalar_one_or_none()
+    if not t:
+        return {"code": 404, "message": "记录不存在", "data": None}
+    await db.delete(t)
+    await db.flush()
+    return {"code": 0, "message": "ok", "data": None}
 
 
 @router.post("/interview/evaluation/{candidate_id}/transcribe")
@@ -747,6 +960,64 @@ async def submit_evaluation(
     }
 
 
+async def _score_question_with_llm(
+    question: InterviewQuestion,
+    answer: str,
+    db: AsyncSession,
+) -> dict:
+    """调用「面试评分 Agent」对单道题目评分，并把 AI 分数落库到 InterviewEvaluation
+    （无记录则创建）。
+
+    评分逻辑由专门的子 Agent（app.agent.scoring_agent）承担，独立于面试出题环节，
+    只基于「问题 + 回答 + 岗位上下文」做多维度评分。返回 {"score", "dimensions", "summary"}。
+    LLM 失败时 Agent 返回兜底分数，这里同样落库，保证前端始终能看到 AI 参考评分。
+    """
+    from app.agent.scoring_agent import score_answer
+
+    fallback_score = int(await get_setting(db, "passScoreThreshold", 75) or 75)
+
+    # 读取岗位名作为评分上下文
+    cand_result = await db.execute(
+        select(Candidate).options(selectinload(Candidate.position)).where(
+            Candidate.id == question.candidate_id
+        )
+    )
+    candidate = cand_result.scalar_one_or_none()
+    position_name = candidate.position.name if (candidate and candidate.position) else "未知岗位"
+
+    result = await score_answer(
+        question_content=question.content or "",
+        answer=answer or "",
+        position_name=position_name,
+        category=question.category or "",
+        difficulty=question.difficulty or "medium",
+        fallback_score=fallback_score,
+    )
+
+    # 无论 LLM 成功还是兜底，都把 AI 分数落库，确保前端能看到 AI 参考评分
+    e_result = await db.execute(
+        select(InterviewEvaluation).where(and_(
+            InterviewEvaluation.question_id == question.id,
+        ))
+    )
+    e = e_result.scalar_one_or_none()
+    if not e:
+        e = InterviewEvaluation(
+            candidate_id=question.candidate_id,
+            round=question.round,
+            question_id=question.id,
+        )
+        db.add(e)
+    e.ai_score = result.get("score")
+    e.ai_dimensions = result.get("dimensions", [])
+    if not e.answer and answer:
+        e.answer = answer
+    if not e.status or e.status == "pending":
+        e.status = "scoring"
+    await db.flush()
+    return result
+
+
 @router.post("/interview/score/{question_id}")
 async def ai_score_question(
     question_id: str,
@@ -767,67 +1038,8 @@ async def ai_score_question(
     if not question:
         return {"code": 404, "message": "题目不存在", "data": None}
 
-    fallback_score = int(await get_setting(db, "passScoreThreshold", 75) or 75)
-
-    try:
-        prompt = f"""作为面试评分专家，请对以下面试回答评分（0-100分）。
-
-题目：{question.content}
-分类：{question.category}
-难度：{question.difficulty}
-候选人回答：{answer or "（无回答）"}
-
-请从以下5个维度评分并返回JSON：
-1. 技术深度
-2. 问题解决
-3. 沟通表达
-4. 项目经验
-5. 文化匹配
-
-返回格式：{{"score": 总分, "dimensions": [{{"name": "维度名", "score": 分数}}]}}
-只返回JSON。"""
-
-        response = await llm_client.chat.completions.create(
-            model=settings.deepseek_model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.3,
-            max_tokens=1024,
-        )
-        content = response.choices[0].message.content.strip()
-        if content.startswith("```json"):
-            content = content[7:]
-        if content.endswith("```"):
-            content = content[:-3]
-
-        result = json.loads(content.strip())
-
-        # Save AI score
-        e_result = await db.execute(
-            select(InterviewEvaluation).where(and_(
-                InterviewEvaluation.question_id == question_id,
-            ))
-        )
-        e = e_result.scalar_one_or_none()
-        if e:
-            e.ai_score = result.get("score")
-            e.ai_dimensions = result.get("dimensions", [])
-            if not e.status or e.status == "pending":
-                e.status = "scoring"
-
-        await db.flush()
-        return {"code": 0, "message": "ok", "data": result}
-    except Exception as e:
-        return {
-            "code": 0,
-            "message": "ok",
-            "data": {"score": fallback_score, "dimensions": [
-                {"name": "技术深度", "score": fallback_score},
-                {"name": "问题解决", "score": fallback_score},
-                {"name": "沟通表达", "score": fallback_score},
-                {"name": "项目经验", "score": fallback_score},
-                {"name": "文化匹配", "score": fallback_score},
-            ]},
-        }
+    result = await _score_question_with_llm(question, answer, db)
+    return {"code": 0, "message": "ok", "data": result}
 
 
 @router.get("/interview/rankings")
