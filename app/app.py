@@ -62,6 +62,42 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("⚠ 初始数据跳过 (可能已存在): %s (%s)", e, _elapsed())
 
+    # ── Step 3: 数据保留定时清理（每天 02:00）──
+    scheduler = None
+    try:
+        from apscheduler.schedulers.asyncio import AsyncIOScheduler
+        from app.database import async_session_factory
+        from app.services.data_retention import cleanup_expired
+
+        async def _scheduled_cleanup():
+            async with async_session_factory() as session:
+                try:
+                    await cleanup_expired(session)
+                    await session.commit()
+                except Exception as e:
+                    await session.rollback()
+                    logger.warning("定时数据清理失败: %s", e)
+
+        async def _scheduled_interview_reminders():
+            from app.services.notification import check_interview_reminders
+            async with async_session_factory() as session:
+                try:
+                    n = await check_interview_reminders(session)
+                    await session.commit()
+                    if n:
+                        logger.info("面试提醒已记录 %d 条", n)
+                except Exception as e:
+                    await session.rollback()
+                    logger.warning("面试提醒任务失败: %s", e)
+
+        scheduler = AsyncIOScheduler()
+        scheduler.add_job(_scheduled_cleanup, "cron", hour=2, minute=0, id="data_retention")
+        scheduler.add_job(_scheduled_interview_reminders, "cron", hour=9, minute=0, id="interview_reminders")
+        scheduler.start()
+        logger.info("✓ 定时任务已注册 (清理 02:00 / 面试提醒 09:00) (%s)", _elapsed())
+    except Exception as e:
+        logger.warning("⚠ 定时任务未启动（可手动调用 POST /api/settings/cleanup）: %s", e)
+
     # ── Ready ──
     logger.info("=" * 55)
     logger.info("  全部配置加载完毕，开始接收请求 (%s)", _elapsed())
@@ -72,6 +108,11 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    if scheduler is not None:
+        try:
+            scheduler.shutdown(wait=False)
+        except Exception:
+            pass
     logger.info("Genie 招聘系统 — 正在关闭...")
 
 
@@ -136,7 +177,7 @@ async def global_exception_handler(request: Request, exc: Exception):
 # ── Register routers ──
 from app.routers import positions, resumes, interview, probation, performance
 from app.routers import knowledge, dashboard, ai_agent, settings as settings_router
-from app.routers import rag
+from app.routers import rag, export as export_router
 
 app.include_router(positions.router, prefix="/api")
 app.include_router(resumes.router, prefix="/api")
@@ -147,6 +188,7 @@ app.include_router(knowledge.router, prefix="/api")
 app.include_router(dashboard.router, prefix="/api")
 app.include_router(ai_agent.router, prefix="/api")
 app.include_router(settings_router.router, prefix="/api")
+app.include_router(export_router.router, prefix="/api")
 app.include_router(rag.router)  # RAG endpoints (prefix defined in router)
 
 

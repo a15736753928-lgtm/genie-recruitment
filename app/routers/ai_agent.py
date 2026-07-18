@@ -384,11 +384,14 @@ async def execute_tool_call(tool_name: str, params: dict, db: AsyncSession) -> s
         elif tool_name == "rag_search":
             try:
                 from app.services.rag.search_service import search as rag_search_fn
+                from app.services.system_settings import get_system_setting
                 top_k = params.get("topK", 5)
+                recall_threshold = float(await get_system_setting(db, "recallThreshold", 0.75) or 0.75)
                 results = await rag_search_fn(
                     query=params["query"],
                     kb_ids=None,
                     top_k=top_k,
+                    min_similarity=recall_threshold,
                 )
                 if results:
                     summaries = []

@@ -56,6 +56,7 @@ DEFAULT_SETTINGS = {
     "dataRetentionDays": 365,
     "exportFormat": "xlsx",
     "webhookEnabled": False,
+    "webhookUrl": "",
 }
 
 DEFAULT_CATEGORIES = [

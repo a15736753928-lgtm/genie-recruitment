@@ -96,7 +96,45 @@ def _add_column_if_missing(connection, table: str, column: str, ddl_type: str) -
     ))
 
 
+def _migrate_audit_logs(connection) -> None:
+    """重建 audit_logs 为新结构（time/actor），旧表若为 actor_name 版本则 drop 重建。"""
+    from sqlalchemy import text
+
+    table_exists = connection.execute(text(
+        "SELECT EXISTS ("
+        "  SELECT 1 FROM information_schema.tables"
+        "  WHERE table_schema = 'public' AND table_name = 'audit_logs'"
+        ")"
+    )).scalar()
+    if not table_exists:
+        return
+
+    has_time = connection.execute(text(
+        "SELECT EXISTS ("
+        "  SELECT 1 FROM information_schema.columns"
+        "  WHERE table_name = 'audit_logs' AND column_name = 'time'"
+        ")"
+    )).scalar()
+    if has_time:
+        return
+
+    connection.execute(text("SET LOCAL lock_timeout = '3s'"))
+    connection.execute(text("DROP TABLE IF EXISTS audit_logs CASCADE"))
+    connection.execute(text(
+        "CREATE TABLE audit_logs ("
+        "  id VARCHAR(36) PRIMARY KEY,"
+        "  time VARCHAR(32) NOT NULL,"
+        "  actor VARCHAR(64) NOT NULL DEFAULT '系统',"
+        "  action VARCHAR(255) NOT NULL,"
+        "  section VARCHAR(32),"
+        "  created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()"
+        ")"
+    ))
+
+
 def _run_migrations(connection):
     """Idempotent schema migrations for existing databases."""
     # v1: Add owner_id column for KB ownership (security)
     _add_column_if_missing(connection, "knowledge_bases", "owner_id", "VARCHAR(36)")
+    # v2: 系统设置审计日志表结构（time/actor）
+    _migrate_audit_logs(connection)

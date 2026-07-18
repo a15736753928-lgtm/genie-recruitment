@@ -53,3 +53,7 @@ httpx==0.28.1
 
 # Object Storage (MinIO)
 minio>=7.2.0
+
+# Export & Scheduling
+openpyxl>=3.1.0
+apscheduler>=3.10.0

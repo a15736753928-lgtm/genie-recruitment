@@ -1,5 +1,5 @@
 import json
-from datetime import date
+from datetime import date, timedelta
 from typing import Optional
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -13,6 +13,7 @@ from app.models.probation import (
 )
 from app.models.candidate import Candidate, Position
 from app.config import get_settings
+from app.services.system_settings import get_system_setting
 
 router = APIRouter(tags=["试用期"])
 settings = get_settings()
@@ -216,6 +217,13 @@ async def create_employee(
     req: CreateEmployeeRequest,
     db: AsyncSession = Depends(get_db),
 ):
+    join_date = date.fromisoformat(req.joinDate) if req.joinDate else date.today()
+    if req.probationEnd:
+        probation_end = date.fromisoformat(req.probationEnd)
+    else:
+        probation_days = int(await get_system_setting(db, "probationDays", 90) or 90)
+        probation_end = join_date + timedelta(days=probation_days)
+
     emp = Employee(
         candidate_id=req.candidateId,
         position_id=req.positionId,
@@ -223,13 +231,28 @@ async def create_employee(
         gender=req.gender,
         age=req.age,
         department=req.department,
-        join_date=date.fromisoformat(req.joinDate) if req.joinDate else None,
-        probation_end=date.fromisoformat(req.probationEnd) if req.probationEnd else None,
+        join_date=join_date,
+        probation_end=probation_end,
         mentor_name=req.mentorName,
         mentor_id=req.mentorId,
         status="assessing",
     )
     db.add(emp)
+    await db.flush()
+
+    # 按 defaultProbationTasks 批量生成默认周任务
+    task_count = int(await get_system_setting(db, "defaultProbationTasks", 5) or 5)
+    task_count = max(1, min(task_count, 12))
+    for i in range(1, task_count + 1):
+        db.add(ProbationTask(
+            employee_id=emp.id,
+            title=f"第 {i} 周试用期考核任务",
+            week_number=i,
+            description=f"完成第 {i} 周工作目标与复盘",
+            deadline=join_date + timedelta(days=7 * i),
+            status="pending",
+        ))
+
     await db.flush()
     await db.refresh(emp)
     return {"code": 0, "message": "ok", "data": serialize_employee(emp)}
@@ -261,7 +284,9 @@ async def save_week1_assessment(
         return {"code": 404, "message": "员工不存在", "data": None}
 
     total = req.dimensionCompletion + req.dimensionFidelity + req.dimensionProblemSolving + req.dimensionStandards
-    passed = total >= 70  # Per document: >= 70 passes week 1
+    week1_threshold = int(await get_system_setting(db, "passScoreThreshold", 75) or 75)
+    # 第一周通过线取设置合格分与文档基准 70 的较低者，避免过严
+    passed = total >= min(70, week1_threshold)
 
     # Upsert week1 assessment
     wa_result = await db.execute(
@@ -299,6 +324,23 @@ async def save_week1_assessment(
     if not passed:
         emp.status = "failed"
         emp.conversion_decision = "rejected"
+        try:
+            from app.services.notification import notify_if
+            from app.services.webhook import dispatch_webhook
+            await notify_if(
+                db,
+                "notifyProbationRisk",
+                "probation_risk",
+                f"试用期第一周未通过：{emp.name}（得分 {total}）",
+                {"employeeId": employee_id},
+            )
+            await dispatch_webhook(
+                db,
+                "probation.week1_failed",
+                {"employeeId": employee_id, "name": emp.name, "score": total},
+            )
+        except Exception:
+            pass
 
     await db.flush()
     return {"code": 0, "message": "ok", "data": {"totalScore": total, "passed": passed}}

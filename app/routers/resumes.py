@@ -20,10 +20,10 @@ from app.models.candidate import (
     Candidate, Position, CandidateSkill, CandidateEducation,
     CandidateWorkExperience, CandidateProjectExperience, CandidateAIAnalysis
 )
-from app.models.settings import SystemSetting
 from app.config import get_settings
 from app.core import minio_storage
 from app.services.portrait_gender import infer_gender_from_resume_file
+from app.services.system_settings import get_system_setting
 
 router = APIRouter(tags=["简历"])
 settings = get_settings()
@@ -491,6 +491,15 @@ async def run_resume_parse(candidate: Candidate, position_name: str = "", db: As
     if not candidate.resume_file:
         return "未找到简历文件"
 
+    if db is None:
+        return "内部错误：缺少数据库会话"
+
+    # AI 简历分析开关：关闭时仅保留文件元数据，不调用 LLM
+    ai_enabled = await get_system_setting(db, "aiResumeAnalysis", True)
+    if not ai_enabled:
+        logger.info("aiResumeAnalysis 已关闭，跳过 AI 解析 candidate=%s", candidate.id)
+        return "AI 简历分析已关闭，仅保存文件"
+
     text, extract_error = extract_text_from_file(candidate.resume_file)
     if extract_error:
         return extract_error
@@ -513,9 +522,21 @@ async def run_resume_parse(candidate: Candidate, position_name: str = "", db: As
     if isinstance(analysis, dict):
         analysis["dimensions"] = await score_all(text, parsed, position_name)
 
-    if db is None:
-        return "内部错误：缺少数据库会话"
     await fill_candidate_from_parsed(candidate, parsed, db)
+
+    # 匹配分阈值：写入 screening_ai_score，低于阈值标记为低匹配
+    min_score = int(await get_system_setting(db, "minMatchScore", 70) or 70)
+    overall = None
+    if isinstance(analysis, dict):
+        overall = analysis.get("overallScore")
+    if overall is None:
+        overall = candidate.score
+    if isinstance(overall, (int, float)):
+        candidate.screening_ai_score = int(overall)
+        candidate.score = int(overall)
+        if int(overall) < min_score:
+            candidate.status = "low_match"
+
     return parse_error
 
 
@@ -587,11 +608,7 @@ async def fill_candidate_from_parsed(candidate: Candidate, parsed: dict, db: Asy
 
 
 async def get_auto_parse_setting(db: AsyncSession) -> bool:
-    result = await db.execute(select(SystemSetting).where(SystemSetting.key == "global"))
-    s = result.scalar_one_or_none()
-    if s and s.value:
-        return s.value.get("autoParseResume", True)
-    return True
+    return bool(await get_system_setting(db, "autoParseResume", True))
 
 
 # ── Endpoints ───────────────────────────────────────────
@@ -605,6 +622,7 @@ async def list_resumes(
     sortOrder: str = Query("desc"),
     page: int = Query(1),
     pageSize: int = Query(10),
+    minScore: Optional[int] = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
     query = select(Candidate).options(
@@ -619,6 +637,14 @@ async def list_resumes(
     # Filter by position
     if positionId and positionId != "all":
         query = query.where(Candidate.position_id == positionId)
+
+    # 最低匹配分过滤：未传 minScore 时读系统设置
+    score_threshold = minScore
+    if score_threshold is None:
+        score_threshold = int(await get_system_setting(db, "minMatchScore", 70) or 70)
+    # 仅当显式传入 minScore 时强制过滤；默认阈值用于「低匹配」标记，列表仍展示全部
+    if minScore is not None:
+        query = query.where(Candidate.score >= score_threshold)
 
     # Filter by statuses
     if statuses:
@@ -745,11 +771,18 @@ async def get_resume(resume_id: str, db: AsyncSession = Depends(get_db)):
 @router.post("/resumes/upload")
 async def upload_resume(
     file: UploadFile = File(...),
-    positionId: str = Form(...),
+    positionId: Optional[str] = Form(None),
     db: AsyncSession = Depends(get_db),
 ):
+    # 未传岗位时回退到系统默认岗位
+    resolved_position_id = (positionId or "").strip()
+    if not resolved_position_id:
+        resolved_position_id = str(await get_system_setting(db, "defaultPositionId", "") or "")
+    if not resolved_position_id:
+        return {"code": 400, "message": "请选择应聘岗位，或在系统设置中配置默认岗位", "data": None}
+
     # Validate position
-    pos_result = await db.execute(select(Position).where(Position.id == positionId))
+    pos_result = await db.execute(select(Position).where(Position.id == resolved_position_id))
     position = pos_result.scalar_one_or_none()
     if not position:
         return {"code": 404, "message": "岗位不存在", "data": None}
@@ -769,7 +802,7 @@ async def upload_resume(
     # Create candidate
     candidate = Candidate(
         name=original_name,
-        position_id=positionId,
+        position_id=resolved_position_id,
         status="job_hunting",
         resume_file=object_key,
         upload_time=date.today(),
@@ -788,6 +821,25 @@ async def upload_resume(
                 parse_message = None  # partial success is ok
 
     await db.flush()
+
+    # 新简历入库通知 + Webhook
+    try:
+        from app.services.notification import notify_if
+        from app.services.webhook import dispatch_webhook
+        await notify_if(
+            db,
+            "notifyNewResume",
+            "new_resume",
+            f"新简历入库：{original_name}（岗位：{position.name}）",
+            {"candidateId": str(candidate.id)},
+        )
+        await dispatch_webhook(
+            db,
+            "candidate.uploaded",
+            {"candidateId": str(candidate.id), "name": original_name, "positionId": resolved_position_id},
+        )
+    except Exception as e:
+        logger.warning("通知/Webhook 钩子失败: %s", e)
 
     # Reload with relationships
     candidate = await load_candidate(db, candidate.id)

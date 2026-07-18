@@ -656,7 +656,13 @@ async def search_query(
     top_k = body.get("top_k", settings.default_top_k)
     if top_k == 0 or top_k is None:
         top_k = min(settings.max_search_recall, 50)
-    min_sim = body.get("min_similarity", 0.0)
+
+    # 未传 min_similarity 时默认读系统设置 recallThreshold
+    if "min_similarity" in body:
+        min_sim = float(body.get("min_similarity") or 0.0)
+    else:
+        from app.services.system_settings import get_system_setting
+        min_sim = float(await get_system_setting(db, "recallThreshold", 0.75) or 0.75)
 
     try:
         results = await search(

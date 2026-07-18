@@ -8,9 +8,16 @@ from app.database import get_db
 from app.models.performance import PerformanceRecord, PerformanceQuarter
 from app.models.probation import Employee
 from app.config import get_settings
+from app.services.system_settings import get_system_setting
 
 router = APIRouter(tags=["绩效"])
 settings = get_settings()
+
+
+async def _resolve_quarter(db: AsyncSession, quarter: Optional[str]) -> str:
+    if quarter:
+        return quarter
+    return str(await get_system_setting(db, "defaultQuarter", "2026-Q3") or "2026-Q3")
 
 
 # ── Serializer ──────────────────────────────────────────
@@ -34,7 +41,8 @@ def serialize_record(r: PerformanceRecord) -> dict:
 # ── Endpoints ───────────────────────────────────────────
 
 @router.get("/performance/stats")
-async def get_performance_stats(quarter: str = Query(...), db: AsyncSession = Depends(get_db)):
+async def get_performance_stats(quarter: Optional[str] = Query(None), db: AsyncSession = Depends(get_db)):
+    quarter = await _resolve_quarter(db, quarter)
     result = await db.execute(
         select(PerformanceRecord).where(PerformanceRecord.quarter == quarter)
     )
@@ -65,11 +73,12 @@ async def get_performance_stats(quarter: str = Query(...), db: AsyncSession = De
 
 @router.get("/performance")
 async def list_performance(
-    quarter: str = Query(...),
+    quarter: Optional[str] = Query(None),
     page: int = Query(1),
     pageSize: int = Query(10),
     db: AsyncSession = Depends(get_db),
 ):
+    quarter = await _resolve_quarter(db, quarter)
     query = select(PerformanceRecord).options(
         selectinload(PerformanceRecord.employee)
     ).where(PerformanceRecord.quarter == quarter)
@@ -96,7 +105,8 @@ async def list_performance(
 
 
 @router.get("/performance/departments")
-async def get_department_performance(quarter: str = Query(...), db: AsyncSession = Depends(get_db)):
+async def get_department_performance(quarter: Optional[str] = Query(None), db: AsyncSession = Depends(get_db)):
+    quarter = await _resolve_quarter(db, quarter)
     result = await db.execute(
         select(PerformanceRecord).options(
             selectinload(PerformanceRecord.employee)
@@ -121,7 +131,8 @@ async def get_department_performance(quarter: str = Query(...), db: AsyncSession
 
 
 @router.get("/performance/grades")
-async def get_grade_distribution(quarter: str = Query(...), db: AsyncSession = Depends(get_db)):
+async def get_grade_distribution(quarter: Optional[str] = Query(None), db: AsyncSession = Depends(get_db)):
+    quarter = await _resolve_quarter(db, quarter)
     result = await db.execute(
         select(PerformanceRecord).where(PerformanceRecord.quarter == quarter)
     )
@@ -147,7 +158,8 @@ async def get_grade_distribution(quarter: str = Query(...), db: AsyncSession = D
 
 
 @router.get("/performance/bonus")
-async def get_bonus_info(quarter: str = Query(...), db: AsyncSession = Depends(get_db)):
+async def get_bonus_info(quarter: Optional[str] = Query(None), db: AsyncSession = Depends(get_db)):
+    quarter = await _resolve_quarter(db, quarter)
     pq_result = await db.execute(
         select(PerformanceQuarter).where(PerformanceQuarter.quarter == quarter)
     )
@@ -207,7 +219,7 @@ async def initiate_appraisal(
     body: dict,
     db: AsyncSession = Depends(get_db),
 ):
-    quarter = body.get("quarter")
+    quarter = await _resolve_quarter(db, body.get("quarter"))
     employee_ids = body.get("employeeIds", [])
 
     # Create or update quarter
@@ -243,7 +255,20 @@ async def initiate_appraisal(
                 ))
 
     await db.flush()
-    return {"code": 0, "message": "ok", "data": None}
+
+    try:
+        from app.services.notification import notify_if
+        await notify_if(
+            db,
+            "notifyPerformanceDue",
+            "performance_due",
+            f"已发起 {quarter} 绩效考核，共 {len(employee_ids)} 人",
+            {"quarter": quarter, "count": len(employee_ids)},
+        )
+    except Exception:
+        pass
+
+    return {"code": 0, "message": "ok", "data": {"quarter": quarter}}
 
 
 @router.put("/performance/{employee_id}/bonus")

@@ -5,44 +5,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc
 from app.database import get_db
 from app.models.settings import SystemSetting, AuditLog
+from app.services.system_settings import (
+    DEFAULT_SETTINGS,
+    get_system_settings,
+    invalidate_cache,
+)
 
 router = APIRouter(tags=["系统设置"])
-
-DEFAULT_SETTINGS = {
-    "systemName": "Genie 智能招聘系统",
-    "companyName": "Genie Tech",
-    "contactEmail": "hr@genietech.com",
-    "defaultQuarter": "2026-Q3",
-    "autoParseResume": True,
-    "minMatchScore": 70,
-    "defaultPositionId": "",
-    "offerApprovalRequired": True,
-    "defaultQuestionCount": 8,
-    "defaultScoringMode": "ai",
-    "passScoreThreshold": 75,
-    "allowAudioUpload": True,
-    "probationDays": 90,
-    "defaultProbationTasks": 5,
-    "aiResumeAnalysis": True,
-    "aiQuestionGeneration": True,
-    "aiInterviewScoring": True,
-    "recallThreshold": 0.75,
-    "notifyNewResume": True,
-    "notifyInterviewReminder": True,
-    "notifyOfferPending": True,
-    "notifyProbationRisk": True,
-    "notifyPerformanceDue": True,
-    "dataRetentionDays": 365,
-    "exportFormat": "xlsx",
-    "webhookEnabled": False,
-}
 
 
 @router.get("/settings")
 async def get_settings(db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(SystemSetting).where(SystemSetting.key == "global"))
-    setting = result.scalar_one_or_none()
-    data = setting.value if setting and setting.value else DEFAULT_SETTINGS
+    data = await get_system_settings(db)
     return {"code": 0, "message": "ok", "data": data}
 
 
@@ -55,8 +29,7 @@ async def update_settings(
     setting = result.scalar_one_or_none()
 
     if setting:
-        # Merge with existing
-        merged = {**setting.value, **body}
+        merged = {**(setting.value or {}), **body}
         setting.value = merged
     else:
         merged = {**DEFAULT_SETTINGS, **body}
@@ -67,7 +40,17 @@ async def update_settings(
         db.add(setting)
 
     await db.flush()
+    invalidate_cache()
     return {"code": 0, "message": "ok", "data": merged}
+
+
+@router.post("/settings/cleanup")
+async def trigger_cleanup(db: AsyncSession = Depends(get_db)):
+    """手动触发过期数据清理。"""
+    from app.services.data_retention import cleanup_expired
+
+    result = await cleanup_expired(db)
+    return {"code": 0, "message": "ok", "data": result}
 
 
 # ── Audit log ──────────────────────────────────────────
@@ -100,7 +83,7 @@ async def append_audit_log(body: dict, db: AsyncSession = Depends(get_db)):
     """追加一条审计日志。body: { actor, action, section }"""
     log = AuditLog(
         id=f"log-{uuid.uuid4().hex[:12]}",
-        time=datetime.utcnow().strftime("%Y-%m-%d %H:%M"),
+        time=body.get("time") or datetime.utcnow().strftime("%Y-%m-%d %H:%M"),
         actor=body.get("actor", "系统"),
         action=body.get("action", ""),
         section=body.get("section"),

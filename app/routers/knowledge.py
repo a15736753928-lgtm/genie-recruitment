@@ -449,8 +449,13 @@ async def recall_test(body: dict, db: AsyncSession = Depends(get_db)):
     if not query:
         return {"code": 400, "message": "请提供查询文本", "data": []}
 
+    from app.services.system_settings import get_system_setting
+    threshold = float(await get_system_setting(db, "recallThreshold", 0.75) or 0.75)
+
     # Search Milvus
     results = await asyncio.to_thread(search_milvus, query, 5)
+    # 按召回阈值过滤
+    results = [r for r in results if float(r.get("score") or 0) >= threshold]
 
     # Enrich with source names
     for r in results:
@@ -464,4 +469,4 @@ async def recall_test(body: dict, db: AsyncSession = Depends(get_db)):
                 # Update recall count
                 item.recall_count = (item.recall_count or 0) + 1
 
-    return {"code": 0, "message": "ok", "data": results}
+    return {"code": 0, "message": "ok", "data": results, "threshold": threshold}

@@ -12,9 +12,9 @@ from openai import AsyncOpenAI
 from app.database import get_db
 from app.models.candidate import Candidate, Position
 from app.models.interview import InterviewQuestion, InterviewEvaluation, InterviewTranscript
-from app.models.settings import SystemSetting
 from app.config import get_settings
 from app.core import minio_storage
+from app.services.system_settings import get_system_setting
 
 router = APIRouter(tags=["面试"])
 settings = get_settings()
@@ -32,11 +32,8 @@ INTERVIEW_ELIGIBLE_STATUSES = {"passed", "first_interview", "second_interview", 
 # ── Helpers ─────────────────────────────────────────────
 
 async def get_setting(db: AsyncSession, key: str, default=None):
-    result = await db.execute(select(SystemSetting).where(SystemSetting.key == "global"))
-    s = result.scalar_one_or_none()
-    if s and s.value:
-        return s.value.get(key, default)
-    return default
+    """兼容旧调用点，统一走 system_settings 服务。"""
+    return await get_system_setting(db, key, default)
 
 
 async def generate_questions_with_llm(
@@ -152,8 +149,13 @@ async def get_or_generate_questions(candidate_id: str, round: str, db: AsyncSess
     if questions:
         return list(questions)
 
+    # AI 出题开关
+    ai_gen = await get_setting(db, "aiQuestionGeneration", True)
+    if not ai_gen:
+        return []
+
     # Auto-generate
-    count = await get_setting(db, "defaultQuestionCount", 8)
+    count = int(await get_setting(db, "defaultQuestionCount", 8) or 8)
     rag_text = ""
     if candidate.resume_file:
         try:
@@ -453,6 +455,8 @@ async def get_evaluation(
     round: str = Query("first"),
     db: AsyncSession = Depends(get_db),
 ):
+    scoring_mode = await get_setting(db, "defaultScoringMode", "ai")
+
     # Get questions first
     questions = await db.execute(
         select(InterviewQuestion).where(and_(
@@ -474,6 +478,13 @@ async def get_evaluation(
     data = []
     for q in questions:
         e = evals.get(str(q.id))
+        # 按评分模式决定默认展示分数：ai 优先 aiScore，manual 优先 hrScore
+        primary_score = None
+        if e:
+            if scoring_mode == "manual":
+                primary_score = e.hr_score if e.hr_score is not None else e.ai_score
+            else:
+                primary_score = e.ai_score if e.ai_score is not None else e.hr_score
         data.append({
             "questionId": str(q.id),
             "index": q.index_num,
@@ -483,6 +494,8 @@ async def get_evaluation(
             "aiScore": e.ai_score if e else None,
             "aiDimensions": e.ai_dimensions if e else None,
             "hrScore": e.hr_score if e else None,
+            "primaryScore": primary_score,
+            "scoringMode": scoring_mode,
             "status": e.status if e else "pending",
             "dimensions": e.hr_dimensions if e else None,
         })
@@ -594,6 +607,10 @@ async def transcribe_audio(
     round: str = Form(...),
     db: AsyncSession = Depends(get_db),
 ):
+    allow_audio = await get_setting(db, "allowAudioUpload", True)
+    if not allow_audio:
+        return {"code": 403, "message": "系统已关闭音频上传功能", "data": None}
+
     # Audio file — transcribe with DeepSeek (audio not stored, text only)
     audio_bytes = await file.read()
 
@@ -644,16 +661,74 @@ async def transcribe_audio(
 
 
 @router.post("/interview/evaluation/{candidate_id}/submit")
-async def submit_evaluation(candidate_id: str, db: AsyncSession = Depends(get_db)):
-    evals = await db.execute(
-        select(InterviewEvaluation).where(InterviewEvaluation.candidate_id == candidate_id)
+async def submit_evaluation(
+    candidate_id: str,
+    round: str = Query("first"),
+    db: AsyncSession = Depends(get_db),
+):
+    scoring_mode = await get_setting(db, "defaultScoringMode", "ai")
+    pass_threshold = int(await get_setting(db, "passScoreThreshold", 75) or 75)
+
+    evals_result = await db.execute(
+        select(InterviewEvaluation).where(and_(
+            InterviewEvaluation.candidate_id == candidate_id,
+            InterviewEvaluation.round == round,
+        ))
     )
-    for e in evals.scalars().all():
+    evals = list(evals_result.scalars().all())
+    scores: List[float] = []
+    for e in evals:
         if e.hr_score is not None:
             e.status = "scored"
+        if scoring_mode == "manual":
+            score_val = e.hr_score if e.hr_score is not None else e.ai_score
+        else:
+            score_val = e.ai_score if e.ai_score is not None else e.hr_score
+        if score_val is not None:
+            scores.append(float(score_val))
+
+    avg_score = round(sum(scores) / len(scores), 1) if scores else 0
+    passed = avg_score >= pass_threshold
+
+    cand_result = await db.execute(select(Candidate).where(Candidate.id == candidate_id))
+    candidate = cand_result.scalar_one_or_none()
+    if candidate:
+        if passed:
+            if round == "second":
+                candidate.status = "offer_pending"
+                try:
+                    from app.services.notification import notify_if
+                    from app.services.webhook import dispatch_webhook
+                    await notify_if(
+                        db,
+                        "notifyOfferPending",
+                        "offer_pending",
+                        f"二面通过，待发 Offer：{candidate.name}",
+                        {"candidateId": candidate_id},
+                    )
+                    await dispatch_webhook(
+                        db,
+                        "candidate.offer_pending",
+                        {"candidateId": candidate_id, "name": candidate.name, "avgScore": avg_score},
+                    )
+                except Exception:
+                    pass
+            else:
+                candidate.status = "second_interview"
+        else:
+            candidate.status = "rejected"
 
     await db.flush()
-    return {"code": 0, "message": "ok", "data": None}
+    return {
+        "code": 0,
+        "message": "ok",
+        "data": {
+            "avgScore": avg_score,
+            "passThreshold": pass_threshold,
+            "passed": passed,
+            "scoringMode": scoring_mode,
+        },
+    }
 
 
 @router.post("/interview/score/{question_id}")
@@ -662,6 +737,12 @@ async def ai_score_question(
     body: dict,
     db: AsyncSession = Depends(get_db),
 ):
+    # AI 评分开关 + 手动模式拒绝
+    ai_scoring = await get_setting(db, "aiInterviewScoring", True)
+    scoring_mode = await get_setting(db, "defaultScoringMode", "ai")
+    if not ai_scoring or scoring_mode == "manual":
+        return {"code": 403, "message": "当前设置不允许 AI 评分", "data": None}
+
     answer = body.get("answer", "")
     question_result = await db.execute(
         select(InterviewQuestion).where(InterviewQuestion.id == question_id)
@@ -669,6 +750,8 @@ async def ai_score_question(
     question = question_result.scalar_one_or_none()
     if not question:
         return {"code": 404, "message": "题目不存在", "data": None}
+
+    fallback_score = int(await get_setting(db, "passScoreThreshold", 75) or 75)
 
     try:
         prompt = f"""作为面试评分专家，请对以下面试回答评分（0-100分）。
@@ -721,12 +804,12 @@ async def ai_score_question(
         return {
             "code": 0,
             "message": "ok",
-            "data": {"score": 75, "dimensions": [
-                {"name": "技术深度", "score": 75},
-                {"name": "问题解决", "score": 75},
-                {"name": "沟通表达", "score": 75},
-                {"name": "项目经验", "score": 75},
-                {"name": "文化匹配", "score": 75},
+            "data": {"score": fallback_score, "dimensions": [
+                {"name": "技术深度", "score": fallback_score},
+                {"name": "问题解决", "score": fallback_score},
+                {"name": "沟通表达", "score": fallback_score},
+                {"name": "项目经验", "score": fallback_score},
+                {"name": "文化匹配", "score": fallback_score},
             ]},
         }
 

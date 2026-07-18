@@ -1,5 +1,5 @@
 from datetime import datetime
-from sqlalchemy import Column, String, DateTime, Text
+from sqlalchemy import Column, String, DateTime
 from sqlalchemy.dialects.postgresql import JSONB
 from app.database import Base
 
@@ -18,7 +18,7 @@ class AuditLog(Base):
     __tablename__ = "audit_logs"
 
     id = Column(String(36), primary_key=True)
-    time = Column(String(32), nullable=False)  # 展示用时间字符串
+    time = Column(String(32), nullable=False)
     actor = Column(String(64), nullable=False, default="系统")
     action = Column(String(255), nullable=False)
     section = Column(String(32), nullable=True)
