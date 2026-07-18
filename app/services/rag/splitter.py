@@ -136,7 +136,7 @@ def split_text_semantic(
 
     try:
         from llama_index.core.node_parser import SemanticSplitterNodeParser
-        from app.core.model_loader import _get_model as _get_embedding
+        from app.infrastructure.model_loader import _get_model as _get_embedding
 
         # Get the embedding model (SentenceTransformer compatible)
         embed_model = _get_embedding()

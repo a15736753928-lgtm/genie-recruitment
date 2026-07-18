@@ -35,7 +35,7 @@ from app.services.rag.text_processor import clean_text
 from app.services.rag.splitter import chunk_document
 from app.services.rag.embedding import encode_batch
 from app.services.rag.utils import get_file_type
-from app.core.milvus_manager import insert_vectors
+from app.infrastructure.milvus_manager import insert_vectors
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
@@ -298,7 +298,7 @@ def _run_ingest_sync(
     try:
         # Download the original file from MinIO to a temp file for parsing.
         ext = os.path.splitext(file_name)[1] or ".txt"
-        from app.core import minio_storage
+        from app.infrastructure import minio_storage
         try:
             local_path = minio_storage.download_to_temp(object_key, suffix=ext)
         except Exception as e:
@@ -490,7 +490,7 @@ def ingest_file_async(
     if file_size <= 0:
         # Best-effort: stat the MinIO object to get its size if not provided.
         try:
-            from app.core import minio_storage
+            from app.infrastructure import minio_storage
             stat = minio_storage._get_client().stat_object(
                 minio_storage.settings.minio_bucket, file_path
             )

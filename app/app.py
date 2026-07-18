@@ -39,7 +39,7 @@ async def lifespan(app: FastAPI):
     logger.info("=" * 55)
 
     # ── Step 1: Run all startup health checks ──
-    from app.core.startup_checks import run_startup_checks, print_check_summary, CheckStatus
+    from app.infrastructure.startup_checks import run_startup_checks, print_check_summary, CheckStatus
 
     results = await run_startup_checks(settings)
     print_check_summary(results)
@@ -56,7 +56,7 @@ async def lifespan(app: FastAPI):
     # ── Step 2: Seed data ──
     logger.info("检查/填充初始数据 (示例岗位)...")
     try:
-        from app.services.seed import seed_all
+        from app.services.recruitment.seed_data import seed_all
         await seed_all()
         logger.info("✓ 初始数据就绪 (%s)", _elapsed())
     except Exception as e:
@@ -67,7 +67,7 @@ async def lifespan(app: FastAPI):
     try:
         from apscheduler.schedulers.asyncio import AsyncIOScheduler
         from app.database import async_session_factory
-        from app.services.data_retention import cleanup_expired
+        from app.services.system.data_retention import cleanup_expired
 
         async def _scheduled_cleanup():
             async with async_session_factory() as session:
@@ -79,7 +79,7 @@ async def lifespan(app: FastAPI):
                     logger.warning("定时数据清理失败: %s", e)
 
         async def _scheduled_interview_reminders():
-            from app.services.notification import check_interview_reminders
+            from app.services.system.notification import check_interview_reminders
             async with async_session_factory() as session:
                 try:
                     n = await check_interview_reminders(session)
@@ -175,9 +175,16 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 
 # ── Register routers ──
-from app.routers import positions, resumes, interview, probation, performance
-from app.routers import knowledge, dashboard, ai_agent, settings as settings_router
-from app.routers import rag, export as export_router
+# 招聘管理
+from app.api.recruitment import positions, resumes
+# 人才评估
+from app.api.talent import interview, probation, performance
+# 知识库
+from app.api.knowledge import knowledge_base as knowledge, rag
+# AI 功能
+from app.api.ai import agent_chat as ai_agent
+# 系统管理
+from app.api.system import dashboard, settings as settings_router, export as export_router
 
 app.include_router(positions.router, prefix="/api")
 app.include_router(resumes.router, prefix="/api")

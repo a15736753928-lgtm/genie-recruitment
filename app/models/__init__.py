@@ -1,4 +1,4 @@
-from app.models.candidate import (
+from app.models.recruitment import (
     Position, Candidate, CandidateSkill, CandidateEducation,
     CandidateWorkExperience, CandidateProjectExperience, CandidateAIAnalysis
 )
@@ -10,7 +10,7 @@ from app.models.performance import PerformanceRecord, PerformanceQuarter
 from app.models.knowledge import (
     KnowledgeCategory, KnowledgeItem
 )
-from app.models.agent import (
+from app.models.agent_session import (
     AgentSession, AgentMessage, AgentMaterial, AgentTask
 )
 from app.models.settings import SystemSetting, AuditLog

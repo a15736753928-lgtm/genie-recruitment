@@ -851,7 +851,7 @@ async def _execute_tool_sync(tool_name: str, **kwargs) -> str:
 
     Uses lazy import to avoid circular dependency with app.routers.ai_agent.
     """
-    from app.routers.ai_agent import execute_tool_call  # lazy import
+    from app.api.ai.agent_chat import execute_tool_call  # lazy import
 
     # Remove None values (unset optional params)
     params = {k: v for k, v in kwargs.items() if v is not None}

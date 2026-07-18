@@ -19,7 +19,7 @@ from openai import OpenAI
 from app.config import get_settings
 from app.database import get_sync_db
 from app.models.knowledge import GraphCommunity, _now_ms, _short_uuid
-from app.core.graph_store import (
+from app.infrastructure.graph_store import (
     get_all_entities_for_kb,
     get_all_relations_for_kb,
     is_available as kuzu_available,

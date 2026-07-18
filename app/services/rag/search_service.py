@@ -29,7 +29,7 @@ from app.services.rag.text_processor import (
     highlighter,
 )
 from app.services.rag.reranker import rerank
-from app.core.milvus_manager import search_dense, search_sparse
+from app.infrastructure.milvus_manager import search_dense, search_sparse
 
 settings = get_settings()
 

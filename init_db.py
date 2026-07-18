@@ -5,16 +5,16 @@ sys.path.insert(0, ".")
 
 async def main():
     from app.database import engine, Base, async_session_factory
-    from app.services.seed import seed_all
+    from app.services.recruitment.seed_data import seed_all
     # Import all models to register them with Base
-    from app.models.candidate import Position, Candidate, CandidateSkill, CandidateEducation
-    from app.models.candidate import CandidateWorkExperience, CandidateProjectExperience, CandidateAIAnalysis
+    from app.models.recruitment import Position, Candidate, CandidateSkill, CandidateEducation
+    from app.models.recruitment import CandidateWorkExperience, CandidateProjectExperience, CandidateAIAnalysis
     from app.models.interview import InterviewQuestion, InterviewEvaluation, InterviewTranscript
     from app.models.probation import Employee, ProbationTask
     from app.models.performance import PerformanceRecord, PerformanceQuarter
     from app.models.knowledge import KnowledgeCategory, KnowledgeItem
     from app.models.knowledge import KnowledgeBase, KnowledgeDocument, KnowledgeChunk, IngestionTask
-    from app.models.agent import AgentSession, AgentMessage, AgentMaterial, AgentTask
+    from app.models.agent_session import AgentSession, AgentMessage, AgentMaterial, AgentTask
     from app.models.settings import SystemSetting
 
     print("Creating database tables...")

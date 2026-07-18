@@ -20,7 +20,7 @@ from openai import AsyncOpenAI
 from app.config import get_settings
 from app.database import async_session_factory
 from app.models.knowledge import GraphCommunity
-from app.core.graph_store import (
+from app.infrastructure.graph_store import (
     query_entities,
     expand_from_entities,
     is_available as kuzu_available,

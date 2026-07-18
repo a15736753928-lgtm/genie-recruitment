@@ -14,7 +14,7 @@ import json
 import logging
 from openai import OpenAI
 from app.config import get_settings
-from app.core.graph_store import (
+from app.infrastructure.graph_store import (
     upsert_entity,
     upsert_chunk,
     link_entity_to_chunk,

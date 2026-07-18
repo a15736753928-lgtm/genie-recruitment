@@ -15,7 +15,7 @@ are incompatible. Drop the old collection and re-ingest all documents.
 
 from __future__ import annotations
 
-from app.core.model_loader import (
+from app.infrastructure.model_loader import (
     encode_dense as _encode_dense,
     encode_sparse as _encode_sparse,
     encode_query_dense as _encode_query_dense,

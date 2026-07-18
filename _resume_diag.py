@@ -3,8 +3,8 @@
 import asyncio
 from sqlalchemy import select
 from app.database import async_session_factory
-from app.models.candidate import Candidate
-from app.core import minio_storage
+from app.models.recruitment import Candidate
+from app.infrastructure import minio_storage
 
 
 async def main():
@@ -34,7 +34,7 @@ async def main():
             print(f"minio object_exists({rf!r}): {exists_in_minio}")
 
         # Try the actual extraction path used by run_resume_parse
-        from app.routers.resumes import extract_text_from_file
+        from app.api.recruitment.resumes import extract_text_from_file
         try:
             text, err = extract_text_from_file(rf)
             print(f"extract_text_from_file -> text_len={len(text)}, err={err!r}")
