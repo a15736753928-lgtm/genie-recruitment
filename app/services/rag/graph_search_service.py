@@ -33,6 +33,8 @@ logger = logging.getLogger(__name__)
 llm_client = AsyncOpenAI(
     api_key=settings.deepseek_api_key,
     base_url=settings.deepseek_base_url,
+    timeout=60.0,
+    max_retries=0,
 )
 
 _ENTITY_EXTRACT_SYSTEM = """你是一个查询分析专家。从用户问题中提取关键概念/术语/实体名称。

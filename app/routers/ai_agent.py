@@ -31,7 +31,17 @@ llm_client = AsyncOpenAI(
 )
 
 # Agent configurations
+# The system now exposes a single omnipotent "Genie" agent that has access to
+# ALL tools (every business endpoint). The legacy 4 sub-agents are kept only as
+# @-mention routing targets for backward compatibility.
 AGENT_CONFIGS = {
+    "genie": {
+        "name": "Genie 全能助手",
+        "description": "通过对话框完成招聘系统所有操作：简历筛选、面试出题、面试评定、试用期考核、绩效管理、知识库管理、系统设置",
+        "icon": "search",
+        "iconBg": "#e8f4fd",
+        "iconColor": "#2196f3",
+    },
     "recruit": {
         "name": "招聘 Agent",
         "description": "负责简历解析、人才筛选、岗位匹配",
@@ -110,6 +120,84 @@ async def execute_tool_call(tool_name: str, params: dict, db: AsyncSession) -> s
                 return f"已成功更新候选人 {params['id']} 的信息"
             return f"更新失败：{result['message']}"
 
+        elif tool_name == "upload_resume":
+            # fileKey is a MinIO object key uploaded by the frontend "添加资料" flow.
+            from app.routers.resumes import upload_resume as fn
+            from fastapi import UploadFile
+            import io
+            object_key = params["fileKey"]
+            file_name = params["fileName"]
+            position_id = params["positionId"]
+            tmp_path = await asyncio.to_thread(minio_storage.download_to_temp, object_key)
+            try:
+                with open(tmp_path, "rb") as f:
+                    content = f.read()
+            finally:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+            upload_file = UploadFile(file=io.BytesIO(content), filename=file_name)
+            result = await fn(file=upload_file, positionId=position_id, db=db)
+            if result["code"] == 0:
+                d = result.get("data", {})
+                return f"已上传简历「{d.get('name', file_name)}」，匹配度 {d.get('score', 0)} 分，状态 {d.get('status', '')}。{result.get('message', '')}"
+            return f"上传失败：{result.get('message', '')}"
+
+        elif tool_name == "batch_parse_resumes":
+            from app.routers.resumes import batch_parse as fn
+            result = await fn(body={"ids": params["ids"]}, db=db)
+            return f"已批量解析 {len(params['ids'])} 位候选人" if result["code"] == 0 else f"批量解析失败：{result.get('message', '')}"
+
+        elif tool_name == "reanalyze_resume":
+            from app.routers.resumes import reanalyze_resume as fn
+            result = await fn(resume_id=params["id"], db=db)
+            if result["code"] == 0:
+                d = result.get("data", {})
+                return f"已重新解析「{d.get('name', '')}」，新匹配度 {d.get('score', 0)} 分"
+            return f"重新解析失败：{result.get('message', '')}"
+
+        elif tool_name == "delete_resume":
+            from app.routers.resumes import delete_resume as fn
+            result = await fn(resume_id=params["id"], db=db)
+            return f"已删除候选人 {params['id']}" if result["code"] == 0 else f"删除失败：{result.get('message', '')}"
+
+        elif tool_name == "get_position":
+            from app.routers.positions import get_position as fn
+            result = await fn(position_id=params["id"], db=db)
+            d = result.get("data") or {}
+            return f"岗位「{d.get('name', '')}」- {d.get('department', '')}。职责：{(d.get('jdResponsibilities') or '')[:200]}"
+
+        elif tool_name == "create_position":
+            from app.routers.positions import create_position as fn, CreatePositionRequest
+            req = CreatePositionRequest(**params)
+            result = await fn(req=req, db=db)
+            if result["code"] == 0:
+                return f"已创建岗位「{params['name']}」"
+            return f"创建失败：{result.get('message', '')}"
+
+        elif tool_name == "update_position":
+            from app.routers.positions import update_position as fn, UpdatePositionRequest
+            req = UpdatePositionRequest(**params.get("fields", {}))
+            result = await fn(position_id=params["id"], req=req, db=db)
+            return f"已更新岗位 {params['id']}" if result["code"] == 0 else f"更新失败：{result.get('message', '')}"
+
+        elif tool_name == "delete_position":
+            from app.routers.positions import delete_position as fn
+            result = await fn(position_id=params["id"], db=db)
+            return f"已删除岗位 {params['id']}" if result["code"] == 0 else f"删除失败：{result.get('message', '')}"
+
+        elif tool_name == "get_position_questions":
+            from app.routers.positions import get_position_questions as fn
+            result = await fn(position_id=params["positionId"], round=params["round"], db=db)
+            qs = result.get("data", [])
+            return f"岗位题库（{params['round']}）共 {len(qs)} 道题"
+
+        elif tool_name == "save_position_questions":
+            from app.routers.positions import save_position_questions as fn
+            result = await fn(position_id=params["positionId"], body={"round": params["round"], "questions": params["questions"]}, db=db)
+            return f"已保存岗位题库 {len(params['questions'])} 道题" if result["code"] == 0 else f"保存失败：{result.get('message', '')}"
+
         elif tool_name == "get_questions":
             from app.routers.interview import get_questions as fn
             result = await fn(candidateId=params["candidateId"], round=params["round"], db=db)
@@ -141,6 +229,33 @@ async def execute_tool_call(tool_name: str, params: dict, db: AsyncSession) -> s
             data = result.get("data", [])
             return f"排行榜共 {len(data)} 人"
 
+        elif tool_name == "save_questions":
+            from app.routers.interview import save_questions as fn
+            result = await fn(body={"candidateId": params["candidateId"], "round": params["round"], "questions": params["questions"]}, db=db)
+            return f"已保存 {len(params['questions'])} 道面试题" if result["code"] == 0 else f"保存失败：{result.get('message', '')}"
+
+        elif tool_name == "replace_question":
+            from app.routers.interview import replace_question as fn
+            result = await fn(question_id=params["questionId"], body=params, db=db)
+            qs = result.get("data", [])
+            return f"已替换题目，当前题单共 {len(qs)} 道" if result["code"] == 0 else f"替换失败：{result.get('message', '')}"
+
+        elif tool_name == "save_evaluation":
+            from app.routers.interview import save_evaluation as fn
+            result = await fn(candidate_id=params["candidateId"], body={"round": params["round"], "scores": params["scores"]}, db=db)
+            return f"已保存 {len(params['scores'])} 题评分" if result["code"] == 0 else f"保存失败：{result.get('message', '')}"
+
+        elif tool_name == "submit_evaluation":
+            from app.routers.interview import submit_evaluation as fn
+            result = await fn(candidate_id=params["candidateId"], db=db)
+            return f"已提交候选人 {params['candidateId']} 的面试评定" if result["code"] == 0 else f"提交失败：{result.get('message', '')}"
+
+        elif tool_name == "get_rankings":
+            from app.routers.interview import get_rankings as fn
+            result = await fn(candidateId=params["candidateId"], db=db)
+            data = result.get("data", [])
+            return f"同岗位排名共 {len(data)} 人"
+
         elif tool_name == "list_probation":
             from app.routers.probation import list_probation as fn
             result = await fn(department=params.get("department", "all"), status=params.get("status", "all"), db=db)
@@ -149,6 +264,74 @@ async def execute_tool_call(tool_name: str, params: dict, db: AsyncSession) -> s
                 return f"试用期员工：共 {data.get('total', 0)} 人"
             return "查询完成"
 
+        elif tool_name == "get_probation_stats":
+            from app.routers.probation import get_probation_stats as fn
+            result = await fn(db=db)
+            d = result.get("data", {})
+            return f"试用期统计：总 {d.get('total', 0)}，考核中 {d.get('assessing', 0)}，通过 {d.get('passed', 0)}，未通过 {d.get('failed', 0)}"
+
+        elif tool_name == "get_probation_employee":
+            from app.routers.probation import get_probation_employee as fn
+            result = await fn(employee_id=params["id"], db=db)
+            d = result.get("data") or {}
+            return f"员工「{d.get('name', '')}」- {d.get('positionName', '')}，状态 {d.get('status', '')}，任务进度 {d.get('taskProgress', 0)}%"
+
+        elif tool_name == "create_probation_employee":
+            from app.routers.probation import create_employee as fn, CreateEmployeeRequest
+            req = CreateEmployeeRequest(**params)
+            result = await fn(req=req, db=db)
+            if result["code"] == 0:
+                return f"已新增试用期员工「{params['name']}」"
+            return f"新增失败：{result.get('message', '')}"
+
+        elif tool_name == "save_week1_assessment":
+            from app.routers.probation import save_week1_assessment as fn, Week1AssessmentRequest
+            req = Week1AssessmentRequest(**params)
+            result = await fn(employee_id=params["employeeId"], req=req, db=db)
+            if result["code"] == 0:
+                d = result.get("data", {})
+                verdict = "通过" if d.get("passed") else "未通过"
+                return f"第一周评估已保存，总分 {d.get('totalScore', 0)}，{verdict}"
+            return f"保存失败：{result.get('message', '')}"
+
+        elif tool_name == "save_conversion":
+            from app.routers.probation import save_conversion as fn, ConversionRequest
+            req = ConversionRequest(**params)
+            result = await fn(employee_id=params["employeeId"], req=req, db=db)
+            if result["code"] == 0:
+                d = result.get("data", {})
+                decision_map = {"converted": "转正", "extended": "延长试用期", "rejected": "不通过"}
+                return f"转正评估已保存，总分 {d.get('totalScore', 0)}，结论：{decision_map.get(d.get('decision', ''), d.get('decision', ''))}"
+            return f"保存失败：{result.get('message', '')}"
+
+        elif tool_name == "create_probation_task":
+            from app.routers.probation import create_probation_task as fn
+            result = await fn(body=params, db=db)
+            return f"已为员工 {params['employeeId']} 新增任务「{params.get('title', '')}」" if result["code"] == 0 else f"新增失败：{result.get('message', '')}"
+
+        elif tool_name == "update_probation_task":
+            from app.routers.probation import update_probation_task as fn
+            result = await fn(task_id=params["taskId"], body=params.get("fields", {}), db=db)
+            return f"已更新任务 {params['taskId']}" if result["code"] == 0 else f"更新失败：{result.get('message', '')}"
+
+        elif tool_name == "ai_evaluate_probation":
+            from app.routers.probation import ai_evaluate_probation as fn
+            result = await fn(employee_id=params["employeeId"], db=db)
+            if result["code"] == 0:
+                d = result.get("data", {})
+                return f"AI评估完成：综合分 {d.get('score', 0)}，结论 {d.get('result', '')}。{d.get('comment', '')}"
+            return f"AI评估失败：{result.get('message', '')}"
+
+        elif tool_name == "update_probation_status":
+            from app.routers.probation import update_probation_status as fn
+            result = await fn(employee_id=params["employeeId"], body={"status": params["status"]}, db=db)
+            return f"已更新员工 {params['employeeId']} 状态为 {params['status']}" if result["code"] == 0 else f"更新失败：{result.get('message', '')}"
+
+        elif tool_name == "manual_review_probation":
+            from app.routers.probation import manual_review as fn
+            result = await fn(employee_id=params["employeeId"], body={"aiScore": params.get("aiScore"), "aiResult": params.get("aiResult")}, db=db)
+            return f"已手动录入员工 {params['employeeId']} 的评估" if result["code"] == 0 else f"录入失败：{result.get('message', '')}"
+
         elif tool_name == "list_performance":
             from app.routers.performance import list_performance as fn
             result = await fn(quarter=params["quarter"], db=db)
@@ -156,6 +339,47 @@ async def execute_tool_call(tool_name: str, params: dict, db: AsyncSession) -> s
             if isinstance(data, dict):
                 return f"绩效数据：共 {data.get('total', 0)} 条记录"
             return "查询完成"
+
+        elif tool_name == "get_performance_stats":
+            from app.routers.performance import get_performance_stats as fn
+            result = await fn(quarter=params["quarter"], db=db)
+            d = result.get("data", {})
+            return f"绩效统计：参与 {d.get('participants', 0)} 人，平均分 {d.get('avgScore', 0)}，优秀 {d.get('excellentCount', 0)}，待改进 {d.get('needsImprovement', 0)}"
+
+        elif tool_name == "get_department_performance":
+            from app.routers.performance import get_department_performance as fn
+            result = await fn(quarter=params["quarter"], db=db)
+            data = result.get("data", [])
+            return f"部门绩效共 {len(data)} 个部门"
+
+        elif tool_name == "get_grade_distribution":
+            from app.routers.performance import get_grade_distribution as fn
+            result = await fn(quarter=params["quarter"], db=db)
+            data = result.get("data", [])
+            parts = [f"{g['grade']}:{g['count']}" for g in data]
+            return f"等级分布：{', '.join(parts)}"
+
+        elif tool_name == "get_bonus_info":
+            from app.routers.performance import get_bonus_info as fn
+            result = await fn(quarter=params["quarter"], db=db)
+            d = result.get("data", {})
+            return f"奖金池：总额 {d.get('totalPool', 0)}，已分配 {d.get('distributed', 0)}，待分配 {d.get('pending', 0)}"
+
+        elif tool_name == "get_quarter_trends":
+            from app.routers.performance import get_quarter_trends as fn
+            result = await fn(db=db)
+            data = result.get("data", [])
+            return f"近 {len(data)} 个季度趋势"
+
+        elif tool_name == "initiate_appraisal":
+            from app.routers.performance import initiate_appraisal as fn
+            result = await fn(body={"quarter": params["quarter"], "employeeIds": params["employeeIds"]}, db=db)
+            return f"已为 {params['quarter']} 发起绩效考核，{len(params['employeeIds'])} 人参与" if result["code"] == 0 else f"发起失败：{result.get('message', '')}"
+
+        elif tool_name == "update_bonus":
+            from app.routers.performance import update_bonus as fn
+            result = await fn(employee_id=params["employeeId"], body={"bonus": params["bonus"]}, db=db)
+            return f"已更新员工 {params['employeeId']} 奖金为 {params['bonus']}" if result["code"] == 0 else f"更新失败：{result.get('message', '')}"
 
         elif tool_name == "rag_search":
             try:
@@ -185,6 +409,104 @@ async def execute_tool_call(tool_name: str, params: dict, db: AsyncSession) -> s
                 return f"知识库：共 {data.get('total', 0)} 条素材"
             return "查询完成"
 
+        elif tool_name == "get_knowledge_stats":
+            from app.routers.knowledge import get_knowledge_stats as fn
+            result = await fn(db=db)
+            d = result.get("data", {})
+            return f"知识库统计：共 {d.get('total', 0)} 条，本月新增 {d.get('newThisMonth', 0)}"
+
+        elif tool_name == "get_knowledge_categories":
+            from app.routers.knowledge import get_categories as fn
+            result = await fn(db=db)
+            data = result.get("data", [])
+            return f"知识库分类共 {len(data)} 个根分类"
+
+        elif tool_name == "upload_knowledge_file":
+            # fileKey is a MinIO object key uploaded by the frontend "添加资料" flow.
+            object_key = params["fileKey"]
+            file_name = params["fileName"]
+            return f"知识库素材文件「{file_name}」已就绪，object key={object_key}。请接着调用 create_knowledge_item 完成入库。"
+
+        elif tool_name == "create_knowledge_item":
+            from app.routers.knowledge import create_knowledge_item as fn
+            result = await fn(body=params, db=db)
+            if result["code"] == 0:
+                return f"已创建知识库素材「{params.get('name', '')}」"
+            return f"创建失败：{result.get('message', '')}"
+
+        elif tool_name == "update_knowledge_item":
+            from app.routers.knowledge import update_knowledge_item as fn
+            result = await fn(item_id=params["id"], body=params.get("fields", {}), db=db)
+            return f"已更新素材 {params['id']}" if result["code"] == 0 else f"更新失败：{result.get('message', '')}"
+
+        elif tool_name == "delete_knowledge_item":
+            from app.routers.knowledge import delete_knowledge_item as fn
+            result = await fn(item_id=params["id"], db=db)
+            return f"已删除素材 {params['id']}" if result["code"] == 0 else f"删除失败：{result.get('message', '')}"
+
+        elif tool_name == "recall_test":
+            from app.routers.knowledge import recall_test as fn
+            result = await fn(body={"query": params["query"]}, db=db)
+            data = result.get("data", [])
+            return f"召回测试命中 {len(data)} 条"
+
+        elif tool_name == "list_knowledge_bases":
+            from app.routers.rag import list_knowledge_bases as fn
+            result = await fn(keyword=params.get("keyword", ""), db=db)
+            d = result.get("data", {})
+            return f"RAG知识库共 {d.get('total', 0)} 个"
+
+        elif tool_name == "create_knowledge_base":
+            from app.routers.rag import create_knowledge_base as fn
+            result = await fn(body={"name": params["name"], "description": params.get("description", "")}, db=db)
+            return f"已创建RAG知识库「{params['name']}」" if result.get("code") == 200 or result.get("code") == 0 else f"创建失败：{result.get('message', '')}"
+
+        elif tool_name == "update_knowledge_base":
+            from app.routers.rag import update_knowledge_base as fn
+            result = await fn(kb_id=params["id"], body=params.get("fields", {}), db=db)
+            return f"已更新RAG知识库 {params['id']}" if result.get("code") in (0, 200) else f"更新失败：{result.get('message', '')}"
+
+        elif tool_name == "delete_knowledge_base":
+            from app.routers.rag import delete_knowledge_base as fn
+            result = await fn(kb_id=params["id"], db=db)
+            return f"已删除RAG知识库 {params['id']}" if result.get("code") in (0, 200) else f"删除失败：{result.get('message', '')}"
+
+        elif tool_name == "upload_document":
+            # fileKey is a MinIO object key uploaded by the frontend "添加资料" flow.
+            # The RAG upload_document endpoint expects an UploadFile + kb_id form.
+            from app.routers.rag import upload_document as fn
+            from fastapi import UploadFile
+            import io
+            object_key = params["fileKey"]
+            file_name = params["fileName"]
+            kb_id = params["kbId"]
+            tmp_path = await asyncio.to_thread(minio_storage.download_to_temp, object_key)
+            try:
+                with open(tmp_path, "rb") as f:
+                    content = f.read()
+            finally:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+            upload_file = UploadFile(file=io.BytesIO(content), filename=file_name)
+            result = await fn(file=upload_file, kb_id=kb_id)
+            if result.get("code") in (0, 200):
+                d = result.get("data", {})
+                return f"已上传文档「{file_name}」到知识库 {kb_id}，文档ID={d.get('docId', '')}，任务ID={d.get('taskId', '')}。入库异步进行中。"
+            return f"上传失败：{result.get('message', '')}"
+
+        elif tool_name == "list_documents":
+            from app.routers.rag import list_documents as fn
+            result = await fn(kb_id=params.get("kbId", ""), db=db)
+            d = result.get("data", {})
+            return f"文档列表共 {d.get('total', 0)} 个"
+
+        elif tool_name == "delete_document":
+            from app.routers.rag import delete_document as fn
+            result = await fn(doc_id=params["id"], db=db)
+            return f"已删除文档 {params['id']}" if result.get("code") in (0, 200) else f"删除失败：{result.get('message', '')}"
+
         elif tool_name == "get_operations_dashboard":
             from app.routers.dashboard import get_operations as fn
             result = await fn(db=db)
@@ -192,11 +514,21 @@ async def execute_tool_call(tool_name: str, params: dict, db: AsyncSession) -> s
             summary = data.get("summary", {})
             return f"运营概览：{summary.get('title', '')} - {summary.get('text', '')}"
 
+        elif tool_name == "get_dashboard_overview":
+            from app.routers.dashboard import get_overview as fn
+            result = await fn(db=db)
+            return f"数据看板概览已获取"
+
         elif tool_name == "get_settings":
             from app.routers.settings import get_settings as fn
             result = await fn(db=db)
             data = result.get("data", {})
             return f"系统设置：公司「{data.get('companyName', '')}」，AI解析={'开启' if data.get('aiResumeAnalysis') else '关闭'}"
+
+        elif tool_name == "update_settings":
+            from app.routers.settings import update_settings as fn
+            result = await fn(body=params.get("fields", {}), db=db)
+            return f"已更新系统设置" if result["code"] == 0 else f"更新失败：{result.get('message', '')}"
 
         else:
             return f"工具 {tool_name} 执行完成"
@@ -207,25 +539,38 @@ async def execute_tool_call(tool_name: str, params: dict, db: AsyncSession) -> s
 
 # ── Agent System Prompt ─────────────────────────────────
 
-def build_system_prompt(agent_id: str = "recruit") -> str:
-    agent_info = AGENT_CONFIGS.get(agent_id, AGENT_CONFIGS["recruit"])
-    return f"""你是 Genie 智能招聘系统的 {agent_info['name']}，{agent_info['description']}。
+def build_system_prompt(agent_id: str = "genie") -> str:
+    agent_info = AGENT_CONFIGS.get(agent_id, AGENT_CONFIGS["genie"])
+    return f"""你是 Genie 智能招聘系统的「{agent_info['name']}」，{agent_info['description']}。
 
-你是招聘总管，可以协调招聘、面试、培训、绩效四个子Agent协同工作。
+你的核心使命：用户可以通过对话框完成系统中**所有**原本需要用鼠标点击的操作。主打全能智能化。
+
+你可以完成以下所有功能：
+- **简历筛选**：上传/查询/评分/删除/重新解析简历，按岗位/状态/关键词筛选候选人
+- **岗位管理**：创建/查询/更新/删除岗位，管理岗位题库
+- **面试出题**：生成/保存/替换面试题目（一面/二面），结合候选人简历和知识库出题
+- **面试评定**：录入候选人回答、AI 评分、HR 评分、提交评定、查看排行榜
+- **试用期考核**：新增试用期员工、录入第一周评估、转正评估、任务跟踪、AI 自动评估
+- **绩效管理**：发起季度考核、查询绩效统计/部门绩效/等级分布/奖金池、调整奖金
+- **知识库管理**：上传/创建/更新/删除知识库素材、RAG 知识库 CRUD、文档入库、语义检索
+- **系统设置**：查看/修改公司信息、AI 开关、合格分数线、试用期天数等配置
+- **数据看板**：查看运营概览、招聘漏斗、风险提示
 
 工作规则：
-1. 你必须使用工具来获取系统中的实际数据，不要编造数据
-2. 当用户要求执行操作时，先确认理解意图，再调用合适的工具
-3. 操作完成后，用简洁的中文汇报结果
-4. 如果用户的问题涉及多个步骤，请按顺序执行并汇报进度
-5. 你可以将复杂任务拆解给子Agent处理：使用 @interview、@training、@performance 标记
-6. 对于知识类问题，优先使用 rag_search 检索知识库
-7. 回复使用 Markdown 格式，包含清晰的标题和列表
+1. **必须使用工具**获取和修改系统中的实际数据，绝对不要编造数据或凭空回答
+2. 当用户提出操作需求时，先理解意图，再调用最合适的工具。复杂任务拆解为多步骤，按顺序执行并汇报进度
+3. 工具返回结果后，用简洁的中文总结结果，并主动给出下一步建议
+4. **文件类操作**（上传简历/上传知识库文档）：用户已通过「添加资料」按钮上传的文件会以 materialId/objectKey 形式出现在对话上下文中。直接使用对应的 upload_xxx 工具，把 fileKey 传进去即可
+5. 对于知识类问题（公司制度、技术规范、面试题库），优先使用 rag_search 检索知识库
+6. 涉及多个模块的复杂任务，可以协调子 Agent 协作（使用 @interview、@training、@performance 标记）
+7. 回复使用 Markdown 格式，包含清晰的标题、列表和重点
+8. 如果工具执行失败，如实告知错误并给出修复建议
 
-可用的子Agent：
-- @interview：负责面试出题、面试分析、录用建议
-- @training：负责入职培养、试用期跟踪
-- @performance：负责绩效分析、员工成长建议"""
+可用子 Agent（@-mention 协作）：
+- @interview：面试出题与评定
+- @training：试用期跟踪
+- @performance：绩效分析
+（默认情况下你已拥有所有工具，无需 @ 也可直接处理）"""
 
 
 # ── API Endpoints ───────────────────────────────────────
@@ -246,7 +591,8 @@ async def get_ai_agent_overview(db: AsyncSession = Depends(get_db)):
             "agents": [
                 {
                     "id": aid, "name": cfg["name"], "description": cfg["description"],
-                    "status": "就绪", "tone": "active",
+                    "status": "就绪" if aid != "genie" else "全能就绪",
+                    "tone": "active",
                     "icon": cfg["icon"], "iconBg": cfg["iconBg"], "iconColor": cfg["iconColor"],
                 }
                 for aid, cfg in AGENT_CONFIGS.items()
@@ -312,7 +658,7 @@ async def create_session(
     """Create a new empty chat session."""
     session = AgentSession(
         title="新对话",
-        agent_id="recruit",
+        agent_id="genie",
     )
     db.add(session)
     await db.flush()
@@ -499,7 +845,7 @@ async def agent_chat(
     """
     message = body.get("message", "")
     session_id = body.get("sessionId")
-    agent_id = body.get("agentId", "recruit")
+    agent_id = body.get("agentId", "genie")
     mentioned_agent_ids = body.get("mentionedAgentIds", [])
     material_ids = body.get("materialIds", [])
 
@@ -546,7 +892,7 @@ async def agent_chat(
             is_new_session = True
             session = AgentSession(
                 title="新对话",
-                agent_id=agent_id,
+                agent_id="genie",
             )
             db.add(session)
             await db.flush()

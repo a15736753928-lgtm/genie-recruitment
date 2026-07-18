@@ -5,9 +5,19 @@ from contextlib import asynccontextmanager
 import logging
 import time
 import sys
+import io
 from app.config import get_settings
 
 # ── Early logging setup (before uvicorn takes over) ──
+# On Windows the default stdout/stderr encoding is often GBK and chokes on
+# emoji/box-drawing characters used in startup logs. Force UTF-8 so logs
+# render correctly regardless of the system codepage.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except (AttributeError, io.UnsupportedOperation):
+    pass
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
@@ -99,6 +109,23 @@ app.add_middleware(
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
+    # Invalid UUID path/query params surface as asyncpg DataError or
+    # sqlalchemy DBAPIError. Convert to a clean 400/404 instead of a 500 so
+    # the frontend gets a meaningful message and the server logs stay clean.
+    msg = str(exc)
+    exc_type = type(exc).__name__
+    is_invalid_uuid = (
+        "invalid UUID" in msg
+        or "invalid input for query argument" in msg
+        or "DataError" in exc_type
+        or "DataError" in msg
+    )
+    if is_invalid_uuid:
+        logger.warning("Bad UUID input on %s %s: %s", request.method, request.url.path, msg)
+        return JSONResponse(
+            status_code=404,
+            content={"code": 404, "message": "记录不存在或 ID 格式无效", "data": None},
+        )
     logger.error("Unhandled exception: %s", exc, exc_info=True)
     return JSONResponse(
         status_code=500,

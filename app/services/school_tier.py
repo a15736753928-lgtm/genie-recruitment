@@ -112,6 +112,8 @@ async def classify_school_tier(school_name: str) -> str:
         client = AsyncOpenAI(
             api_key=settings.deepseek_api_key,
             base_url=settings.deepseek_base_url,
+            timeout=60.0,
+            max_retries=0,
         )
         prompt = (
             f"判断「{key}」这所中国高校的招生层次。只回答一个词，从以下选一个："

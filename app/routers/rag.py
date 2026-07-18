@@ -418,7 +418,11 @@ async def get_document_file(
     doc_id: str,
     db: AsyncSession = Depends(get_db),
 ):
-    """Stream a document's original file content from MinIO (preview / download)."""
+    """Stream a document's original file content (preview / download).
+
+    Supports both MinIO object keys and legacy absolute local file paths stored
+    in ``object_key`` before the MinIO migration.
+    """
     result = await db.execute(
         select(KnowledgeDocument).where(KnowledgeDocument.id == doc_id)
     )
@@ -429,16 +433,7 @@ async def get_document_file(
             content={"code": 404, "message": "文档或原始文件不存在", "data": None},
         )
 
-    from app.core import minio_storage
-    from starlette.responses import StreamingResponse
-
-    try:
-        response = await asyncio.to_thread(minio_storage.get_object_stream, doc.object_key)
-    except Exception as e:
-        return JSONResponse(
-            status_code=500,
-            content={"code": 500, "message": f"读取文件失败: {e}", "data": None},
-        )
+    from starlette.responses import StreamingResponse, FileResponse
 
     ext = os.path.splitext(doc.file_name or "")[1].lower()
     media_type = {
@@ -452,6 +447,40 @@ async def get_document_file(
     }.get(ext, "application/octet-stream")
 
     filename = doc.file_name or f"{doc.id}{ext}"
+    stored = doc.object_key
+
+    # 1) Legacy absolute local path that still exists on disk → stream from disk.
+    if os.path.isabs(stored) and os.path.isfile(stored):
+        return FileResponse(
+            path=stored,
+            media_type=media_type,
+            filename=filename,
+            headers={"Content-Disposition": f'inline; filename="{filename}"'},
+        )
+
+    # 2) Otherwise treat ``stored`` as a MinIO object key and stream from MinIO.
+    from app.core import minio_storage
+
+    # Verify the object actually exists in MinIO before opening a stream —
+    # otherwise the StreamingResponse would start, fail mid-stream, and the
+    # client would receive a truncated/empty body with no clear error.
+    if not minio_storage.object_exists(stored):
+        return JSONResponse(
+            status_code=404,
+            content={
+                "code": 404,
+                "message": "原始文件不存在或已被清理，请重新上传该文档",
+                "data": None,
+            },
+        )
+
+    try:
+        response = await asyncio.to_thread(minio_storage.get_object_stream, stored)
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"code": 500, "message": f"读取文件失败: {e}", "data": None},
+        )
 
     def _iter():
         try:

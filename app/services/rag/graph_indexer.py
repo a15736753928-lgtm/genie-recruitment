@@ -28,6 +28,8 @@ logger = logging.getLogger(__name__)
 llm_client = OpenAI(
     api_key=settings.deepseek_api_key,
     base_url=settings.deepseek_base_url,
+    timeout=60.0,
+    max_retries=0,
 )
 
 _EXTRACT_ENTITIES_SYSTEM = """你是一个知识图谱实体抽取专家。从给定的文本片段中提取关键实体。

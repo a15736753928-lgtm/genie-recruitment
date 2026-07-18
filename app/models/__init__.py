@@ -13,7 +13,7 @@ from app.models.knowledge import (
 from app.models.agent import (
     AgentSession, AgentMessage, AgentMaterial, AgentTask
 )
-from app.models.settings import SystemSetting
+from app.models.settings import SystemSetting, AuditLog
 
 __all__ = [
     "Position", "Candidate", "CandidateSkill", "CandidateEducation",
@@ -23,5 +23,5 @@ __all__ = [
     "PerformanceRecord", "PerformanceQuarter",
     "KnowledgeCategory", "KnowledgeItem",
     "AgentSession", "AgentMessage", "AgentMaterial", "AgentTask",
-    "SystemSetting",
+    "SystemSetting", "AuditLog",
 ]

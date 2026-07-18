@@ -31,6 +31,8 @@ logger = logging.getLogger(__name__)
 llm_client = OpenAI(
     api_key=settings.deepseek_api_key,
     base_url=settings.deepseek_base_url,
+    timeout=60.0,
+    max_retries=0,
 )
 
 _SUMMARY_SYSTEM = """你是一个技术文档摘要专家。请根据一组相关实体的信息，生成该知识社区的自然语言摘要。

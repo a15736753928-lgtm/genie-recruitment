@@ -211,6 +211,8 @@ def infer_gender_from_vision(image_bytes: bytes, client: Optional[OpenAI] = None
     llm_client = client or OpenAI(
         api_key=settings.deepseek_api_key,
         base_url=settings.deepseek_base_url,
+        timeout=60.0,
+        max_retries=0,
     )
     mime = _guess_mime(image_bytes)
     encoded = base64.b64encode(image_bytes).decode("ascii")

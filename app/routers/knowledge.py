@@ -21,6 +21,8 @@ settings = get_settings()
 llm_client = OpenAI(
     api_key=settings.deepseek_api_key,
     base_url=settings.deepseek_base_url,
+    timeout=60.0,
+    max_retries=0,
 )
 
 # ── Milvus Lite setup ───────────────────────────────────

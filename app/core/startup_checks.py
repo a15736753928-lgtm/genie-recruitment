@@ -157,33 +157,46 @@ def _find_port_owner(port: int) -> str:
 
 
 async def check_port_available(settings: Settings) -> CheckResult:
-    """Fail fast if the app port is already in use.
+    """Fail fast if the app port is already in use by ANOTHER process.
 
     Runs as a preflight BEFORE model loading, so a port conflict surfaces in
-    milliseconds rather than after ~20s of model loading. Does NOT set
-    SO_REUSEADDR — on Windows that would let two processes share the port and
-    hide the conflict; we want to detect it the way uvicorn will.
+    milliseconds rather than after ~20s of model loading.
+
+    Implementation note: we use connect() (try to reach whoever is listening)
+    rather than bind(). Under uvicorn --reload the reloader process binds the
+    socket and passes it to the worker; the lifespan startup check runs inside
+    the worker, so a bind()-based check would always collide with uvicorn's own
+    inherited socket and falsely report "already in use". connect() only
+    succeeds when some OTHER process is actually accepting connections on the
+    port, which is exactly the conflict we want to catch.
     """
     import socket
     port = settings.app_port
     t0 = time.perf_counter()
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(0.25)
     try:
-        sock.bind(("0.0.0.0", port))
-        return CheckResult(
-            f"Port {port}", "critical", CheckStatus.PASS,
-            "Available",
-            (time.perf_counter() - t0) * 1000,
-        )
-    except OSError as e:
+        # If connect succeeds, someone else is already listening → conflict.
+        sock.connect(("127.0.0.1", port))
+        sock.close()
         hint = await asyncio.to_thread(_find_port_owner, port)
         return CheckResult(
             f"Port {port}", "critical", CheckStatus.FAIL,
             f"Already in use{hint}",
             (time.perf_counter() - t0) * 1000,
         )
+    except (OSError, ConnectionRefusedError, socket.timeout):
+        # Connection refused / timed out → port is free for us.
+        return CheckResult(
+            f"Port {port}", "critical", CheckStatus.PASS,
+            "Available",
+            (time.perf_counter() - t0) * 1000,
+        )
     finally:
-        sock.close()
+        try:
+            sock.close()
+        except OSError:
+            pass
 
 
 # ═══════════════════════════════════════════════════════════════════

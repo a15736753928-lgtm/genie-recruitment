@@ -44,6 +44,8 @@ async def _llm_score(rubric: str, resume_text: str, position_name: str) -> Optio
         client = AsyncOpenAI(
             api_key=settings.deepseek_api_key,
             base_url=settings.deepseek_base_url,
+            timeout=60.0,
+            max_retries=0,
         )
         resp = await client.chat.completions.create(
             model=settings.deepseek_model,
