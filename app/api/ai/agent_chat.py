@@ -88,11 +88,29 @@ async def execute_tool_call(tool_name: str, params: dict, db: AsyncSession) -> s
             statuses = params.get("statuses", "")
             keyword = params.get("keyword", "")
             limit = params.get("limit", 10)
-            result = await fn(positionId=pos_id, statuses=statuses, keyword=keyword, page=1, pageSize=limit, db=db)
+            # minScore 必须显式传 None：FastAPI 的 Query(None) 默认值在
+            # 直接 Python 调用时不会解析，导致 Query 对象被注入 SQL 引发
+            # "Query(None) cannot be interpreted as an integer" 错误。
+            result = await fn(
+                positionId=pos_id, statuses=statuses, keyword=keyword,
+                sortBy="uploadTime", sortOrder="desc",
+                page=1, pageSize=limit, minScore=None, db=db,
+            )
             data = result["data"]
             if isinstance(data, dict) and "list" in data:
                 candidates = data["list"]
-                return f"找到 {data['total']} 位候选人。前 {len(candidates)} 位"
+                total = data["total"]
+                if not candidates:
+                    return f"未找到符合条件的候选人（共 {total} 位候选人）"
+                lines = [f"共 {total} 位候选人，以下是前 {len(candidates)} 位："]
+                for c in candidates:
+                    skills = ", ".join(c.get("skills", [])[:5]) or "无"
+                    lines.append(
+                        f"  [{c['id']}] {c['name']} | {c['position']} | "
+                        f"匹配度 {c['score']} 分 | 状态: {c['status']} | "
+                        f"技能: {skills}"
+                    )
+                return "\n".join(lines)
             return f"查询结果：{json.dumps(data, ensure_ascii=False)[:500]}"
 
         elif tool_name == "get_resume":
@@ -100,15 +118,64 @@ async def execute_tool_call(tool_name: str, params: dict, db: AsyncSession) -> s
             result = await fn(resume_id=params["id"], db=db)
             data = result.get("data")
             if data:
-                return f"候选人「{data['name']}」- {data['position']}，匹配度 {data['score']} 分，状态 {data['status']}。技能：{', '.join(data.get('skills', [])[:8])}。{data.get('aiAnalysis', {}).get('summary', '')}"
+                ai = data.get("aiAnalysis") or {}
+                lines = [
+                    f"候选人「{data['name']}」(ID: {data['id']})",
+                    f"  岗位: {data['position']}({data.get('positionId','')}) | 匹配度: {data['score']} 分 | 状态: {data['status']}",
+                    f"  性别: {data.get('gender','未知')} | 年龄: {data.get('age') or '未知'} | 民族: {data.get('ethnicity','未知')} | 籍贯: {data.get('nativePlace','未知')}",
+                    f"  学历: {data.get('education','未知')} | 经验: {data.get('experience','未知')}",
+                    f"  电话: {data.get('phone','未知')} | 邮箱: {data.get('email','未知')}",
+                    f"  技能: {', '.join(data.get('skills', [])) or '无'}",
+                ]
+                if data.get("educationHistory"):
+                    lines.append("  教育经历:")
+                    for e in data["educationHistory"]:
+                        lines.append(f"    - {e.get('school','')} | {e.get('degree','')} | {e.get('major','')} | {e.get('period','')}")
+                if data.get("workHistory"):
+                    lines.append("  工作经历:")
+                    for w in data["workHistory"]:
+                        lines.append(f"    - {w.get('company','')} | {w.get('role','')} | {w.get('period','')}")
+                        if w.get('description'):
+                            lines.append(f"      描述: {w['description'][:200]}")
+                if data.get("projectHistory"):
+                    lines.append("  项目经历:")
+                    for p in data["projectHistory"]:
+                        lines.append(f"    - {p.get('name','')} | {p.get('role','')} | {p.get('period','')}")
+                        if p.get('description'):
+                            lines.append(f"      描述: {p['description'][:200]}")
+                if ai:
+                    lines.append(f"  AI综合分析:")
+                    if ai.get("summary"):
+                        lines.append(f"    总结: {ai['summary']}")
+                    if ai.get("overallScore"):
+                        lines.append(f"    综合分: {ai['overallScore']}")
+                    if ai.get("positionMatch"):
+                        lines.append(f"    岗位匹配: {ai['positionMatch']}")
+                    if ai.get("experienceInsight"):
+                        lines.append(f"    经验洞察: {ai['experienceInsight']}")
+                    if ai.get("keywords"):
+                        lines.append(f"    关键词: {', '.join(ai['keywords'])}")
+                    if ai.get("highlights"):
+                        lines.append(f"    亮点: {'; '.join(ai['highlights'])}")
+                    if ai.get("risks"):
+                        lines.append(f"    风险: {'; '.join(ai['risks'])}")
+                    if ai.get("recommendation"):
+                        lines.append(f"    建议: {ai['recommendation']}")
+                    if ai.get("dimensions"):
+                        lines.append(f"    维度评分:")
+                        for d in ai["dimensions"]:
+                            lines.append(f"      - {d.get('name','')}: {d.get('score',0)}分 ({d.get('comment','')[:200] if d.get('comment') else ''})")
+                return "\n".join(lines)
             return "候选人不存在"
 
         elif tool_name == "list_positions":
             from app.api.recruitment.positions import list_positions as fn
             result = await fn(db=db)
             data = result["data"]
-            return f"共有 {len(data)} 个岗位：{'，'.join(p['name'] for p in data)}"
-            return f"共 {len(data)} 个岗位"
+            lines = [f"共 {len(data)} 个岗位："]
+            for p in data:
+                lines.append(f"  [{p['id']}] {p['name']} | 部门: {p.get('department', '未设置')}")
+            return "\n".join(lines)
 
         elif tool_name == "update_resume":
             from app.api.recruitment.resumes import update_resume as fn
@@ -166,7 +233,27 @@ async def execute_tool_call(tool_name: str, params: dict, db: AsyncSession) -> s
             from app.api.recruitment.positions import get_position as fn
             result = await fn(position_id=params["id"], db=db)
             d = result.get("data") or {}
-            return f"岗位「{d.get('name', '')}」- {d.get('department', '')}。职责：{(d.get('jdResponsibilities') or '')[:200]}"
+            if not d:
+                return "岗位不存在"
+            lines = [
+                f"岗位「{d.get('name', '')}」(ID: {d.get('id', '')})",
+                f"  部门: {d.get('department', '未设置')} | 章节数: {d.get('chapterNumber', '未设置')}",
+            ]
+            if d.get("jdResponsibilities"):
+                lines.append(f"  岗位职责: {d['jdResponsibilities']}")
+            if d.get("jdRequirements"):
+                lines.append(f"  任职要求: {d['jdRequirements']}")
+            if d.get("jdPreferred"):
+                lines.append(f"  加分项: {d['jdPreferred']}")
+            if d.get("jdTechStack"):
+                lines.append(f"  技术栈: {d['jdTechStack']}")
+            if d.get("screeningCriteria"):
+                lines.append(f"  筛选标准: {json.dumps(d['screeningCriteria'], ensure_ascii=False)}")
+            if d.get("interviewCriteriaR1"):
+                lines.append(f"  一面标准: {json.dumps(d['interviewCriteriaR1'], ensure_ascii=False)}")
+            if d.get("interviewCriteriaR2"):
+                lines.append(f"  二面标准: {json.dumps(d['interviewCriteriaR2'], ensure_ascii=False)}")
+            return "\n".join(lines)
 
         elif tool_name == "create_position":
             from app.api.recruitment.positions import create_position as fn, CreatePositionRequest
@@ -254,7 +341,15 @@ async def execute_tool_call(tool_name: str, params: dict, db: AsyncSession) -> s
             from app.api.talent.interview import get_rankings as fn
             result = await fn(candidateId=params["candidateId"], db=db)
             data = result.get("data", [])
-            return f"同岗位排名共 {len(data)} 人"
+            if not data:
+                return "暂无同岗位排名数据"
+            lines = [f"同岗位排名共 {len(data)} 人："]
+            for r in data[:20]:
+                lines.append(
+                    f"  #{r.get('rank','?')} {r.get('name','?')} | "
+                    f"匹配度 {r.get('score',0)} 分 | 状态: {r.get('status','?')}"
+                )
+            return "\n".join(lines)
 
         elif tool_name == "list_probation":
             from app.api.talent.probation import list_probation as fn
@@ -520,7 +615,14 @@ async def execute_tool_call(tool_name: str, params: dict, db: AsyncSession) -> s
         elif tool_name == "get_dashboard_overview":
             from app.api.system.dashboard import get_overview as fn
             result = await fn(db=db)
-            return f"数据看板概览已获取"
+            d = result.get("data", {})
+            stats = d.get("stats", {})
+            return (
+                f"数据看板：简历总数 {stats.get('totalResumes', 0)}，"
+                f"岗位数 {stats.get('totalPositions', 0)}，"
+                f"面试中 {stats.get('totalInterviews', 0)}，"
+                f"在职员工 {stats.get('totalEmployees', 0)}"
+            )
 
         elif tool_name == "get_settings":
             from app.api.system.settings import get_settings as fn
