@@ -143,3 +143,28 @@ def _run_migrations(connection):
     # v3: 知识文档来源追踪（简历级联删除）
     _add_column_if_missing(connection, "knowledge_documents", "source_type", "VARCHAR(32) DEFAULT ''")
     _add_column_if_missing(connection, "knowledge_documents", "source_id", "VARCHAR(64) DEFAULT ''")
+    # v4: 修正历史脏状态 low_match —— 该状态不在前端合法状态枚举内，恢复为「求职中」
+    _cleanup_low_match_status(connection)
+
+
+def _cleanup_low_match_status(connection) -> None:
+    """把 candidates.status = 'low_match' 的历史脏数据恢复为 'job_hunting'。
+
+    low_match 曾被用作 AI 评分低于阈值时的标记，但它不在前端简历状态下拉枚举中，
+    会在界面上原样显示成英文串。低匹配信息已通过 screening_ai_score/score 保留，
+    状态本身回归合法值即可。
+    """
+    from sqlalchemy import text
+
+    table_exists = connection.execute(text(
+        "SELECT EXISTS ("
+        "  SELECT 1 FROM information_schema.tables"
+        "  WHERE table_schema = 'public' AND table_name = 'candidates'"
+        ")"
+    )).scalar()
+    if not table_exists:
+        return
+
+    connection.execute(text(
+        "UPDATE candidates SET status = 'job_hunting' WHERE status = 'low_match'"
+    ))

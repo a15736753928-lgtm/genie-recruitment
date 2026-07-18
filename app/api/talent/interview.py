@@ -300,11 +300,45 @@ async def replace_question(question_id: str, body: dict, db: AsyncSession = Depe
     if not candidate:
         return {"code": 404, "message": "候选人不存在", "data": None}
 
-    # Delete old question
-    old_q = await db.execute(select(InterviewQuestion).where(InterviewQuestion.id == question_id))
-    old = old_q.scalar_one_or_none()
-    if old:
-        # Get max index
+    # 前端「手动添加题目」时会用 `{candidateId}-{round}-custom-{ts}` 这种非 UUID 的本地 id，
+    # 这类题目从未落库；这里做一次 UUID 校验，避免 asyncpg 把非法 UUID 直接抛成 500。
+    old: Optional[InterviewQuestion] = None
+    try:
+        parsed_qid = uuid.UUID(str(question_id))
+    except (ValueError, TypeError):
+        parsed_qid = None
+    if parsed_qid is not None:
+        old_q = await db.execute(select(InterviewQuestion).where(InterviewQuestion.id == parsed_qid))
+        old = old_q.scalar_one_or_none()
+
+    rag_text = ""
+    if candidate.resume_file:
+        try:
+            rag_text = await asyncio.to_thread(_resume_text, candidate.resume_file)
+        except Exception:
+            pass
+
+    q_data = await generate_questions_with_llm(
+        candidate.name,
+        candidate.position.name if candidate.position else "未知",
+        round,
+        1,
+        rag_text,
+        prompt_override=body.get("prompt", ""),
+        category_override=body.get("category", ""),
+        difficulty_override=body.get("difficulty", "medium"),
+    )
+
+    if isinstance(q_data, list) and q_data:
+        q_data = q_data[0]
+
+    if old is not None:
+        # 替换已存在的题目：保留原 index
+        old.content = q_data.get("content", old.content)
+        old.category = q_data.get("category", old.category)
+        old.difficulty = q_data.get("difficulty", old.difficulty)
+    else:
+        # 题目不存在（前端本地自定义题或已被删除）：追加一道新题
         max_idx_result = await db.execute(
             select(func.max(InterviewQuestion.index_num)).where(and_(
                 InterviewQuestion.candidate_id == candidate_id,
@@ -312,33 +346,15 @@ async def replace_question(question_id: str, body: dict, db: AsyncSession = Depe
             ))
         )
         max_idx = max_idx_result.scalar() or 0
-        new_index = old.index_num
-
-        rag_text = ""
-        if candidate.resume_file:
-            try:
-                rag_text = await asyncio.to_thread(_resume_text, candidate.resume_file)
-            except Exception:
-                pass
-
-        q_data = await generate_questions_with_llm(
-            candidate.name,
-            candidate.position.name if candidate.position else "未知",
-            round,
-            1,
-            rag_text,
-            prompt_override=body.get("prompt", ""),
-            category_override=body.get("category", ""),
-            difficulty_override=body.get("difficulty", "medium"),
+        new_q = InterviewQuestion(
+            candidate_id=candidate_id,
+            round=round,
+            index_num=max_idx + 1,
+            content=q_data.get("content", ""),
+            category=q_data.get("category", "综合"),
+            difficulty=q_data.get("difficulty", "medium"),
         )
-
-        if isinstance(q_data, list) and q_data:
-            q_data = q_data[0]
-
-        # Replace old question
-        old.content = q_data.get("content", old.content)
-        old.category = q_data.get("category", old.category)
-        old.difficulty = q_data.get("difficulty", old.difficulty)
+        db.add(new_q)
 
     await db.flush()
 

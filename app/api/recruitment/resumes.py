@@ -524,7 +524,8 @@ async def run_resume_parse(candidate: Candidate, position_name: str = "", db: As
 
     await fill_candidate_from_parsed(candidate, parsed, db)
 
-    # 匹配分阈值：写入 screening_ai_score，低于阈值标记为低匹配
+    # 匹配分阈值：写入 screening_ai_score，低于阈值仅记录分数，不改变简历状态
+    # 简历状态只能取筛选下拉框中的 6 种合法值，新上传简历保持「求职中」
     min_score = int(await get_system_setting(db, "minMatchScore", 70) or 70)
     overall = None
     if isinstance(analysis, dict):
@@ -534,8 +535,7 @@ async def run_resume_parse(candidate: Candidate, position_name: str = "", db: As
     if isinstance(overall, (int, float)):
         candidate.screening_ai_score = int(overall)
         candidate.score = int(overall)
-        if int(overall) < min_score:
-            candidate.status = "low_match"
+        _ = min_score  # 低匹配阈值仅用于前端按综合分数过滤展示，不再覆写状态
 
     return parse_error
 
