@@ -7,10 +7,11 @@ settings = get_settings()
 engine = create_async_engine(
     settings.database_url,
     echo=False,
-    pool_size=20,
-    max_overflow=10,
+    pool_size=30,
+    max_overflow=20,
     pool_pre_ping=True,
-    pool_timeout=10,       # fail fast when pool is exhausted (vs. hang forever)
+    pool_timeout=30,      # 容忍短暂的池子耗尽（如批量上传）
+    pool_recycle=1800,    # 30 分钟回收，避免长连接被 PG 端踢掉
 )
 
 async_session_factory = async_sessionmaker(
@@ -45,10 +46,11 @@ _sync_url = settings.database_url.replace("+asyncpg", "+psycopg2") if settings.d
 _sync_engine = _create_sync_engine(
     _sync_url or settings.database_url_sync or "postgresql+psycopg2://postgres:1234@localhost:5432/genie_recruitment",
     echo=False,
-    pool_size=5,
-    max_overflow=5,
+    pool_size=10,
+    max_overflow=10,
     pool_pre_ping=True,
-    pool_timeout=10,
+    pool_timeout=30,
+    pool_recycle=1800,
 )
 
 SyncSessionFactory = _sync_sessionmaker(
@@ -138,3 +140,6 @@ def _run_migrations(connection):
     _add_column_if_missing(connection, "knowledge_bases", "owner_id", "VARCHAR(36)")
     # v2: 系统设置审计日志表结构（time/actor）
     _migrate_audit_logs(connection)
+    # v3: 知识文档来源追踪（简历级联删除）
+    _add_column_if_missing(connection, "knowledge_documents", "source_type", "VARCHAR(32) DEFAULT ''")
+    _add_column_if_missing(connection, "knowledge_documents", "source_id", "VARCHAR(64) DEFAULT ''")

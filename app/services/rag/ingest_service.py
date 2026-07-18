@@ -280,6 +280,8 @@ def _run_ingest_sync(
     file_name: str,
     kb_id: str,
     file_size: int = 0,
+    source_type: str = "",
+    source_id: str = "",
 ):
     """Full ingestion pipeline (runs in background thread).
 
@@ -321,6 +323,8 @@ def _run_ingest_sync(
             status="pending",
             uploaded_at=now,
             created_at=now,
+            source_type=source_type or "",
+            source_id=source_id or "",
         )
         db.add(doc)
         db.flush()
@@ -345,6 +349,12 @@ def _run_ingest_sync(
             if message:
                 task.message = message
             task.updated_at = _now_ms()
+            # 同步文档状态，避免前端一直显示「等待中」导致「查看分片」灰掉
+            if doc is not None:
+                if status in ("completed", "failed"):
+                    doc.status = status
+                elif status in ("parsing", "encoding", "indexing"):
+                    doc.status = status
             db.commit()
 
         # 2. Parse → raw text (3-layer pipeline)
@@ -456,11 +466,23 @@ def _run_ingest_sync(
 
 # ── Public API ──────────────────────────────────────────────
 
-def ingest_file_async(file_path: str, file_name: str, kb_id: str, file_size: int = 0):
+def ingest_file_async(
+    file_path: str,
+    file_name: str,
+    kb_id: str,
+    file_size: int = 0,
+    source_type: str = "",
+    source_id: str = "",
+):
     """Launch ingestion in a background thread.
 
     ``file_path`` is a MinIO object key. The worker downloads it to a temp file
     for parsing and removes the temp file when done.
+
+    Args:
+        source_type / source_id: 来源追踪。简历自动入库时传
+            ``source_type='resume'``、``source_id=<candidate_id>``，删除文档时
+            据此级联删除候选人。
 
     Returns (doc_id, task_id) immediately.
     Client polls GET /api/v1/rag/ingest-tasks/{task_id} for progress.
@@ -483,7 +505,7 @@ def ingest_file_async(file_path: str, file_name: str, kb_id: str, file_size: int
 
     t = threading.Thread(
         target=_run_ingest_sync,
-        args=(doc_id, task_id, file_path, file_name, kb_id, file_size),
+        args=(doc_id, task_id, file_path, file_name, kb_id, file_size, source_type, source_id),
         daemon=True,
     )
     t.start()

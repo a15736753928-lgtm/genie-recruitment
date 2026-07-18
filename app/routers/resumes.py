@@ -710,6 +710,9 @@ async def get_resume_file(resume_id: str, db: AsyncSession = Depends(get_db)):
     stored = candidate.resume_file
     filename = os.path.basename(stored) or stored
 
+    from app.services.rag.utils import content_disposition_header
+    cd_header = content_disposition_header(filename, "inline")
+
     # Legacy on-disk path — serve directly
     if os.path.isabs(stored) and os.path.exists(stored):
         ext = os.path.splitext(stored)[1].lower()
@@ -718,7 +721,7 @@ async def get_resume_file(resume_id: str, db: AsyncSession = Depends(get_db)):
             stored,
             media_type=media_type,
             filename=filename,
-            headers={"Content-Disposition": f'inline; filename="{filename}"'},
+            headers={"Content-Disposition": cd_header},
         )
 
     # MinIO object key — stream from object storage
@@ -744,7 +747,7 @@ async def get_resume_file(resume_id: str, db: AsyncSession = Depends(get_db)):
     return StreamingResponse(
         _iter(),
         media_type=media_type,
-        headers={"Content-Disposition": f'inline; filename="{filename}"'},
+        headers={"Content-Disposition": cd_header},
     )
 
 
@@ -821,6 +824,19 @@ async def upload_resume(
                 parse_message = None  # partial success is ok
 
     await db.flush()
+
+    # 自动进入 RAG「简历」知识库：无则创建，有则复用，并触发分片/向量化
+    try:
+        from app.services.resume_kb import ingest_resume_to_kb
+        await ingest_resume_to_kb(
+            db,
+            content=content,
+            file_name=original_name,
+            source_object_key=object_key,
+            candidate_id=str(candidate.id),
+        )
+    except Exception as e:
+        logger.warning("简历知识库入库钩子失败: %s", e)
 
     # 新简历入库通知 + Webhook
     try:
@@ -1010,21 +1026,15 @@ async def delete_resume(
     resume_id: str,
     db: AsyncSession = Depends(get_db),
 ):
-    result = await db.execute(select(Candidate).where(Candidate.id == resume_id))
-    candidate = result.scalar_one_or_none()
-    if not candidate:
+    """删除简历（候选人）。
+
+    删除该候选人意味着此人不存在了，所有相关数据一并清理。
+    与「知识库管理 → 删除简历文档」共用同一套级联删除服务
+    （app.services.cascade_delete），保证两边行为一致。
+    """
+    from app.services.cascade_delete import cascade_delete_by_candidate
+    logger.info("删除候选人开始 candidate_id=%s", resume_id)
+    deleted = await cascade_delete_by_candidate(db, resume_id, delete_resume_file=True)
+    if not deleted:
         return {"code": 404, "message": "候选人不存在", "data": None}
-
-    # Delete resume file from MinIO (if it's a MinIO key; legacy local paths
-    # are also cleaned up best-effort).
-    if candidate.resume_file:
-        if os.path.isabs(candidate.resume_file) and os.path.exists(candidate.resume_file):
-            try:
-                os.remove(candidate.resume_file)
-            except Exception:
-                pass
-        else:
-            await asyncio.to_thread(minio_storage.delete_object, candidate.resume_file)
-
-    await db.delete(candidate)
     return {"code": 0, "message": "ok", "data": None}

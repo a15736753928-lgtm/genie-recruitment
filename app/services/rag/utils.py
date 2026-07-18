@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from urllib.parse import quote
 
 from app.config import get_settings
 
@@ -53,3 +54,18 @@ def get_file_type(filename: str) -> str:
     if ext in ("markdown",):
         return "md"
     return ext or "txt"
+
+
+def content_disposition_header(filename: str, disposition: str = "inline") -> str:
+    """Build Content-Disposition safe for HTTP headers (latin-1).
+
+    HTTP headers must be latin-1; Chinese filenames go into RFC 5987
+    ``filename*=UTF-8''...`` so Starlette/uvicorn won't crash.
+    """
+    name = (filename or "file").replace("\r", "").replace("\n", "").strip() or "file"
+    ascii_fallback = name.encode("ascii", "ignore").decode("ascii").replace('"', "_")
+    if not ascii_fallback:
+        ext = Path(name).suffix
+        ascii_fallback = f"file{ext}" if ext else "file"
+    encoded = quote(name, safe="")
+    return f"{disposition}; filename=\"{ascii_fallback}\"; filename*=UTF-8''{encoded}"

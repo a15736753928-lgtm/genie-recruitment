@@ -11,14 +11,17 @@ IMPORTANT: After upgrading from the old 512-dim single-vector schema,
 existing collection must be dropped and documents re-ingested.
 """
 
+import logging
 import re
 import threading
-import numpy as np
+import time
+from queue import Empty, Queue
 from typing import Optional
 
 from pymilvus import MilvusClient, DataType
 from app.config import get_settings
 
+logger = logging.getLogger("genie.milvus")
 settings = get_settings()
 
 _KB_ID_PATTERN = re.compile(r'^kb_[a-f0-9]{8}$')
@@ -26,6 +29,9 @@ _KB_ID_PATTERN = re.compile(r'^kb_[a-f0-9]{8}$')
 _lock = threading.Lock()
 _client: Optional[MilvusClient] = None
 _collection_ready: bool = False
+
+# 单次 insert 最长等待；超时即判定连接已死，重置客户端后重试一次
+_INSERT_TIMEOUT = 60.0
 
 
 def _get_client() -> MilvusClient:
@@ -35,6 +41,29 @@ def _get_client() -> MilvusClient:
             if _client is None:
                 _client = MilvusClient(settings.milvus_db_path)
     return _client
+
+
+def reset_client() -> None:
+    """丢弃当前客户端与就绪标志，下次调用会重建连接。
+
+    Milvus Lite 内嵌 gRPC 服务端会因 keepalive「too_many_pings」主动 GOAWAY
+    掉连接，缓存客户端此后所有调用都会永久挂起。出现超时/异常时调用本函数。
+    """
+    global _client, _collection_ready
+    with _lock:
+        old = _client
+        _client = None
+        _collection_ready = False
+    # 异步关闭旧客户端，避免 close() 自身挂住阻塞调用方
+    if old is not None:
+        threading.Thread(target=_safe_close, args=(old,), daemon=True).start()
+
+
+def _safe_close(client: MilvusClient) -> None:
+    try:
+        client.close()
+    except Exception as e:
+        logger.debug("关闭旧 Milvus 客户端失败（可忽略）: %s", e)
 
 
 def ensure_collection() -> bool:
@@ -125,32 +154,95 @@ def insert_vectors(
         kb_ids: kb_id per vector
 
     Returns:
-        List of auto-generated integer IDs (milvus_pk)
+        List of auto-generated integer IDs (milvus_pk). 失败返回 []。
     """
     if not dense_vectors:
         return []
 
-    if not ensure_collection():
-        return []
+    # Sanitize empty sparse dicts — Milvus Lite can hang/fail on {}
+    safe_sparse = []
+    for s_vec in sparse_vectors:
+        if isinstance(s_vec, dict) and s_vec:
+            safe_sparse.append(s_vec)
+        else:
+            safe_sparse.append({0: 0.0})
 
-    client = _get_client()
     coll_name = settings.milvus_collection_name
-
     data = []
-    for d_vec, s_vec, kb_id in zip(dense_vectors, sparse_vectors, kb_ids):
+    for d_vec, s_vec, kb_id in zip(dense_vectors, safe_sparse, kb_ids):
         data.append({
             "dense_vector": d_vec,
             "sparse_vector": s_vec,
             "kb_id": kb_id,
         })
 
+    # 最多尝试 2 次：第一次超时/异常 → 重置客户端 → 第二次用全新连接
+    for attempt in range(2):
+        if not ensure_collection():
+            reset_client()
+            continue
+        ids = _insert_with_timeout(coll_name, data, _INSERT_TIMEOUT)
+        if ids is not None:
+            return ids
+        # 超时或异常：连接已死，重置后重试
+        logger.warning("Milvus insert 超时/失败，重置客户端后重试 (attempt=%d)", attempt + 1)
+        reset_client()
+
+    logger.error("Milvus insert 两次均失败，放弃")
+    return []
+
+
+def _insert_with_timeout(coll_name: str, data: list[dict], timeout: float) -> Optional[list[int]]:
+    """在子线程内执行 insert，主线程最多等 timeout 秒。
+
+    返回:
+        list[int]  成功
+        None      超时或异常（调用方应重置客户端）
+    """
+    result_q: Queue = Queue()
+
+    def _worker():
+        try:
+            with _lock:
+                client = _get_client()
+                result = client.insert(collection_name=coll_name, data=data)
+                ids = result.get("ids", [])
+                result_q.put(ids if isinstance(ids, list) else list(ids))
+        except Exception as e:
+            logger.warning("Milvus insert 异常: %s", e)
+            result_q.put(None)
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
     try:
-        result = client.insert(collection_name=coll_name, data=data)
-        ids = result.get("ids", [])
-        return ids if isinstance(ids, list) else list(ids)
-    except Exception as e:
-        print(f"[Milvus] Insert error: {e}")
-        return []
+        return result_q.get(timeout=timeout)
+    except Empty:
+        logger.warning("Milvus insert 超时（%ss），判定连接已死", timeout)
+        return None
+
+
+def _call_with_timeout(fn, timeout: float = 30.0, *args, **kwargs):
+    """在子线程内执行一个 Milvus 调用，超时则返回 None 并触发客户端重置。"""
+    result_q: Queue = Queue()
+
+    def _worker():
+        try:
+            with _lock:
+                client = _get_client()
+                result_q.put(("ok", fn(client, *args, **kwargs)))
+        except Exception as e:
+            logger.warning("Milvus 调用异常: %s", e)
+            result_q.put(("err", None))
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    try:
+        tag, val = result_q.get(timeout=timeout)
+        return val if tag == "ok" else None
+    except Empty:
+        logger.warning("Milvus 调用超时（%ss），判定连接已死", timeout)
+        reset_client()
+        return None
 
 
 def search_dense(
@@ -166,17 +258,15 @@ def search_dense(
     if not ensure_collection():
         return []
 
-    client = _get_client()
     coll_name = settings.milvus_collection_name
+    filter_expr = None
+    if kb_id:
+        if not _KB_ID_PATTERN.match(kb_id):
+            raise ValueError(f"Invalid kb_id format: {kb_id[:20]}...")
+        filter_expr = f'kb_id == "{kb_id}"'
 
-    try:
-        filter_expr = None
-        if kb_id:
-            if not _KB_ID_PATTERN.match(kb_id):
-                raise ValueError(f"Invalid kb_id format: {kb_id[:20]}...")
-            filter_expr = f'kb_id == "{kb_id}"'
-
-        results = client.search(
+    def _do(client):
+        return client.search(
             collection_name=coll_name,
             data=[query_vector],
             anns_field="dense_vector",
@@ -186,21 +276,18 @@ def search_dense(
             search_params={"ef": settings.search_ef},
         )
 
-        if not results or not results[0]:
-            return []
-
-        hits = []
-        for hit in results[0]:
-            hits.append({
-                "id": hit["id"],
-                "distance": hit["distance"],
-                "kb_id": hit.get("entity", {}).get("kb_id", ""),
-            })
-        return hits
-
-    except Exception as e:
-        print(f"[Milvus] Dense search error: {e}")
+    results = _call_with_timeout(_do, 30.0)
+    if results is None or not results or not results[0]:
         return []
+
+    hits = []
+    for hit in results[0]:
+        hits.append({
+            "id": hit["id"],
+            "distance": hit["distance"],
+            "kb_id": hit.get("entity", {}).get("kb_id", ""),
+        })
+    return hits
 
 
 def search_sparse(
@@ -221,17 +308,15 @@ def search_sparse(
     if not ensure_collection():
         return []
 
-    client = _get_client()
     coll_name = settings.milvus_collection_name
+    filter_expr = None
+    if kb_id:
+        if not _KB_ID_PATTERN.match(kb_id):
+            raise ValueError(f"Invalid kb_id format: {kb_id[:20]}...")
+        filter_expr = f'kb_id == "{kb_id}"'
 
-    try:
-        filter_expr = None
-        if kb_id:
-            if not _KB_ID_PATTERN.match(kb_id):
-                raise ValueError(f"Invalid kb_id format: {kb_id[:20]}...")
-            filter_expr = f'kb_id == "{kb_id}"'
-
-        results = client.search(
+    def _do(client):
+        return client.search(
             collection_name=coll_name,
             data=[sparse_vector],
             anns_field="sparse_vector",
@@ -240,21 +325,18 @@ def search_sparse(
             output_fields=["kb_id"],
         )
 
-        if not results or not results[0]:
-            return []
-
-        hits = []
-        for hit in results[0]:
-            hits.append({
-                "id": hit["id"],
-                "distance": hit["distance"],
-                "kb_id": hit.get("entity", {}).get("kb_id", ""),
-            })
-        return hits
-
-    except Exception as e:
-        print(f"[Milvus] Sparse search error: {e}")
+    results = _call_with_timeout(_do, 30.0)
+    if results is None or not results or not results[0]:
         return []
+
+    hits = []
+    for hit in results[0]:
+        hits.append({
+            "id": hit["id"],
+            "distance": hit["distance"],
+            "kb_id": hit.get("entity", {}).get("kb_id", ""),
+        })
+    return hits
 
 
 def delete_by_ids(ids: list[int]) -> bool:
@@ -262,16 +344,14 @@ def delete_by_ids(ids: list[int]) -> bool:
     if not ids or not ensure_collection():
         return False
 
-    client = _get_client()
     coll_name = settings.milvus_collection_name
 
-    try:
+    def _do(client):
         id_list = ", ".join(str(i) for i in ids)
         client.delete(collection_name=coll_name, filter=f"id in [{id_list}]")
         return True
-    except Exception as e:
-        print(f"[Milvus] Delete error: {e}")
-        return False
+
+    return bool(_call_with_timeout(_do, 30.0) or False)
 
 
 def get_collection_stats() -> dict:
@@ -279,15 +359,12 @@ def get_collection_stats() -> dict:
     if not ensure_collection():
         return {"row_count": 0}
 
-    client = _get_client()
     coll_name = settings.milvus_collection_name
 
-    try:
-        stats = client.get_collection_stats(coll_name)
-        return stats
-    except Exception as e:
-        print(f"[Milvus] Stats error: {e}")
-        return {"row_count": 0}
+    def _do(client):
+        return client.get_collection_stats(coll_name)
+
+    return _call_with_timeout(_do, 30.0) or {"row_count": 0}
 
 
 def drop_collection() -> bool:

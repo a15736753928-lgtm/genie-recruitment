@@ -448,6 +448,8 @@ async def get_document_file(
 
     filename = doc.file_name or f"{doc.id}{ext}"
     stored = doc.object_key
+    from app.services.rag.utils import content_disposition_header
+    cd_header = content_disposition_header(filename, "inline")
 
     # 1) Legacy absolute local path that still exists on disk → stream from disk.
     if os.path.isabs(stored) and os.path.isfile(stored):
@@ -455,7 +457,7 @@ async def get_document_file(
             path=stored,
             media_type=media_type,
             filename=filename,
-            headers={"Content-Disposition": f'inline; filename="{filename}"'},
+            headers={"Content-Disposition": cd_header},
         )
 
     # 2) Otherwise treat ``stored`` as a MinIO object key and stream from MinIO.
@@ -493,7 +495,7 @@ async def get_document_file(
     return StreamingResponse(
         _iter(),
         media_type=media_type,
-        headers={"Content-Disposition": f'inline; filename="{filename}"'},
+        headers={"Content-Disposition": cd_header},
     )
 
 
@@ -502,46 +504,41 @@ async def delete_document(
     doc_id: str,
     db: AsyncSession = Depends(get_db),
 ):
-    """Delete a document, its chunks (PG + Milvus), and its file."""
+    """Delete a document, its chunks (PG + Milvus), and its file.
+
+    若该文档属于「简历」知识库，会一并级联删除对应候选人及其所有下游数据
+    （面试 / 试用期 / 绩效 / 人才库 / 简历原件）。删除逻辑与「简历管理」
+    的删除共用同一套服务（app.services.cascade_delete），保证两边行为一致。
+    """
+    import logging
+    log = logging.getLogger("genie.rag.delete")
+    log.info("删除文档开始 doc_id=%s", doc_id)
+
     result = await db.execute(
         select(KnowledgeDocument).where(KnowledgeDocument.id == doc_id)
     )
     doc = result.scalar_one_or_none()
     if not doc:
+        log.warning("删除文档：文档不存在 doc_id=%s", doc_id)
         return {"code": 404, "message": "文档不存在", "data": None}
 
-    # Fetch parent KB (to update its counters below)
-    kb_result = await db.execute(
-        select(KnowledgeBase).where(KnowledgeBase.id == doc.kb_id)
+    log.info(
+        "删除文档 doc_id=%s file=%s kb=%s source_type=%s source_id=%s",
+        doc_id, doc.file_name, doc.kb_id,
+        getattr(doc, "source_type", "") or "",
+        getattr(doc, "source_id", "") or "",
     )
-    kb = kb_result.scalar_one_or_none()
 
-    # Get milvus PKs
-    from app.core.milvus_manager import delete_by_ids
-    chunk_result = await db.execute(
-        select(KnowledgeChunk.milvus_pk).where(KnowledgeChunk.doc_id == doc_id)
-    )
-    milvus_pks = [r[0] for r in chunk_result.fetchall() if r[0] > 0]
+    from app.services.cascade_delete import cascade_delete_by_kb_document
+    try:
+        await cascade_delete_by_kb_document(db, doc)
+    except Exception as e:
+        log.warning("级联删除失败（继续）: %s doc_id=%s", e, doc_id)
+        # 兜底：确保文档本身被删
+        await db.delete(doc)
+        await db.flush()
 
-    # Update KB counter
-    if kb:
-        kb.doc_count = max(0, (kb.doc_count or 0) - 1)
-        kb.chunk_count = max(0, (kb.chunk_count or 0) - (doc.chunk_count or 0))
-        kb.updated_at = _now_ms()
-
-    # Delete file from MinIO
-    from app.core import minio_storage
-    if doc.object_key:
-        await asyncio.to_thread(minio_storage.delete_object, doc.object_key)
-
-    # Delete document (PG cascade deletes chunks)
-    await db.delete(doc)
-    await db.flush()
-
-    # Clean up Milvus (run blocking call off the event loop)
-    if milvus_pks:
-        await asyncio.to_thread(delete_by_ids, milvus_pks)
-
+    log.info("删除文档完成 doc_id=%s", doc_id)
     return {"code": 200, "message": "已删除", "data": None}
 
 

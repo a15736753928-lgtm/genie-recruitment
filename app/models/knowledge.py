@@ -83,6 +83,10 @@ class KnowledgeDocument(Base):
     status = Column(String(20), default="pending")  # pending/parsing/encoding/indexing/completed/failed
     uploaded_at = Column(BigInteger, default=0)     # ms timestamp
     created_at = Column(BigInteger, nullable=False, default=_now_ms)
+    # 来源追踪：简历自动入库时记录 source_type='resume', source_id=candidate_id
+    # 删除该文档时可据此级联删除候选人及其下游数据
+    source_type = Column(String(32), default="")
+    source_id = Column(String(64), default="")
 
     kb = relationship("KnowledgeBase", back_populates="documents")
     chunks = relationship("KnowledgeChunk", back_populates="document", cascade="all, delete-orphan")
