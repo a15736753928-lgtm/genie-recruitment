@@ -97,14 +97,14 @@ async def get_ai_agent_overview(db: AsyncSession = Depends(get_db)):
 
 @router.get("/ai-agent/welcome-prompts")
 async def get_welcome_prompts(db: AsyncSession = Depends(get_db)):
-    """欢迎页快捷入口推荐。
+    """欢迎页快捷入口推荐（只读缓存，对用户无感）。
 
-    由后端「推荐 Agent」根据当前系统状态（候选人数 / 试用期员工 / 待评估面试等）
-    调用 LLM 生成 3 条最值得做的动作，前端不再写死。LLM 失败时回退到内置默认推荐。
+    推荐由后台定时任务默默刷新（见 app lifespan 中的 welcome_prompts job），
+    本接口绝不在请求路径上调用 LLM。缓存为空时返回内置默认推荐。
     """
-    from app.services.ai.welcome_prompt_recommender import recommend_welcome_prompts
+    from app.services.ai.welcome_prompt_recommender import get_cached_welcome_prompts
 
-    prompts = await recommend_welcome_prompts(db)
+    prompts = await get_cached_welcome_prompts(db)
     return {
         "code": 0,
         "message": "ok",

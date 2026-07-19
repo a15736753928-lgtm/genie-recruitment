@@ -1,37 +1,38 @@
 """欢迎页推荐 Agent —— 根据当前系统状态，AI 推荐用户可以做什么。
 
-前端 AI Agent 欢迎页的「快捷入口」不再写死，而是由本 Agent 读取系统当前状态
-（候选人数 / 岗位数 / 试用期员工 / 待面试评估等），交给 LLM 推断「现在最值得做的
-3 件事」，并以 `{id, title, meta, promptText}` 的结构返回，前端直接渲染。
+设计原则：
+- **对用户无感**：HTTP 接口只读缓存，绝不在请求路径上调 LLM。
+- **后台默默跑**：由 APScheduler 定时任务（默认每 30 分钟）调用
+  ``refresh_welcome_prompts``，把结果写入 ``system_settings`` 表。
+- **启动时补一次**：服务启动后异步跑一遍，避免冷启动缓存为空。
 
-返回结构：
-    [
-        {"id": "...", "title": "...", "meta": "...", "promptText": "..."},
-        ...
-    ]
-
-LLM 失败 / 超时 / 返回非法 JSON 时，回退到内置的 3 条默认推荐，保证前端可用。
+缓存 key：``welcome_prompts_cache``
+存储结构：``{"prompts": [...], "updatedAt": "ISO8601"}``
 """
 from __future__ import annotations
 
 import json
 import logging
-from typing import List
+from copy import deepcopy
+from datetime import datetime
+from typing import List, Optional
 
 from openai import AsyncOpenAI
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
-from app.models.recruitment import Candidate, Position
-from app.models.probation import Employee
 from app.models.interview import InterviewEvaluation
+from app.models.probation import Employee
+from app.models.recruitment import Candidate, Position
+from app.models.settings import SystemSetting
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
+CACHE_KEY = "welcome_prompts_cache"
 
-# 默认推荐：LLM 不可用时的兜底，保证前端永远有内容可渲染。
+# 默认推荐：缓存为空 / LLM 失败时的兜底。
 DEFAULT_PROMPTS: List[dict] = [
     {
         "id": "operations",
@@ -54,27 +55,85 @@ DEFAULT_PROMPTS: List[dict] = [
 ]
 
 
+def _normalize_prompts(data) -> Optional[List[dict]]:
+    """校验并规整 LLM / 缓存里的 prompts，非法则返回 None。"""
+    if not isinstance(data, list):
+        return None
+
+    cleaned: List[dict] = []
+    seen_ids: set[str] = set()
+    for idx, item in enumerate(data[:3]):
+        if not isinstance(item, dict):
+            continue
+        item_id = str(item.get("id") or f"prompt-{idx}").strip() or f"prompt-{idx}"
+        if item_id in seen_ids:
+            item_id = f"{item_id}-{idx}"
+        seen_ids.add(item_id)
+
+        title = str(item.get("title") or "").strip()
+        meta = str(item.get("meta") or "").strip()
+        prompt_text = str(item.get("promptText") or "").strip()
+        if not title or not prompt_text:
+            continue
+        cleaned.append({
+            "id": item_id,
+            "title": title[:32],
+            "meta": meta[:48],
+            "promptText": prompt_text[:200],
+        })
+
+    return cleaned if len(cleaned) == 3 else None
+
+
+async def get_cached_welcome_prompts(db: AsyncSession) -> List[dict]:
+    """读缓存。无缓存时返回 DEFAULT_PROMPTS（不触发 LLM）。"""
+    result = await db.execute(
+        select(SystemSetting).where(SystemSetting.key == CACHE_KEY)
+    )
+    row = result.scalar_one_or_none()
+    if not row or not isinstance(row.value, dict):
+        return deepcopy(DEFAULT_PROMPTS)
+
+    prompts = _normalize_prompts(row.value.get("prompts"))
+    if prompts is None:
+        return deepcopy(DEFAULT_PROMPTS)
+    return prompts
+
+
+async def _save_cache(db: AsyncSession, prompts: List[dict]) -> None:
+    payload = {
+        "prompts": prompts,
+        "updatedAt": datetime.utcnow().isoformat() + "Z",
+    }
+    result = await db.execute(
+        select(SystemSetting).where(SystemSetting.key == CACHE_KEY)
+    )
+    row = result.scalar_one_or_none()
+    if row:
+        row.value = payload
+        row.updated_at = datetime.utcnow()
+    else:
+        db.add(SystemSetting(key=CACHE_KEY, value=payload))
+    await db.flush()
+
+
 async def _gather_system_snapshot(db: AsyncSession) -> dict:
     """汇总当前系统状态，作为 LLM 推荐的上下文。"""
-    # 候选人按状态分桶
     cand_rows = await db.execute(
         select(Candidate.status, func.count(Candidate.id)).group_by(Candidate.status)
     )
     candidate_by_status = {row[0] or "unknown": int(row[1]) for row in cand_rows.all()}
     total_candidates = sum(candidate_by_status.values())
 
-    # 在招岗位
     pos_count_row = await db.execute(select(func.count(Position.id)))
     position_count = int(pos_count_row.scalar() or 0)
 
-    # 试用期员工按状态分桶
     emp_rows = await db.execute(
         select(Employee.status, func.count(Employee.id)).group_by(Employee.status)
     )
     employee_by_status = {row[0] or "unknown": int(row[1]) for row in emp_rows.all()}
     total_employees = sum(employee_by_status.values())
 
-    # 待评估的面试
     pending_eval_row = await db.execute(
         select(func.count(InterviewEvaluation.id)).where(
             InterviewEvaluation.status == "pending"
@@ -122,16 +181,13 @@ def _build_prompt(snapshot: dict) -> str:
     )
 
 
-async def recommend_welcome_prompts(db: AsyncSession) -> List[dict]:
-    """根据系统状态推荐 3 条欢迎页快捷入口。
-
-    任何环节失败都回退到 DEFAULT_PROMPTS，保证前端始终有内容可渲染。
-    """
+async def _generate_with_llm(db: AsyncSession) -> List[dict]:
+    """调 LLM 生成推荐。失败时返回 DEFAULT_PROMPTS。"""
     try:
         snapshot = await _gather_system_snapshot(db)
     except Exception as e:
         logger.warning("welcome_prompt_recommender 收集系统状态失败: %s", e)
-        return DEFAULT_PROMPTS
+        return deepcopy(DEFAULT_PROMPTS)
 
     try:
         client = AsyncOpenAI(
@@ -156,35 +212,26 @@ async def recommend_welcome_prompts(db: AsyncSession) -> List[dict]:
         data = json.loads(content.strip())
     except json.JSONDecodeError as e:
         logger.warning("welcome_prompt_recommender 返回非法 JSON: %s", e)
-        return DEFAULT_PROMPTS
+        return deepcopy(DEFAULT_PROMPTS)
     except Exception as e:
         logger.warning("welcome_prompt_recommender LLM 调用失败: %s", e)
-        return DEFAULT_PROMPTS
+        return deepcopy(DEFAULT_PROMPTS)
 
-    # 校验 + 规整返回结构
-    if not isinstance(data, list):
-        return DEFAULT_PROMPTS
+    prompts = _normalize_prompts(data)
+    return prompts if prompts is not None else deepcopy(DEFAULT_PROMPTS)
 
-    cleaned: List[dict] = []
-    seen_ids: set[str] = set()
-    for idx, item in enumerate(data[:3]):
-        if not isinstance(item, dict):
-            continue
-        item_id = str(item.get("id") or f"prompt-{idx}").strip() or f"prompt-{idx}"
-        if item_id in seen_ids:
-            item_id = f"{item_id}-{idx}"
-        seen_ids.add(item_id)
 
-        title = str(item.get("title") or "").strip()
-        meta = str(item.get("meta") or "").strip()
-        prompt_text = str(item.get("promptText") or "").strip()
-        if not title or not prompt_text:
-            continue
-        cleaned.append({
-            "id": item_id,
-            "title": title[:32],
-            "meta": meta[:48],
-            "promptText": prompt_text[:200],
-        })
+async def refresh_welcome_prompts(db: AsyncSession) -> List[dict]:
+    """后台刷新：调 LLM → 写缓存。供定时任务 / 启动任务调用。"""
+    prompts = await _generate_with_llm(db)
+    try:
+        await _save_cache(db, prompts)
+        logger.info("欢迎页推荐已刷新（%d 条）", len(prompts))
+    except Exception as e:
+        logger.warning("欢迎页推荐写缓存失败: %s", e)
+    return prompts
 
-    return cleaned if len(cleaned) == 3 else DEFAULT_PROMPTS
+
+# 兼容旧调用名：对外只读缓存，不触发 LLM。
+async def recommend_welcome_prompts(db: AsyncSession) -> List[dict]:
+    return await get_cached_welcome_prompts(db)

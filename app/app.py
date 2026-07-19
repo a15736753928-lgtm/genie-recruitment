@@ -62,7 +62,7 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("⚠ 初始数据跳过 (可能已存在): %s (%s)", e, _elapsed())
 
-    # ── Step 3: 数据保留定时清理（每天 02:00）──
+    # ── Step 3: 定时任务（清理 / 面试提醒 / 欢迎页推荐）──
     scheduler = None
     try:
         from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -90,11 +90,35 @@ async def lifespan(app: FastAPI):
                     await session.rollback()
                     logger.warning("面试提醒任务失败: %s", e)
 
+        async def _scheduled_welcome_prompts():
+            """后台默默刷新欢迎页推荐缓存，用户无感。"""
+            from app.services.ai.welcome_prompt_recommender import refresh_welcome_prompts
+            async with async_session_factory() as session:
+                try:
+                    await refresh_welcome_prompts(session)
+                    await session.commit()
+                except Exception as e:
+                    await session.rollback()
+                    logger.warning("欢迎页推荐定时刷新失败: %s", e)
+
+        from datetime import datetime, timedelta
+
         scheduler = AsyncIOScheduler()
         scheduler.add_job(_scheduled_cleanup, "cron", hour=2, minute=0, id="data_retention")
         scheduler.add_job(_scheduled_interview_reminders, "cron", hour=9, minute=0, id="interview_reminders")
+        # 每 30 分钟刷新一次；启动 15 秒后先跑一遍（不阻塞启动，用户无感）
+        scheduler.add_job(
+            _scheduled_welcome_prompts,
+            "interval",
+            minutes=30,
+            id="welcome_prompts",
+            next_run_time=datetime.now() + timedelta(seconds=15),
+        )
         scheduler.start()
-        logger.info("✓ 定时任务已注册 (清理 02:00 / 面试提醒 09:00) (%s)", _elapsed())
+        logger.info(
+            "✓ 定时任务已注册 (清理 02:00 / 面试提醒 09:00 / 欢迎页推荐 每30分钟) (%s)",
+            _elapsed(),
+        )
     except Exception as e:
         logger.warning("⚠ 定时任务未启动（可手动调用 POST /api/settings/cleanup）: %s", e)
 
