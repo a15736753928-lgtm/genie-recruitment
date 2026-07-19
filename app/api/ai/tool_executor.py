@@ -182,7 +182,7 @@ async def execute_tool_call(tool_name: str, params: dict, db: AsyncSession) -> s
                 return "岗位不存在"
             lines = [
                 f"岗位「{d.get('name', '')}」(ID: {d.get('id', '')})",
-                f"  部门: {d.get('department', '未设置')} | 章节数: {d.get('chapterNumber', '未设置')}",
+                f"  部门: {d.get('department', '未设置')}",
             ]
             if d.get("jdResponsibilities"):
                 lines.append(f"  岗位职责: {d['jdResponsibilities']}")

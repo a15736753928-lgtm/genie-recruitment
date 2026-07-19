@@ -98,6 +98,23 @@ def _add_column_if_missing(connection, table: str, column: str, ddl_type: str) -
     ))
 
 
+def _drop_column_if_exists(connection, table: str, column: str) -> None:
+    """幂等删除列:列不存在则跳过,避免重启时反复尝试 DROP 报错。"""
+    from sqlalchemy import text
+    exists = connection.execute(text(
+        "SELECT EXISTS ("
+        "  SELECT 1 FROM information_schema.columns"
+        "  WHERE table_name = :table AND column_name = :column"
+        ")"
+    ), {"table": table, "column": column}).scalar()
+    if not exists:
+        return
+    connection.execute(text("SET LOCAL lock_timeout = '3s'"))
+    connection.execute(text(
+        f"ALTER TABLE {table} DROP COLUMN IF EXISTS {column}"
+    ))
+
+
 def _migrate_audit_logs(connection) -> None:
     """重建 audit_logs 为新结构（time/actor），旧表若为 actor_name 版本则 drop 重建。"""
     from sqlalchemy import text
@@ -151,6 +168,13 @@ def _run_migrations(connection):
     _migrate_interview_questions_unique_constraint(connection)
     # v7: 支持面试评定的多次上传历史记录
     _migrate_transcript_history(connection)
+    # v8: 岗位结构化任职要求(学历/经验/年龄/薪资范围)
+    _add_column_if_missing(connection, "positions", "education_requirement", "VARCHAR(32)")
+    _add_column_if_missing(connection, "positions", "experience_requirement", "VARCHAR(32)")
+    _add_column_if_missing(connection, "positions", "age_requirement", "VARCHAR(32)")
+    _add_column_if_missing(connection, "positions", "salary_range", "VARCHAR(64)")
+    # v9: 移除无业务含义的 chapter_number 列(仅种子数据排序用途),列表改用 created_at 排序
+    _drop_column_if_exists(connection, "positions", "chapter_number")
 
 
 def _migrate_transcript_history(connection) -> None:

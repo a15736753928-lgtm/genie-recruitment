@@ -118,13 +118,12 @@ TOOL_REGISTRY = {
     },
     "create_position": {
         "name": "create_position",
-        "description": "创建新招聘岗位，含 JD、部门、章节数等。",
+        "description": "创建新招聘岗位，含 JD、部门等。",
         "parameters": {
             "type": "object",
             "properties": {
                 "name": {"type": "string", "description": "岗位名称"},
                 "department": {"type": "string", "description": "部门"},
-                "chapterNumber": {"type": "integer", "description": "章节数（可选）"},
                 "jdResponsibilities": {"type": "string", "description": "岗位职责"},
                 "jdRequirements": {"type": "string", "description": "任职要求"},
                 "jdPreferred": {"type": "string", "description": "加分项"},

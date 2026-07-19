@@ -244,28 +244,66 @@ async def get_or_generate_questions(candidate_id: str, round: str, db: AsyncSess
 
 # ── Endpoints ───────────────────────────────────────────
 
+def _question_to_dict(q: InterviewQuestion) -> dict:
+    return {
+        "id": str(q.id),
+        "index": q.index_num,
+        "content": q.content,
+        "category": q.category,
+        "difficulty": q.difficulty,
+        "round": q.round,
+        "candidateId": str(q.candidate_id),
+    }
+
+
+def _build_question_stats(questions: List[InterviewQuestion]) -> dict:
+    """按难度/分类汇总题目分布,用于前端筛选工具条展示。"""
+    by_difficulty = {"easy": 0, "medium": 0, "hard": 0}
+    by_category: dict[str, int] = {}
+    for q in questions:
+        d = (q.difficulty or "medium")
+        if d in by_difficulty:
+            by_difficulty[d] += 1
+        else:
+            by_difficulty[d] = 1
+        cat = q.category or "未分类"
+        by_category[cat] = by_category.get(cat, 0) + 1
+    return {
+        "total": len(questions),
+        "byDifficulty": by_difficulty,
+        "byCategory": by_category,
+    }
+
+
 @router.get("/interview/questions")
 async def get_questions(
     candidateId: str = Query(...),
     round: str = Query(...),
+    category: Optional[str] = Query(None),
+    difficulty: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
-    questions = await get_or_generate_questions(candidateId, round, db)
+    """获取候选人某轮的面试题,支持按分类/难度筛选,并返回全量统计。
+
+    `data` 为筛选后的题目列表;`stats` 始终基于本轮全量题目(忽略筛选),
+    供前端工具条展示「共 N 题 · 简单 a · 中等 b · 较难 c」。
+    """
+    all_questions = await get_or_generate_questions(candidateId, round, db)
+
+    filtered = all_questions
+    if category:
+        filtered = [q for q in filtered if (q.category or "") == category]
+    if difficulty:
+        filtered = [q for q in filtered if (q.difficulty or "") == difficulty]
+
     return {
         "code": 0,
         "message": "ok",
-        "data": [
-            {
-                "id": str(q.id),
-                "index": q.index_num,
-                "content": q.content,
-                "category": q.category,
-                "difficulty": q.difficulty,
-                "round": q.round,
-                "candidateId": str(q.candidate_id),
-            }
-            for q in questions
-        ],
+        "data": {
+            "questions": [_question_to_dict(q) for q in filtered],
+            "stats": _build_question_stats(all_questions),
+            "filteredCount": len(filtered),
+        },
     }
 
 
@@ -323,18 +361,11 @@ async def regenerate_questions(body: dict, db: AsyncSession = Depends(get_db)):
     return {
         "code": 0,
         "message": "ok",
-        "data": [
-            {
-                "id": str(q.id),
-                "index": q.index_num,
-                "content": q.content,
-                "category": q.category,
-                "difficulty": q.difficulty,
-                "round": q.round,
-                "candidateId": str(q.candidate_id),
-            }
-            for q in questions
-        ],
+        "data": {
+            "questions": [_question_to_dict(q) for q in questions],
+            "stats": _build_question_stats(questions),
+            "filteredCount": len(questions),
+        },
     }
 
 
@@ -420,18 +451,155 @@ async def replace_question(question_id: str, body: dict, db: AsyncSession = Depe
     return {
         "code": 0,
         "message": "ok",
-        "data": [
-            {
-                "id": str(q.id),
-                "index": q.index_num,
-                "content": q.content,
-                "category": q.category,
-                "difficulty": q.difficulty,
-                "round": q.round,
-                "candidateId": str(q.candidate_id),
-            }
-            for q in questions
-        ],
+        "data": {
+            "questions": [_question_to_dict(q) for q in questions],
+            "stats": _build_question_stats(questions),
+            "filteredCount": len(questions),
+        },
+    }
+
+
+@router.post("/interview/questions/batch-delete")
+async def batch_delete_questions(body: dict, db: AsyncSession = Depends(get_db)):
+    """批量删除面试题,删除后对剩余题目按难度排序重新连续编号。
+
+    body: { candidateId, round, questionIds: [uuid str, ...] }
+    返回剩余题目列表与全量统计。
+    """
+    candidate_id = body.get("candidateId")
+    round = body.get("round")
+    raw_ids = body.get("questionIds") or []
+    if not candidate_id or not round or not raw_ids:
+        return {"code": 400, "message": "candidateId / round / questionIds 不能为空", "data": None}
+
+    # 解析 UUID,过滤掉前端本地自定义题(非 UUID 的 id,从未落库)
+    parsed_ids: list[uuid.UUID] = []
+    for qid in raw_ids:
+        try:
+            parsed_ids.append(uuid.UUID(str(qid)))
+        except (ValueError, TypeError):
+            continue
+
+    deleted_count = 0
+    if parsed_ids:
+        to_delete_result = await db.execute(
+            select(InterviewQuestion).where(and_(
+                InterviewQuestion.candidate_id == candidate_id,
+                InterviewQuestion.round == round,
+                InterviewQuestion.id.in_(parsed_ids),
+            ))
+        )
+        for q in to_delete_result.scalars().all():
+            await db.delete(q)
+            deleted_count += 1
+        await db.flush()
+
+    # 重新编号剩余题目(按 index_num 升序保持原顺序)
+    remaining_result = await db.execute(
+        select(InterviewQuestion).where(and_(
+            InterviewQuestion.candidate_id == candidate_id,
+            InterviewQuestion.round == round,
+        )).order_by(InterviewQuestion.index_num)
+    )
+    remaining = remaining_result.scalars().all()
+    for i, q in enumerate(remaining, 1):
+        q.index_num = i
+    await db.flush()
+
+    return {
+        "code": 0,
+        "message": "ok",
+        "data": {
+            "deletedCount": deleted_count,
+            "questions": [_question_to_dict(q) for q in remaining],
+            "stats": _build_question_stats(remaining),
+            "filteredCount": len(remaining),
+        },
+    }
+
+
+@router.post("/interview/questions/append")
+async def append_question(body: dict, db: AsyncSession = Depends(get_db)):
+    """AI 生成一道面试题并追加到本轮末尾。
+
+    body: { candidateId, round, prompt?, category?, difficulty? }
+    - prompt 可选,为空时 AI 根据候选人背景与岗位自动出题。
+    - category / difficulty 可选,默认 "技术能力" / "medium"。
+    返回本轮全量题目列表与统计。
+    """
+    candidate_id = body.get("candidateId")
+    round = body.get("round")
+    if not candidate_id or not round:
+        return {"code": 400, "message": "candidateId / round 不能为空", "data": None}
+
+    cand_result = await db.execute(
+        select(Candidate).options(selectinload(Candidate.position)).where(Candidate.id == candidate_id)
+    )
+    candidate = cand_result.scalar_one_or_none()
+    if not candidate:
+        return {"code": 404, "message": "候选人不存在", "data": None}
+
+    prompt = (body.get("prompt") or "").strip()
+    category = (body.get("category") or "技术能力").strip() or "技术能力"
+    difficulty = (body.get("difficulty") or "medium").strip() or "medium"
+
+    rag_text = ""
+    if candidate.resume_file:
+        try:
+            rag_text = await asyncio.to_thread(_resume_text, candidate.resume_file)
+        except Exception:
+            pass
+
+    q_data = await generate_questions_with_llm(
+        candidate.name,
+        candidate.position.name if candidate.position else "未知岗位",
+        round,
+        1,
+        rag_text,
+        prompt_override=prompt,
+        category_override=category,
+        difficulty_override=difficulty,
+    )
+
+    if isinstance(q_data, list) and q_data:
+        q_data = q_data[0]
+    if not isinstance(q_data, dict):
+        q_data = {"category": category, "difficulty": difficulty,
+                  "content": f"请结合你的项目经验,谈谈在{candidate.position.name if candidate.position else '该岗位'}上的关键实践。"}
+
+    max_idx_result = await db.execute(
+        select(func.max(InterviewQuestion.index_num)).where(and_(
+            InterviewQuestion.candidate_id == candidate_id,
+            InterviewQuestion.round == round,
+        ))
+    )
+    max_idx = max_idx_result.scalar() or 0
+    new_q = InterviewQuestion(
+        candidate_id=candidate_id,
+        round=round,
+        index_num=max_idx + 1,
+        content=q_data.get("content", ""),
+        category=q_data.get("category", category),
+        difficulty=q_data.get("difficulty", difficulty),
+    )
+    db.add(new_q)
+    await db.flush()
+
+    all_qs = await db.execute(
+        select(InterviewQuestion).where(and_(
+            InterviewQuestion.candidate_id == candidate_id,
+            InterviewQuestion.round == round,
+        )).order_by(InterviewQuestion.index_num)
+    )
+    questions = all_qs.scalars().all()
+    return {
+        "code": 0,
+        "message": "ok",
+        "data": {
+            "questions": [_question_to_dict(q) for q in questions],
+            "stats": _build_question_stats(questions),
+            "filteredCount": len(questions),
+        },
     }
 
 

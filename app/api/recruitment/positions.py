@@ -11,22 +11,28 @@ router = APIRouter(tags=["岗位"])
 
 class CreatePositionRequest(BaseModel):
     name: str
-    chapter_number: Optional[int] = None
     department: Optional[str] = None
     jd_responsibilities: Optional[str] = None
     jd_requirements: Optional[str] = None
     jd_preferred: Optional[str] = None
     jd_tech_stack: Optional[str] = None
+    education_requirement: Optional[str] = None
+    experience_requirement: Optional[str] = None
+    age_requirement: Optional[str] = None
+    salary_range: Optional[str] = None
 
 
 class UpdatePositionRequest(BaseModel):
     name: Optional[str] = None
-    chapter_number: Optional[int] = None
     department: Optional[str] = None
     jd_responsibilities: Optional[str] = None
     jd_requirements: Optional[str] = None
     jd_preferred: Optional[str] = None
     jd_tech_stack: Optional[str] = None
+    education_requirement: Optional[str] = None
+    experience_requirement: Optional[str] = None
+    age_requirement: Optional[str] = None
+    salary_range: Optional[str] = None
     screening_criteria: Optional[dict] = None
     interview_criteria_r1: Optional[dict] = None
     interview_criteria_r2: Optional[dict] = None
@@ -40,13 +46,16 @@ def serialize_position(p: Position) -> dict:
     return {
         "id": str(p.id),
         "name": p.name,
-        "chapterNumber": p.chapter_number,
         "department": p.department,
         "jdContent": p.jd_content,
         "jdResponsibilities": p.jd_responsibilities,
         "jdRequirements": p.jd_requirements,
         "jdPreferred": p.jd_preferred,
         "jdTechStack": p.jd_tech_stack,
+        "educationRequirement": p.education_requirement,
+        "experienceRequirement": p.experience_requirement,
+        "ageRequirement": p.age_requirement,
+        "salaryRange": p.salary_range,
         "screeningCriteria": p.screening_criteria,
         "interviewCriteriaR1": p.interview_criteria_r1,
         "interviewCriteriaR2": p.interview_criteria_r2,
@@ -61,7 +70,7 @@ def serialize_position(p: Position) -> dict:
 
 @router.get("/positions")
 async def list_positions(db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(Position).order_by(Position.chapter_number, Position.created_at))
+    result = await db.execute(select(Position).order_by(Position.created_at))
     positions = result.scalars().all()
     return {
         "code": 0,
@@ -90,12 +99,15 @@ async def create_position(
 
     position = Position(
         name=req.name,
-        chapter_number=req.chapter_number,
         department=req.department,
         jd_responsibilities=req.jd_responsibilities,
         jd_requirements=req.jd_requirements,
         jd_preferred=req.jd_preferred,
         jd_tech_stack=req.jd_tech_stack,
+        education_requirement=req.education_requirement,
+        experience_requirement=req.experience_requirement,
+        age_requirement=req.age_requirement,
+        salary_range=req.salary_range,
     )
     db.add(position)
     await db.flush()

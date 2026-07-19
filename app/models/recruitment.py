@@ -13,13 +13,17 @@ class Position(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     name = Column(String(128), unique=True, nullable=False)
-    chapter_number = Column(Integer, nullable=True)
     department = Column(String(64), nullable=True)
     jd_content = Column(Text, nullable=True)
     jd_responsibilities = Column(Text, nullable=True)
     jd_requirements = Column(Text, nullable=True)
     jd_preferred = Column(Text, nullable=True)
     jd_tech_stack = Column(Text, nullable=True)
+    # 任职要求结构化字段(下拉选择),与 jd_requirements 自由文本互补
+    education_requirement = Column(String(32), nullable=True)
+    experience_requirement = Column(String(32), nullable=True)
+    age_requirement = Column(String(32), nullable=True)
+    salary_range = Column(String(64), nullable=True)
     screening_criteria = Column(JSON, nullable=True)
     interview_criteria_r1 = Column(JSON, nullable=True)
     interview_criteria_r2 = Column(JSON, nullable=True)

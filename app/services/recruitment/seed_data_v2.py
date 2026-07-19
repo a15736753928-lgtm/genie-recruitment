@@ -130,7 +130,6 @@ CONVERSION_CRITERIA_COMMON = {
 POSITIONS_DATA = [
     {
         "name": "前沿部署工程师",
-        "chapter_number": 5,
         "department": "AI基础设施部",
         "jd_responsibilities": (
             "1. 深入制造业生产、质量、供应链、仓储等一线场景,挖掘业务痛点,定位AI Agent落地场景;\n"
@@ -201,7 +200,6 @@ POSITIONS_DATA = [
     },
     {
         "name": "数据开发工程师",
-        "chapter_number": 6,
         "department": "数据平台部",
         "jd_responsibilities": (
             "1. 负责公司业务系统中的数据开发工作,包括数据采集、清洗、加工、建模、同步与指标建设;\n"
@@ -276,7 +274,6 @@ POSITIONS_DATA = [
     },
     {
         "name": "知识图谱工程师",
-        "chapter_number": 7,
         "department": "AI平台部",
         "jd_responsibilities": (
             "1. 服务架构:负责知识图谱服务端的架构设计与开发,利用FastAPI启动高性能服务,为后端Agent及下游业务提供标准化接口;\n"
@@ -346,7 +343,6 @@ POSITIONS_DATA = [
     },
     {
         "name": "Agent工程师",
-        "chapter_number": 8,
         "department": "AI平台部",
         "jd_responsibilities": (
             "1. 负责AI Agent应用架构设计与开发,包括Agent框架搭建、工具调用、RAG链路建设;\n"
@@ -417,7 +413,6 @@ POSITIONS_DATA = [
     },
     {
         "name": "全栈开发工程师",
-        "chapter_number": 9,
         "department": "技术研发部",
         "jd_responsibilities": (
             "1. 负责公司业务系统的前后端全栈开发,包括Web前端页面、后端API、数据库设计;\n"
@@ -488,7 +483,6 @@ POSITIONS_DATA = [
     },
     {
         "name": "高级运维工程师",
-        "chapter_number": 10,
         "department": "基础设施部",
         "jd_responsibilities": (
             "1. 负责K8s/Docker集群的日常运维、监控和故障处理;\n"

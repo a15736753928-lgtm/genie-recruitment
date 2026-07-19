@@ -108,11 +108,23 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    # ── Shutdown (order matters: scheduler → pools → engine) ──
     if scheduler is not None:
         try:
-            scheduler.shutdown(wait=False)
+            scheduler.shutdown(wait=True)  # wait=True: 等所有 job 彻底结束
         except Exception:
             pass
+
+    # Dispose SQLAlchemy engine so connection pools are released.
+    # Without this, asyncpg connections may linger and keep the process alive
+    # after uvicorn signals "shutdown complete", causing the "need to restart
+    # twice" issue in PyCharm.
+    try:
+        from app.database import engine
+        await engine.dispose()
+    except Exception:
+        pass
+
     logger.info("Genie 招聘系统 — 正在关闭...")
 
 
