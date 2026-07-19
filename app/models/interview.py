@@ -72,3 +72,38 @@ class InterviewTranscript(Base):
 
     candidate = relationship("Candidate", back_populates="transcripts")
     questions = relationship("InterviewQuestion", back_populates="transcript", cascade="all, delete-orphan")
+    # 自我介绍 / 反问环节等片段评分，关联到具体转写记录，删除记录时级联删除
+    segment_evaluations = relationship(
+        "InterviewSegmentEvaluation", back_populates="transcript", cascade="all, delete-orphan"
+    )
+
+
+class InterviewSegmentEvaluation(Base):
+    """面试「自我介绍」「反问环节」等非问答片段的评分。
+
+    与 InterviewEvaluation（按题目评分）平行：一个 transcript 下，每种 segment_type
+    至多一条。AI 评分在上传转写时自动生成，HR 评分由前端保存。
+    """
+    __tablename__ = "interview_segment_evaluations"
+    __table_args__ = (
+        UniqueConstraint("candidate_id", "round", "transcript_id", "segment_type",
+                         name="uq_interview_segment_evals_cand_round_tid_type"),
+    )
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    candidate_id = Column(UUID(as_uuid=True), ForeignKey("candidates.id", ondelete="CASCADE"))
+    round = Column(String(8), nullable=False)
+    transcript_id = Column(UUID(as_uuid=True), ForeignKey("interview_transcripts.id", ondelete="CASCADE"), nullable=True)
+    # 片段类型：self_intro=自我介绍；reverse_question=反问环节
+    segment_type = Column(String(16), nullable=False)
+    # 从转写文本中抽取出的片段原文，供前端展示
+    content = Column(Text)
+    ai_score = Column(Integer)
+    ai_dimensions = Column(JSON)
+    hr_score = Column(Integer)
+    hr_dimensions = Column(JSON)
+    status = Column(String(16), default="pending")
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    candidate = relationship("Candidate", back_populates="segment_evaluations")
+    transcript = relationship("InterviewTranscript", back_populates="segment_evaluations")

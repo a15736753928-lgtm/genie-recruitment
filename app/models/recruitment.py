@@ -92,6 +92,7 @@ class Candidate(Base):
     questions = relationship("InterviewQuestion", back_populates="candidate", cascade="all, delete-orphan")
     evaluations = relationship("InterviewEvaluation", back_populates="candidate", cascade="all, delete-orphan")
     transcripts = relationship("InterviewTranscript", back_populates="candidate", cascade="all, delete-orphan")
+    segment_evaluations = relationship("InterviewSegmentEvaluation", back_populates="candidate", cascade="all, delete-orphan")
 
 
 class CandidateSkill(Base):

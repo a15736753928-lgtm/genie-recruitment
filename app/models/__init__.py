@@ -3,7 +3,7 @@ from app.models.recruitment import (
     CandidateWorkExperience, CandidateProjectExperience, CandidateAIAnalysis
 )
 from app.models.interview import (
-    InterviewQuestion, InterviewEvaluation, InterviewTranscript
+    InterviewQuestion, InterviewEvaluation, InterviewTranscript, InterviewSegmentEvaluation
 )
 from app.models.probation import Employee, ProbationTask
 from app.models.performance import PerformanceRecord, PerformanceQuarter
@@ -18,7 +18,7 @@ from app.models.settings import SystemSetting, AuditLog
 __all__ = [
     "Position", "Candidate", "CandidateSkill", "CandidateEducation",
     "CandidateWorkExperience", "CandidateProjectExperience", "CandidateAIAnalysis",
-    "InterviewQuestion", "InterviewEvaluation", "InterviewTranscript",
+    "InterviewQuestion", "InterviewEvaluation", "InterviewTranscript", "InterviewSegmentEvaluation",
     "Employee", "ProbationTask",
     "PerformanceRecord", "PerformanceQuarter",
     "KnowledgeCategory", "KnowledgeItem",

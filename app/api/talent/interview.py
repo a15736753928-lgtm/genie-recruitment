@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import uuid
 import asyncio
@@ -11,7 +12,7 @@ from pydantic import BaseModel
 from openai import AsyncOpenAI
 from app.database import get_db
 from app.models.recruitment import Candidate, Position
-from app.models.interview import InterviewQuestion, InterviewEvaluation, InterviewTranscript
+from app.models.interview import InterviewQuestion, InterviewEvaluation, InterviewTranscript, InterviewSegmentEvaluation
 from app.config import get_settings
 from app.infrastructure import minio_storage
 from app.services.system.system_settings import get_system_setting
@@ -128,6 +129,90 @@ def _resume_text(stored: str) -> str:
         return extract_text(local)
 
 
+def _format_position_requirements(position) -> str:
+    """把岗位的职责/任职要求/技术栈等拼成一段文本，供反问环节评分 Agent 对照岗位要求打分。"""
+    if not position:
+        return ""
+    parts: list[str] = []
+    if position.jd_responsibilities:
+        parts.append(f"【岗位职责】\n{position.jd_responsibilities}")
+    if position.jd_requirements:
+        parts.append(f"【任职要求】\n{position.jd_requirements}")
+    if position.jd_preferred:
+        parts.append(f"【加分项】\n{position.jd_preferred}")
+    if position.jd_tech_stack:
+        parts.append(f"【技术栈】\n{position.jd_tech_stack}")
+    structured = []
+    if getattr(position, "education_requirement", None):
+        structured.append(f"学历{position.education_requirement}")
+    if getattr(position, "experience_requirement", None):
+        structured.append(f"经验{position.experience_requirement}")
+    if structured:
+        parts.append("【硬性条件】" + "、".join(structured))
+    return "\n\n".join(parts)
+
+
+def _strip_code_fence(content: str) -> str:
+    """Strip a leading ```json / ``` code fence and trailing fence if present."""
+    content = content.strip()
+    # Match ```json\n ... ``` or ```\n ... ```
+    fence_match = re.match(r"^```(?:json)?\s*\n(.*)\n```\s*$", content, re.DOTALL)
+    if fence_match:
+        return fence_match.group(1).strip()
+    # Loose stripping (legacy behaviour) for partial fences
+    if content.startswith("```json"):
+        content = content[7:]
+    elif content.startswith("```"):
+        content = content[3:]
+    if content.endswith("```"):
+        content = content[:-3]
+    return content.strip()
+
+
+def _extract_json_array(content: str) -> list:
+    """Best-effort extraction of a JSON array from an LLM response.
+
+    Handles: pure JSON, code-fenced JSON, JSON preceded/followed by prose.
+    Returns [] if no valid array can be recovered.
+    """
+    cleaned = _strip_code_fence(content)
+    # Fast path
+    try:
+        data = json.loads(cleaned)
+        if isinstance(data, dict):
+            data = [data]
+        return data if isinstance(data, list) else []
+    except json.JSONDecodeError:
+        pass
+    # Fallback: locate the first [...] block in the raw text
+    match = re.search(r"\[.*\]", content, re.DOTALL)
+    if match:
+        try:
+            data = json.loads(match.group(0))
+            return data if isinstance(data, list) else []
+        except json.JSONDecodeError:
+            return []
+    return []
+
+
+def _extract_json_object(content: str) -> dict:
+    """Best-effort extraction of a JSON object from an LLM response."""
+    cleaned = _strip_code_fence(content)
+    try:
+        data = json.loads(cleaned)
+        return data if isinstance(data, dict) else {}
+    except json.JSONDecodeError:
+        pass
+    match = re.search(r"\{.*\}", content, re.DOTALL)
+    if match:
+        try:
+            data = json.loads(match.group(0))
+            return data if isinstance(data, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+
 async def extract_qa_from_transcript(transcript_text: str, position_name: str) -> List[dict]:
     """从面试转写文本中抽取「问题 + 回答原文 + 分类」列表。
 
@@ -136,18 +221,90 @@ async def extract_qa_from_transcript(transcript_text: str, position_name: str) -
     """
     if not transcript_text or not transcript_text.strip():
         return []
+
+    MAX_CHARS = 8000
+    truncated = len(transcript_text) > MAX_CHARS
+    transcript_slice = transcript_text[:MAX_CHARS]
+    if truncated:
+        print(f"[extract_qa] 转写文本长度 {len(transcript_text)} 超过 {MAX_CHARS}，"
+              f"仅解析前 {MAX_CHARS} 字符")
+
     system_prompt = f"""你是一位资深的面试记录分析专家。请从下面这段面试转写文本中，抽取面试官实际提出的问题以及候选人对应的回答原文。
 
 岗位：{position_name or '未知'}
 
-要求：
-1. 只抽取面试中真实发生的一问一答，不要臆造。
-2. 每条包含：question（面试官问题原文，可适当精简但保留原意）、answer（候选人回答原文，保留关键内容）、category（分类，从「技术能力、项目经验、工程素养、团队协作、架构设计、领导力、沟通表达」中选最贴近的一个）。
-3. 按面试发生顺序输出。
-4. 若文本无法识别出任何问答对，返回空数组 []。
+输入文本可能是以下任一格式，请都识别：
+- 「面试官：...」「候选人：...」之类的说话人标注
+- 「Q：...」「A：...」之类的问答标注
+- 带时间戳的转写文本，如「00:01:23 面试官：...」
+- 没有说话人标注的连续对话（请根据语义判断哪一段是问、哪一段是答）
 
-请返回纯JSON数组，格式如下：
-[{{"question": "...", "answer": "...", "category": "..."}}, ...]
+要求：
+1. 只抽取面试中真实发生的一问一答，不要臆造，不要把面试官的引导语单独成题。
+2. 每条包含：question（面试官问题原文，可适当精简但保留原意）、answer（候选人回答原文，保留关键内容，不要省略到失去信息）、category（分类，从「技术能力、项目经验、工程素养、团队协作、架构设计、领导力、沟通表达」中选最贴近的一个）。
+3. 按面试发生顺序输出。
+4. 若文本明显不是面试对话（例如纯简历、纯职位描述、乱码、空白），返回空数组 []。
+5. 严格返回纯 JSON 数组，不要包含任何 markdown 代码围栏、解释文字或前后缀。
+
+输出格式：
+[{{"question": "面试官问题原文", "answer": "候选人回答原文", "category": "技术能力"}}, ...]
+
+示例输入：
+面试官：请先做个自我介绍。
+候选人：我叫张三，五年 Java 经验，做过电商后端。
+面试官：讲一下你最近负责的订单系统架构。
+候选人：我们用了微服务，订单服务拆分为...
+
+示例输出：
+[{{"question": "请先做个自我介绍。", "answer": "我叫张三，五年 Java 经验，做过电商后端。", "category": "沟通表达"}}, {{"question": "讲一下你最近负责的订单系统架构。", "answer": "我们用了微服务，订单服务拆分为...", "category": "架构设计"}}]
+
+面试转写文本：
+{transcript_slice}"""
+
+    try:
+        response = await llm_client.chat.completions.create(
+            model=settings.deepseek_model,
+            messages=[{"role": "system", "content": system_prompt}],
+            temperature=0.2,
+            max_tokens=4096,
+        )
+        raw_content = response.choices[0].message.content or ""
+        data = _extract_json_array(raw_content)
+        result = [d for d in data if isinstance(d, dict) and d.get("question")]
+        if not result:
+            preview = raw_content.strip().replace("\n", " ")[:300]
+            print(f"[extract_qa] 未抽取到问答。LLM 原始返回长度={len(raw_content)}，"
+                  f"解析后条目数={len(data)}，预览：{preview}")
+        return result
+    except Exception as e:
+        print(f"Transcript QA extraction error: {e}")
+        return []
+
+
+async def extract_segments_from_transcript(transcript_text: str, position_name: str) -> dict:
+    """从面试转写文本中抽取两个特殊片段：自我介绍 / 反问环节。
+
+    与 extract_qa_from_transcript 互补——后者抽取常规问答对，本函数只识别面试的
+    开场自我介绍与结尾反问两个非问答片段。返回
+    {"self_intro": str, "reverse_questions": str}，任一未识别到则返回空串。
+    """
+    if not transcript_text or not transcript_text.strip():
+        return {"self_intro": "", "reverse_questions": ""}
+
+    system_prompt = f"""你是一位资深的面试记录分析专家。请从下面这段面试转写文本中，抽取两个特殊片段。
+
+岗位：{position_name or '未知'}
+
+需要抽取的片段：
+1. self_intro（自我介绍）：面试开场候选人对自己的自我陈述原文。通常是面试官说「请先做个自我介绍」之后候选人的一段独白。
+2. reverse_questions（反问环节）：面试结尾候选人向面试官提出的问题原文。通常是面试官说「你有什么想问的吗」之后候选人的提问。
+
+要求：
+1. 只抽取真实出现的内容，不要臆造；不要把常规问答混入这两个片段。
+2. 保留原文关键内容，可适当精简但保留原意。
+3. 若某个片段在转写中不存在，对应字段返回空字符串 ""。
+4. 严格返回纯 JSON 对象，不要包含 markdown 或解释文字：
+{{"self_intro": "...", "reverse_questions": "..."}}
 
 面试转写文本：
 {transcript_text[:8000]}"""
@@ -157,22 +314,22 @@ async def extract_qa_from_transcript(transcript_text: str, position_name: str) -
             model=settings.deepseek_model,
             messages=[{"role": "system", "content": system_prompt}],
             temperature=0.2,
-            max_tokens=4096,
+            max_tokens=2048,
         )
-        content = response.choices[0].message.content.strip()
-        if content.startswith("```json"):
-            content = content[7:]
-        if content.startswith("```"):
-            content = content[3:]
-        if content.endswith("```"):
-            content = content[:-3]
-        data = json.loads(content.strip())
-        if isinstance(data, dict):
-            data = [data]
-        return [d for d in data if isinstance(d, dict) and d.get("question")]
+        raw_content = response.choices[0].message.content or ""
+        data = _extract_json_object(raw_content)
+        result = {
+            "self_intro": str(data.get("self_intro", "") or "").strip(),
+            "reverse_questions": str(data.get("reverse_questions", "") or "").strip(),
+        }
+        if not result["self_intro"] and not result["reverse_questions"]:
+            preview = raw_content.strip().replace("\n", " ")[:300]
+            print(f"[extract_segments] 未抽取到片段。LLM 原始返回长度={len(raw_content)}，"
+                  f"预览：{preview}")
+        return result
     except Exception as e:
-        print(f"Transcript QA extraction error: {e}")
-        return []
+        print(f"Transcript segments extraction error: {e}")
+        return {"self_intro": "", "reverse_questions": ""}
 
 
 async def get_or_generate_questions(candidate_id: str, round: str, db: AsyncSession) -> List[InterviewQuestion]:
@@ -243,6 +400,68 @@ async def get_or_generate_questions(candidate_id: str, round: str, db: AsyncSess
 
 
 # ── Endpoints ───────────────────────────────────────────
+
+async def _upsert_segment_evaluation(
+    db: AsyncSession,
+    *,
+    candidate_id: str,
+    round: str,
+    transcript_id,
+    segment_type: str,
+    content: str | None = None,
+    ai_score: int | None = None,
+    ai_dimensions=None,
+    hr_score: int | None = None,
+    hr_dimensions=None,
+) -> InterviewSegmentEvaluation:
+    """创建或更新一条片段评分记录。
+
+    查找键：(candidate_id, round, transcript_id, segment_type)。不存在则新建。
+    AI / HR 字段仅在被显式传入（非 None）时覆写，避免互相清空。
+    """
+    e_result = await db.execute(
+        select(InterviewSegmentEvaluation).where(and_(
+            InterviewSegmentEvaluation.candidate_id == candidate_id,
+            InterviewSegmentEvaluation.round == round,
+            InterviewSegmentEvaluation.transcript_id == transcript_id,
+            InterviewSegmentEvaluation.segment_type == segment_type,
+        ))
+    )
+    e = e_result.scalar_one_or_none()
+    if not e:
+        e = InterviewSegmentEvaluation(
+            candidate_id=candidate_id,
+            round=round,
+            transcript_id=transcript_id,
+            segment_type=segment_type,
+        )
+        db.add(e)
+    if content is not None:
+        e.content = content
+    if ai_score is not None:
+        e.ai_score = ai_score
+    if ai_dimensions is not None:
+        e.ai_dimensions = ai_dimensions
+    if hr_score is not None:
+        e.hr_score = hr_score
+    if hr_dimensions is not None:
+        e.hr_dimensions = hr_dimensions
+    if (ai_score is not None or hr_score is not None) and (not e.status or e.status == "pending"):
+        e.status = "scoring"
+    return e
+
+
+def _segment_to_dict(e: InterviewSegmentEvaluation) -> dict:
+    return {
+        "segmentType": e.segment_type,
+        "content": e.content,
+        "aiScore": e.ai_score,
+        "aiDimensions": e.ai_dimensions,
+        "hrScore": e.hr_score,
+        "hrDimensions": e.hr_dimensions,
+        "status": e.status if e.status else "pending",
+    }
+
 
 def _question_to_dict(q: InterviewQuestion) -> dict:
     return {
@@ -694,6 +913,7 @@ async def get_evaluation(
     # （source='transcript'），与「面试出题」环节生成的题目完全独立。
     # 若指定 transcriptId，只返回该次上传记录的题目；否则取最近一次上传记录。
     if transcriptId:
+        target_tid = transcriptId
         transcript_filter = InterviewQuestion.transcript_id == transcriptId
     else:
         latest_t_result = await db.execute(
@@ -702,8 +922,8 @@ async def get_evaluation(
                 InterviewTranscript.round == round,
             )).order_by(InterviewTranscript.created_at.desc()).limit(1)
         )
-        latest_tid = latest_t_result.scalar_one_or_none()
-        transcript_filter = InterviewQuestion.transcript_id == latest_tid if latest_tid else None
+        target_tid = latest_t_result.scalar_one_or_none()
+        transcript_filter = InterviewQuestion.transcript_id == target_tid if target_tid else None
 
     base_filters = [
         InterviewQuestion.candidate_id == candidate_id,
@@ -752,7 +972,19 @@ async def get_evaluation(
             "dimensions": e.hr_dimensions if e else None,
         })
 
-    return {"code": 0, "message": "ok", "data": data}
+    # 取当前 transcript 范围下的「自我介绍 / 反问环节」片段评分
+    segment_filters = [
+        InterviewSegmentEvaluation.candidate_id == candidate_id,
+        InterviewSegmentEvaluation.round == round,
+    ]
+    if target_tid is not None:
+        segment_filters.append(InterviewSegmentEvaluation.transcript_id == target_tid)
+    seg_result = await db.execute(
+        select(InterviewSegmentEvaluation).where(and_(*segment_filters))
+    )
+    segments = [_segment_to_dict(s) for s in seg_result.scalars().all()]
+
+    return {"code": 0, "message": "ok", "data": {"questions": data, "segments": segments}}
 
 
 @router.put("/interview/evaluation/{candidate_id}")
@@ -787,6 +1019,34 @@ async def save_evaluation(
         e.answer = sc.get("answer")
         if sc.get("hrScore") is not None:
             e.status = "scored"
+
+    # 保存「自我介绍 / 反问环节」片段的 HR 评分
+    segment_inputs = body.get("segments") or []
+    if segment_inputs:
+        # 片段评分按 transcript_id 关联；前端未传则取最近一次上传记录
+        target_tid = body.get("transcriptId")
+        if not target_tid:
+            latest_t_result = await db.execute(
+                select(InterviewTranscript.id).where(and_(
+                    InterviewTranscript.candidate_id == candidate_id,
+                    InterviewTranscript.round == round,
+                )).order_by(InterviewTranscript.created_at.desc()).limit(1)
+            )
+            target_tid = latest_t_result.scalar_one_or_none()
+
+        for seg in segment_inputs:
+            seg_type = seg.get("segmentType")
+            if not seg_type:
+                continue
+            await _upsert_segment_evaluation(
+                db,
+                candidate_id=candidate_id,
+                round=round,
+                transcript_id=target_tid,
+                segment_type=seg_type,
+                hr_score=seg.get("hrScore"),
+                hr_dimensions=seg.get("dimensions"),
+            )
 
     await db.flush()
     return {"code": 0, "message": "ok", "data": None}
@@ -922,15 +1182,108 @@ async def upload_transcript(
             print(f"[upload_transcript] AI scoring skipped (disabled or manual mode) "
                   f"for {len(created_questions)} questions")
 
+    # ── 抽取「自我介绍」「反问环节」两个特殊片段并评分 ──
+    # 这两个片段不属于常规问答，独立用专门的子 Agent 评分，落库到
+    # InterviewSegmentEvaluation，关联到本次 transcript_id。
+    # 自我介绍评分需对照简历，反问评分需对照岗位要求，故此处加载两者作为上下文。
+    segments = await extract_segments_from_transcript(transcript_text, position_name)
+    segment_scored_types: list[str] = []
+    if ai_scoring_enabled and scoring_mode != "manual":
+        from app.agent.self_intro_agent import score_self_intro
+        from app.agent.reverse_question_agent import score_reverse_question
+
+        fallback = int(await get_setting(db, "passScoreThreshold", 75) or 75)
+
+        # 加载简历摘要（用于自我介绍评分对照）与岗位要求（用于反问评分对照）
+        resume_text = ""
+        if candidate and candidate.resume_file:
+            try:
+                resume_text = await asyncio.to_thread(_resume_text, candidate.resume_file)
+            except Exception:
+                resume_text = ""
+        position_requirements = _format_position_requirements(
+            candidate.position if candidate else None
+        )
+
+        segment_tasks = []  # (segment_type, content, coro)
+        if segments.get("self_intro"):
+            segment_tasks.append((
+                "self_intro",
+                segments["self_intro"],
+                score_self_intro(
+                    segments["self_intro"],
+                    position_name=position_name,
+                    fallback_score=fallback,
+                    resume_text=resume_text,
+                ),
+            ))
+        if segments.get("reverse_questions"):
+            segment_tasks.append((
+                "reverse_question",
+                segments["reverse_questions"],
+                score_reverse_question(
+                    segments["reverse_questions"],
+                    position_name=position_name,
+                    fallback_score=fallback,
+                    position_requirements=position_requirements,
+                ),
+            ))
+
+        # 两个片段并发评分
+        results = await asyncio.gather(*[t[2] for t in segment_tasks]) if segment_tasks else []
+        for (seg_type, seg_content, _), result in zip(segment_tasks, results):
+            await _upsert_segment_evaluation(
+                db,
+                candidate_id=candidate_id,
+                round=round,
+                transcript_id=transcript_id,
+                segment_type=seg_type,
+                content=seg_content,
+                ai_score=result.get("score"),
+                ai_dimensions=result.get("dimensions", []),
+            )
+            segment_scored_types.append(seg_type)
+        await db.flush()
+        print(f"[upload_transcript] 片段评分完成：{segment_scored_types or '无可用片段'}")
+    else:
+        # 即便关闭 AI 评分，也把抽取到的片段原文落库（content），供前端展示与 HR 手动评分
+        for seg_type, key in (("self_intro", "self_intro"), ("reverse_question", "reverse_questions")):
+            seg_content = segments.get(key, "")
+            if seg_content:
+                await _upsert_segment_evaluation(
+                    db,
+                    candidate_id=candidate_id,
+                    round=round,
+                    transcript_id=transcript_id,
+                    segment_type=seg_type,
+                    content=seg_content,
+                )
+        await db.flush()
+
+    qa_count = len(qa_list)
+    seg_self_intro = bool(segments.get("self_intro"))
+    seg_reverse = bool(segments.get("reverse_questions"))
+
+    warnings: list[str] = []
+    if not transcript_text or not transcript_text.strip():
+        warnings.append("未能从文件中提取出文本，请检查文件内容或格式")
+    elif qa_count == 0 and not seg_self_intro and not seg_reverse:
+        warnings.append("上传成功但未识别出问答、自我介绍或反问环节，请确认文件是面试对话转写而非简历/职位描述")
+
     return {
         "code": 0,
         "message": "ok",
         "data": {
             "transcript": transcript_text,
             "stored": True,
-            "qaCount": len(qa_list),
+            "qaCount": qa_count,
             "transcriptId": str(transcript_id),
             "filename": file.filename or "transcript",
+            "segments": {
+                "selfIntro": seg_self_intro,
+                "reverseQuestions": seg_reverse,
+            },
+            "warning": "；".join(warnings) if warnings else "",
         },
     }
 
@@ -1084,8 +1437,45 @@ async def submit_evaluation(
         if score_val is not None:
             scores.append(float(score_val))
 
-    avg_score = round(sum(scores) / len(scores), 1) if scores else 0
-    passed = avg_score >= pass_threshold
+    qa_avg = round(sum(scores) / len(scores), 1) if scores else 0.0
+
+    # ── 加权最终分：Q&A 80% + 自我介绍 10% + 反问 10% ──
+    # 缺失环节（无记录或无分数）的权重回退给 Q&A，保证不存在的环节不影响最终分。
+    seg_result = await db.execute(
+        select(InterviewSegmentEvaluation).where(and_(
+            InterviewSegmentEvaluation.candidate_id == candidate_id,
+            InterviewSegmentEvaluation.round == round,
+        ))
+    )
+    seg_by_type = {s.segment_type: s for s in seg_result.scalars().all()}
+
+    def _pick_seg_score(seg: Optional[InterviewSegmentEvaluation]) -> Optional[float]:
+        if not seg:
+            return None
+        if scoring_mode == "manual":
+            v = seg.hr_score if seg.hr_score is not None else seg.ai_score
+        else:
+            v = seg.ai_score if seg.ai_score is not None else seg.hr_score
+        return float(v) if v is not None else None
+
+    self_score = _pick_seg_score(seg_by_type.get("self_intro"))
+    reverse_score = _pick_seg_score(seg_by_type.get("reverse_question"))
+
+    components: List[tuple[float, float]] = []  # (weight, score)
+    if scores:
+        components.append((0.8, qa_avg))
+    if self_score is not None:
+        components.append((0.1, self_score))
+    if reverse_score is not None:
+        components.append((0.1, reverse_score))
+
+    if components:
+        total_w = sum(w for w, _ in components)
+        final_score = round(sum(w * s for w, s in components) / total_w, 1)
+    else:
+        final_score = 0.0
+
+    passed = final_score >= pass_threshold
 
     cand_result = await db.execute(select(Candidate).where(Candidate.id == candidate_id))
     candidate = cand_result.scalar_one_or_none()
@@ -1106,7 +1496,7 @@ async def submit_evaluation(
                     await dispatch_webhook(
                         db,
                         "candidate.offer_pending",
-                        {"candidateId": candidate_id, "name": candidate.name, "avgScore": avg_score},
+                        {"candidateId": candidate_id, "name": candidate.name, "avgScore": final_score},
                     )
                 except Exception:
                     pass
@@ -1120,7 +1510,11 @@ async def submit_evaluation(
         "code": 0,
         "message": "ok",
         "data": {
-            "avgScore": avg_score,
+            "avgScore": qa_avg,
+            "qaAvg": qa_avg,
+            "selfIntroScore": self_score,
+            "reverseScore": reverse_score,
+            "finalScore": final_score,
             "passThreshold": pass_threshold,
             "passed": passed,
             "scoringMode": scoring_mode,
