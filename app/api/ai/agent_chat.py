@@ -95,6 +95,23 @@ async def get_ai_agent_overview(db: AsyncSession = Depends(get_db)):
     }
 
 
+@router.get("/ai-agent/welcome-prompts")
+async def get_welcome_prompts(db: AsyncSession = Depends(get_db)):
+    """欢迎页快捷入口推荐。
+
+    由后端「推荐 Agent」根据当前系统状态（候选人数 / 试用期员工 / 待评估面试等）
+    调用 LLM 生成 3 条最值得做的动作，前端不再写死。LLM 失败时回退到内置默认推荐。
+    """
+    from app.services.ai.welcome_prompt_recommender import recommend_welcome_prompts
+
+    prompts = await recommend_welcome_prompts(db)
+    return {
+        "code": 0,
+        "message": "ok",
+        "data": prompts,
+    }
+
+
 @router.get("/ai-agent/sessions")
 async def list_sessions(
     db: AsyncSession = Depends(get_db),
@@ -170,6 +187,46 @@ async def delete_session(
 
     await db.delete(session)
     return {"code": 0, "message": "ok", "data": None}
+
+
+class RenameSessionRequest(BaseModel):
+    title: str
+
+
+@router.patch("/ai-agent/sessions/{session_id}")
+async def rename_session(
+    session_id: str,
+    body: RenameSessionRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """重命名对话（支持用户自定义对话名称）。"""
+    new_title = (body.title or "").strip()
+    if not new_title:
+        return {"code": 400, "message": "对话名称不能为空", "data": None}
+    if len(new_title) > 100:
+        return {"code": 400, "message": "对话名称过长（最多 100 字）", "data": None}
+
+    result = await db.execute(
+        select(AgentSession).where(AgentSession.id == session_id)
+    )
+    session = result.scalar_one_or_none()
+    if not session:
+        return {"code": 404, "message": "对话不存在", "data": None}
+
+    session.title = new_title
+    session.updated_at = datetime.utcnow()
+    await db.flush()
+    return {
+        "code": 0,
+        "message": "ok",
+        "data": {
+            "id": str(session.id),
+            "title": session.title,
+            "agentId": session.agent_id,
+            "createdAt": session.created_at.isoformat() if session.created_at else "",
+            "updatedAt": session.updated_at.isoformat() if session.updated_at else "",
+        },
+    }
 
 
 @router.get("/ai-agent/sessions/{session_id}/messages")
