@@ -1,4 +1,0 @@
-[    1191ms] [INFO] %cDownload the React DevTools for a better development experience: https://react.dev/link/react-devtools font-weight:bold @ http://localhost:5173/node_modules/.vite/deps/client--C8cioMw.js?v=fe477cb8:14335
-[    1745ms] [ERROR] Warning: [antd: Spin] `tip` is deprecated. Please use `description` instead. @ http://localhost:5173/node_modules/.vite/deps/antd.js?v=fe477cb8:1241
-[   31873ms] [ERROR] Warning: [antd: message] Static function can not consume context like dynamic theme. Please use 'App' component instead. @ http://localhost:5173/node_modules/.vite/deps/antd.js?v=fe477cb8:1241
-[  417035ms] [ERROR] Warning: [antd: Modal] `maskClosable` is deprecated. Please use `mask.closable` instead. @ http://localhost:5173/node_modules/.vite/deps/antd.js?v=fe477cb8:1241
