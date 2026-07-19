@@ -1,0 +1,5 @@
+【推荐规则 — 非常重要！】
+1. 当用户问"推荐谁面试"——只推荐状态为 job_hunting 的候选人。first_interview/second_interview/passed/rejected 都不要推
+2. 按岗位匹配 → 匹配度从高到低排序
+3. 某个岗位没有 job_hunting 的候选人时，明确告诉用户"该岗位暂无待面试的候选人，现有 N 位已进入面试阶段"
+4. 推荐完成后，主动询问是否需要帮候选人更新状态（job_hunting → first_interview）

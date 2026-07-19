@@ -850,16 +850,32 @@ async def _execute_tool_sync(tool_name: str, **kwargs) -> str:
     """Execute a tool with an auto-created DB session (for LangGraph context).
 
     Uses lazy import to avoid circular dependency with app.routers.ai_agent.
+
+    IMPORTANT: The session cleanup is shielded from ``asyncio.CancelledError``
+    so that when the SSE streaming client disconnects mid-tool-call, the
+    asyncpg connection is always returned to the pool instead of being left
+    dangling for the garbage collector.
     """
-    from app.api.ai.agent_chat import execute_tool_call  # lazy import
+    from app.api.ai.tool_executor import execute_tool_call  # lazy import
+    import asyncio as _asyncio
 
     # Remove None values (unset optional params)
     params = {k: v for k, v in kwargs.items() if v is not None}
     # Remove the dummy field if present
     params.pop("dummy", None)
 
-    async with async_session_factory() as db:
-        return await execute_tool_call(tool_name, params, db)
+    db = async_session_factory()
+    try:
+        result = await _asyncio.shield(execute_tool_call(tool_name, params, db))
+        await db.commit()
+        return result
+    except BaseException:
+        await db.rollback()
+        raise
+    finally:
+        # Shield close() so the connection ALWAYS goes back to the pool,
+        # even when CancelledError fires during the finally block itself.
+        await _asyncio.shield(db.close())
 
 
 def create_langchain_tools(agent_id: str = "recruit") -> list:
