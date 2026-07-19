@@ -777,22 +777,10 @@ async def upload_resume(
     positionId: Optional[str] = Form(None),
     db: AsyncSession = Depends(get_db),
 ):
-    # 未传岗位时回退到系统默认岗位
-    resolved_position_id = (positionId or "").strip()
-    if not resolved_position_id:
-        resolved_position_id = str(await get_system_setting(db, "defaultPositionId", "") or "")
-    if not resolved_position_id:
-        return {"code": 400, "message": "请选择应聘岗位，或在系统设置中配置默认岗位", "data": None}
-
-    # Validate position
-    pos_result = await db.execute(select(Position).where(Position.id == resolved_position_id))
-    position = pos_result.scalar_one_or_none()
-    if not position:
-        return {"code": 404, "message": "岗位不存在", "data": None}
-
-    # Save file to MinIO (object key: resumes/<uuid>.<ext>)
     original_name = file.filename or "resume.pdf"
     file_ext = os.path.splitext(original_name)[1].lower() or ".pdf"
+
+    # 1) 保存文件到 MinIO（先存，后续无论岗位是否匹配上都能用）
     object_key = f"resumes/{uuid.uuid4()}{file_ext}"
     content = await file.read()
     try:
@@ -802,7 +790,71 @@ async def upload_resume(
     except Exception as e:
         return {"code": 500, "message": f"简历存储失败: {e}", "data": None}
 
-    # Create candidate
+    # 2) 解析应聘岗位：
+    #    - 用户显式传了 positionId → 直接用（保持原行为）；
+    #    - 没传 → 调用「岗位匹配 Agent」由 AI 根据简历内容 + 在招岗位自动判断；
+    #    - AI 匹配失败时，再回退到系统默认岗位，保证可用性。
+    resolved_position_id = (positionId or "").strip()
+    position_source = "user"  # 用于日志/通知里说明岗位来源
+    match_reason = ""
+
+    position: Optional[Position] = None
+
+    if resolved_position_id:
+        # 用户指定岗位：直接校验存在性
+        pos_result = await db.execute(select(Position).where(Position.id == resolved_position_id))
+        position = pos_result.scalar_one_or_none()
+        if not position:
+            return {"code": 404, "message": "岗位不存在", "data": None}
+    else:
+        # 没传岗位 → 走 AI 岗位匹配 Agent
+        from app.services.recruitment.position_matcher import match_position_for_resume
+
+        # 先把简历文本抽出来给 Agent 用
+        resume_text, extract_error = extract_text_from_file(object_key)
+        if not extract_error and resume_text.strip():
+            resolved_position_id, position_name, match_reason = await match_position_for_resume(
+                db, resume_text
+            )
+            if resolved_position_id:
+                position_source = "agent"
+                pos_result = await db.execute(select(Position).where(Position.id == resolved_position_id))
+                position = pos_result.scalar_one_or_none()
+                if not position:
+                    # AI 返回的 id 在在招列表里但库里查不到（极少见），清空走回退
+                    logger.warning("AI 匹配到的岗位 id=%s 在数据库中不存在", resolved_position_id)
+                    resolved_position_id = ""
+                    position = None
+        else:
+            logger.warning("未指定岗位且简历文本抽取失败，回退默认岗位: %s", extract_error)
+
+        # AI 未匹配上或文本抽取失败 → 回退到系统默认岗位
+        if not position:
+            fallback_id = str(await get_system_setting(db, "defaultPositionId", "") or "")
+            if fallback_id:
+                pos_result = await db.execute(select(Position).where(Position.id == fallback_id))
+                position = pos_result.scalar_one_or_none()
+                if position:
+                    resolved_position_id = fallback_id
+                    position_source = "default"
+                    match_reason = match_reason or "AI 匹配未命中，已回退到系统默认岗位"
+
+        if not position:
+            # 既没有 AI 匹配，也没有默认岗位：删掉刚上传的文件，提示用户
+            try:
+                await asyncio.to_thread(minio_storage.delete_object, object_key)
+            except Exception:
+                pass
+            return {
+                "code": 400,
+                "message": (
+                    f"AI 未能判断该简历的应聘岗位：{match_reason or '无匹配'}。"
+                    "请手动选择岗位后重新上传，或在系统设置中配置默认岗位。"
+                ),
+                "data": None,
+            }
+
+    # 3) 创建候选人
     candidate = Candidate(
         name=original_name,
         position_id=resolved_position_id,
@@ -842,11 +894,14 @@ async def upload_resume(
     try:
         from app.services.system.notification import notify_if
         from app.services.system.webhook import dispatch_webhook
+        position_label = position.name
+        if position_source == "agent":
+            position_label = f"{position.name}（AI 匹配：{match_reason}）"
         await notify_if(
             db,
             "notifyNewResume",
             "new_resume",
-            f"新简历入库：{original_name}（岗位：{position.name}）",
+            f"新简历入库：{original_name}（岗位：{position_label}）",
             {"candidateId": str(candidate.id)},
         )
         await dispatch_webhook(
@@ -862,6 +917,8 @@ async def upload_resume(
     if not candidate:
         return {"code": 500, "message": "候选人加载失败", "data": None}
     response_data = serialize_candidate(candidate)
+    if position_source == "agent":
+        response_data["positionMatchReason"] = match_reason
     if parse_message and response_data["parseStatus"] != "parsed":
         return {
             "code": 0,

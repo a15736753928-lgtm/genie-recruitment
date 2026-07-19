@@ -320,6 +320,44 @@ async def check_rapidocr(settings: Settings) -> CheckResult:
         )
 
 
+async def check_funasr(settings: Settings) -> CheckResult:
+    """Verify the FunASR speech-to-text pipeline is available.
+
+    Critical — interview audio transcription is a core feature. The server
+    refuses to start if the model or its dependencies are missing so the
+    user gets a clear error at startup rather than a runtime mystery.
+    """
+    t0 = time.perf_counter()
+    try:
+        import torch  # noqa: F401
+        import torchaudio  # noqa: F401
+        import funasr  # noqa: F401
+        from modelscope.pipelines import pipeline
+        from modelscope.utils.constant import Tasks
+
+        pipe = pipeline(
+            task=Tasks.auto_speech_recognition,
+            model="iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
+        )
+        return CheckResult(
+            "FunASR (语音转写)", "critical", CheckStatus.PASS,
+            f"Paraformer model ready (pipeline: {type(pipe).__name__})",
+            (time.perf_counter() - t0) * 1000,
+        )
+    except ImportError as e:
+        return CheckResult(
+            "FunASR (语音转写)", "critical", CheckStatus.FAIL,
+            f"依赖缺失 — 运行 asr_init.py 安装: {e}",
+            (time.perf_counter() - t0) * 1000,
+        )
+    except Exception as e:
+        return CheckResult(
+            "FunASR (语音转写)", "critical", CheckStatus.FAIL,
+            f"模型加载失败 — 运行 asr_init.py 下载模型: {e}",
+            (time.perf_counter() - t0) * 1000,
+        )
+
+
 async def check_minio(settings: Settings) -> CheckResult:
     """Verify MinIO is reachable and the bucket is ready.
 
@@ -606,6 +644,7 @@ async def run_startup_checks(settings: Settings) -> list[CheckResult]:
         check_upload_dir,
         check_minio,
         check_portrait_gender,
+        check_funasr,
     ]
     checks_phase2: list[CheckFn] = [
         check_milvus_lite,

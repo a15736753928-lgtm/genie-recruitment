@@ -29,6 +29,22 @@ llm_client = AsyncOpenAI(
 
 INTERVIEW_ELIGIBLE_STATUSES = {"passed", "first_interview", "second_interview", "pending_interview"}
 
+# ── FunASR singleton (loaded once, reused across all transcribe calls) ──
+_funasr_pipeline = None
+
+
+def _get_funasr_pipeline():
+    """Return the cached FunASR pipeline, creating it on first call."""
+    global _funasr_pipeline
+    if _funasr_pipeline is None:
+        from modelscope.pipelines import pipeline
+        from modelscope.utils.constant import Tasks
+        _funasr_pipeline = pipeline(
+            task=Tasks.auto_speech_recognition,
+            model="iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
+        )
+    return _funasr_pipeline
+
 
 # ── Helpers ─────────────────────────────────────────────
 
@@ -1361,15 +1377,37 @@ async def transcribe_audio(
     if not allow_audio:
         return {"code": 403, "message": "系统已关闭音频上传功能", "data": None}
 
-    # Audio file — transcribe with DeepSeek (audio not stored, text only)
+    # Audio file — transcribe with FunASR Paraformer (Chinese-optimized)
     audio_bytes = await file.read()
 
-    # Use DeepSeek for transcription
     try:
-        # Note: DeepSeek doesn't have native audio transcription.
-        # We store a note and use text-based fallback.
-        # For production, integrate a speech-to-text service.
-        simulated_text = f"[音频转写] 文件: {file.filename}, 大小: {len(audio_bytes)} bytes. 请集成语音识别服务以获得实际转写内容。"
+        import tempfile
+        import os as _os
+
+        # Write audio to temp WAV (FunASR pipeline accepts file path)
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        try:
+            tmp.write(audio_bytes)
+            tmp.close()
+
+            # Singleton pipeline — loaded once, reused across all requests
+            from modelscope.pipelines import pipeline
+            from modelscope.utils.constant import Tasks
+            import asyncio as _asyncio
+
+            asr = await _asyncio.to_thread(_get_funasr_pipeline)
+            result = await _asyncio.to_thread(asr, tmp.name)
+            # result is list[dict] when input is a file path
+            item = result[0] if isinstance(result, list) else result
+            transcribed_text = item.get("text", "").strip()
+
+            if not transcribed_text:
+                transcribed_text = "[转写完成，但未识别到语音内容]"
+        finally:
+            try:
+                _os.unlink(tmp.name)
+            except OSError:
+                pass
 
         t_result = await db.execute(
             select(InterviewTranscript).where(and_(
@@ -1379,13 +1417,13 @@ async def transcribe_audio(
         )
         t = t_result.scalar_one_or_none()
         if t:
-            t.content = simulated_text
+            t.content = transcribed_text
             t.source = "transcribe"
         else:
             t = InterviewTranscript(
                 candidate_id=candidate_id,
                 round=round,
-                content=simulated_text,
+                content=transcribed_text,
                 source="transcribe",
             )
             db.add(t)
@@ -1404,7 +1442,7 @@ async def transcribe_audio(
         return {
             "code": 0,
             "message": "ok",
-            "data": {"transcript": simulated_text, "stored": True},
+            "data": {"transcript": transcribed_text, "stored": True},
         }
     except Exception as e:
         return {"code": 500, "message": f"转写失败: {str(e)}", "data": None}
