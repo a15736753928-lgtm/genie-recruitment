@@ -64,6 +64,7 @@ def _create_llm(temperature: float = 0.7) -> ChatOpenAI:
 def build_agent_graph(
     tools: list[BaseTool],
     system_prompt: str,
+    tool_result_adapter=None,  # optional ToolResultAdapter for structured output
 ) -> StateGraph:
     """Build a compiled LangGraph ReAct agent.
 
@@ -80,10 +81,6 @@ def build_agent_graph(
         messages = list(state["messages"])
         if not messages or not isinstance(messages[0], SystemMessage):
             messages = [SystemMessage(content=system_prompt)] + messages
-        # Must use ainvoke (not invoke) so the event loop is not blocked
-        # while waiting for the LLM. A synchronous invoke here freezes
-        # the entire async server, which is why the frontend stops
-        # receiving data while any AI task is running.
         response = await llm_with_tools.ainvoke(messages)
         return {"messages": [response]}
 
@@ -101,7 +98,10 @@ def build_agent_graph(
     workflow.add_conditional_edges("agent", should_continue, {"tools": "tools", END: END})
     workflow.add_edge("tools", "agent")
 
-    return workflow.compile()
+    compiled = workflow.compile()
+    # Attach the adapter for use in streaming
+    compiled._tool_result_adapter = tool_result_adapter
+    return compiled
 
 
 # ── SSE Helpers ─────────────────────────────────────────
@@ -153,12 +153,20 @@ def _tool_progress(tool_name: str) -> int:
 
 
 def _display_hint_for(tool_name: str) -> str:
-    """Map tool name to display hint for frontend card rendering."""
-    if tool_name in ("list_resumes",):
+    """Map tool name to display hint for frontend card rendering.
+
+    Uses the comprehensive mapping from ToolResultAdapter when available,
+    falling back to the legacy hardcoded mapping.
+    """
+    try:
+        from app.agent_os.output.adapter import ToolResultAdapter
+        return ToolResultAdapter.DISPLAY_HINTS.get(tool_name, "text")
+    except ImportError:
+        pass
+    # Legacy fallback
+    if tool_name in ("list_resumes", "rag_search", "recall_test"):
         return "list"
-    if tool_name in ("get_resume",):
-        return "card"
-    if tool_name in ("get_position", "list_positions"):
+    if tool_name in ("get_resume", "get_position", "list_positions"):
         return "card"
     if tool_name in ("get_questions", "generate_questions"):
         return "questions"
@@ -166,8 +174,8 @@ def _display_hint_for(tool_name: str) -> str:
         return "score"
     if tool_name in ("get_leaderboard", "get_rankings"):
         return "table"
-    if tool_name in ("rag_search", "recall_test"):
-        return "list"
+    if tool_name in ("get_probation_stats", "get_performance_stats", "get_dashboard_overview"):
+        return "stats"
     return "text"
 
 
@@ -239,22 +247,39 @@ async def stream_agent_response(
         # ── Tool call completed ──
         elif kind == "on_tool_end":
             output = event.get("data", {}).get("output", "")
-            result_text = str(output.content) if hasattr(output, "content") else str(output)
+            raw_text = str(output.content) if hasattr(output, "content") else str(output)
+            tool_name = event.get("name", "")
 
-            # Wrap in ToolResult for structured SSE
-            tr = ToolResult.from_legacy_string(tool_name, result_text)
-            # Detect display hint from tool name
+            # Try to wrap in structured ToolResult
+            tr = None
+            if isinstance(output, ToolResult):
+                tr = output
+            elif hasattr(output, "success"):
+                # dict with success key
+                tr = ToolResult.from_legacy_string(tool_name, raw_text)
+            else:
+                tr = ToolResult.from_legacy_string(tool_name, raw_text)
+
+            # Apply display hint from the adapter's comprehensive map
             tr.display_hint = _display_hint_for(tool_name)
             sse_data = tr.to_sse_dict()
 
             # Update the most recent running block
             for block in reversed(result.tool_blocks):
                 if block["status"] == "running":
-                    block["result"] = result_text
+                    block["result"] = raw_text
                     block["status"] = "done"
+                    # Attach structured fields for frontend rendering
+                    block["success"] = tr.success
+                    block["summary"] = tr.summary
+                    block["display_hint"] = tr.display_hint
+                    if tr.data:
+                        block["data"] = tr.data
+                    if tr.error:
+                        block["error"] = tr.error.model_dump()
                     yield _sse("tool_result", {
                         "id": block["id"],
-                        "result": result_text,
+                        "result": raw_text,
                         **sse_data,
                     })
                     break

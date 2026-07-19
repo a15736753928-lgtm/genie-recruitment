@@ -219,6 +219,7 @@ from app.api.talent import interview, probation, performance
 from app.api.knowledge import knowledge_base as knowledge, rag
 # AI 功能
 from app.api.ai import agent_chat as ai_agent
+from app.api.ai import agent_chat_v2 as ai_agent_v2  # Agent OS powered v2
 # 系统管理
 from app.api.system import dashboard, settings as settings_router, export as export_router
 
@@ -230,6 +231,7 @@ app.include_router(performance.router, prefix="/api")
 app.include_router(knowledge.router, prefix="/api")
 app.include_router(dashboard.router, prefix="/api")
 app.include_router(ai_agent.router, prefix="/api")
+app.include_router(ai_agent_v2.router, prefix="/api")  # Agent OS v2
 app.include_router(settings_router.router, prefix="/api")
 app.include_router(export_router.router, prefix="/api")
 app.include_router(rag.router)  # RAG endpoints (prefix defined in router)
