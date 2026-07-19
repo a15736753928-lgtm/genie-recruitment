@@ -24,6 +24,7 @@ from langchain_core.tools import BaseTool
 from typing import TypedDict, Annotated
 
 from app.config import get_settings
+from app.agent.tool_result import ToolResult, DisplayHint
 
 settings = get_settings()
 
@@ -110,6 +111,66 @@ def _sse(event_type: str, data: dict) -> str:
     return f"event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
+# ── Tool Metadata ───────────────────────────────────────
+
+# Progress percentages by tool category for differentiated feedback
+_TOOL_PROGRESS: dict[str, int] = {
+    # Fast reads
+    "list_resumes": 70, "get_resume": 80, "list_positions": 80, "get_position": 80,
+    "get_questions": 80, "get_evaluation": 80, "get_leaderboard": 80,
+    "get_rankings": 80, "get_settings": 90, "get_operations_dashboard": 80,
+    "get_dashboard_overview": 80, "get_knowledge_stats": 90,
+    "get_knowledge_categories": 90, "get_probation_stats": 80,
+    "get_performance_stats": 80, "get_department_performance": 80,
+    "get_grade_distribution": 80, "get_bonus_info": 80,
+    "get_quarter_trends": 80, "list_knowledge": 80, "list_knowledge_bases": 80,
+    "list_documents": 80, "list_probation": 80, "list_performance": 80,
+    "get_position_questions": 80, "get_probation_employee": 80,
+    # Medium (writes / moderate latency)
+    "update_resume": 40, "update_position": 40, "save_questions": 40,
+    "save_evaluation": 40, "save_position_questions": 40,
+    "update_settings": 50, "create_position": 50, "create_knowledge_item": 50,
+    "create_knowledge_base": 50, "create_probation_employee": 50,
+    "create_probation_task": 50, "update_knowledge_item": 50,
+    "update_knowledge_base": 50, "update_probation_task": 50,
+    # Slow (AI generation / file ops)
+    "generate_questions": 15, "ai_score_question": 10,
+    "ai_evaluate_probation": 10, "rag_search": 20,
+    "upload_resume": 10, "upload_knowledge_file": 10,
+    "upload_document": 10, "reanalyze_resume": 10,
+    "batch_parse_resumes": 5, "recall_test": 20,
+    "replace_question": 15,
+    # Destructive (fast but needs care)
+    "delete_resume": 90, "delete_position": 90, "delete_knowledge_item": 90,
+    "delete_knowledge_base": 90, "delete_document": 90,
+    "submit_evaluation": 80, "initiate_appraisal": 50,
+}
+
+
+def _tool_progress(tool_name: str) -> int:
+    """Return a reasonable progress percentage for a tool's start event."""
+    return _TOOL_PROGRESS.get(tool_name, 50)
+
+
+def _display_hint_for(tool_name: str) -> str:
+    """Map tool name to display hint for frontend card rendering."""
+    if tool_name in ("list_resumes",):
+        return "list"
+    if tool_name in ("get_resume",):
+        return "card"
+    if tool_name in ("get_position", "list_positions"):
+        return "card"
+    if tool_name in ("get_questions", "generate_questions"):
+        return "questions"
+    if tool_name in ("get_evaluation", "save_evaluation", "ai_score_question"):
+        return "score"
+    if tool_name in ("get_leaderboard", "get_rankings"):
+        return "table"
+    if tool_name in ("rag_search", "recall_test"):
+        return "list"
+    return "text"
+
+
 # ── Streaming ───────────────────────────────────────────
 
 async def stream_agent_response(
@@ -171,7 +232,7 @@ async def stream_agent_response(
             yield _sse("task_progress", {
                 "title": f"正在执行 {tool_name}",
                 "description": str(tool_input)[:100],
-                "progress": 30,
+                "progress": _tool_progress(tool_name),
                 "elapsed": "执行中...",
             })
 
@@ -179,6 +240,12 @@ async def stream_agent_response(
         elif kind == "on_tool_end":
             output = event.get("data", {}).get("output", "")
             result_text = str(output.content) if hasattr(output, "content") else str(output)
+
+            # Wrap in ToolResult for structured SSE
+            tr = ToolResult.from_legacy_string(tool_name, result_text)
+            # Detect display hint from tool name
+            tr.display_hint = _display_hint_for(tool_name)
+            sse_data = tr.to_sse_dict()
 
             # Update the most recent running block
             for block in reversed(result.tool_blocks):
@@ -188,6 +255,7 @@ async def stream_agent_response(
                     yield _sse("tool_result", {
                         "id": block["id"],
                         "result": result_text,
+                        **sse_data,
                     })
                     break
 

@@ -12,7 +12,6 @@ required.
 from __future__ import annotations
 
 import os
-from functools import lru_cache
 
 _PROMPTS_DIR = os.path.join(os.path.dirname(__file__), "prompts")
 
@@ -24,15 +23,24 @@ def _load(filename: str) -> str:
         return f.read().strip()
 
 
-@lru_cache(maxsize=1)
+_PROMPT_MTIMES: dict[str, float] = {}
+_PROMPT_CACHE: str | None = None
+
+
 def _load_all() -> str:
-    """Load and join all prompt sections (cached in-process)."""
-    sections = [
-        _load("system.txt"),
-        _load("recommend.txt"),
-        _load("rules.txt"),
-    ]
-    return "\n\n".join(sections)
+    """Load and join all prompt sections; reload when any .txt file changes."""
+    global _PROMPT_CACHE
+    filenames = ("system.txt", "recommend.txt", "rules.txt")
+    mtimes = {
+        name: os.path.getmtime(os.path.join(_PROMPTS_DIR, name)) for name in filenames
+    }
+    if _PROMPT_CACHE is not None and mtimes == _PROMPT_MTIMES:
+        return _PROMPT_CACHE
+    _PROMPT_MTIMES.clear()
+    _PROMPT_MTIMES.update(mtimes)
+    sections = [_load(name) for name in filenames]
+    _PROMPT_CACHE = "\n\n".join(sections)
+    return _PROMPT_CACHE
 
 
 # ── Agent Configurations ──────────────────────────────────

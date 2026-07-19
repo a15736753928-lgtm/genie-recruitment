@@ -7,6 +7,7 @@ the SSE streaming endpoint.
 """
 
 import json
+import re
 import uuid
 import asyncio
 from datetime import datetime
@@ -21,7 +22,9 @@ from openai import AsyncOpenAI
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from app.database import get_db, async_session_factory
 from app.models.agent_session import AgentSession, AgentMessage, AgentMaterial, AgentTask
-from app.agent.tools import create_langchain_tools
+from app.agent.tools import create_langchain_tools, create_langchain_tools_from_defs
+from app.agent.intent_classifier import classify_intent, get_tool_defs_for_intent
+from app.agent.supervisor_graph import classify_complexity_sync, ExecutionPlan, PlanStep
 from app.agent.graph import build_agent_graph, stream_agent_response, AgentResult
 from app.config import get_settings
 from app.infrastructure import minio_storage
@@ -39,6 +42,34 @@ llm_client = AsyncOpenAI(
     timeout=60.0,
     max_retries=0,
 )
+
+
+def iso_utc(dt: Optional[datetime]) -> str:
+    """Serialize naive UTC datetime with trailing Z so browsers parse correctly.
+
+    ``datetime.utcnow()`` / DB columns are naive UTC. ``isoformat()`` alone
+    yields ``2026-07-19T06:00:00`` which JS treats as *local* time — in CST
+    (UTC+8) a just-created session then shows as 「8 小时前」.
+    """
+    if not dt:
+        return ""
+    text = dt.isoformat()
+    if text.endswith("Z") or text.endswith("+00:00"):
+        return text
+    # Already has an offset like +08:00
+    if len(text) >= 6 and text[-6] in "+-" and text[-3] == ":":
+        return text
+    return text + "Z"
+
+
+def serialize_session(s: AgentSession) -> dict:
+    return {
+        "id": str(s.id),
+        "title": s.title or "新对话",
+        "agentId": s.agent_id,
+        "createdAt": iso_utc(s.created_at),
+        "updatedAt": iso_utc(s.updated_at),
+    }
 
 
 # ═══════════════════════════════════════════════════════════
@@ -125,16 +156,7 @@ async def list_sessions(
     return {
         "code": 0,
         "message": "ok",
-        "data": [
-            {
-                "id": str(s.id),
-                "title": s.title or "新对话",
-                "agentId": s.agent_id,
-                "createdAt": s.created_at.isoformat() if s.created_at else "",
-                "updatedAt": s.updated_at.isoformat() if s.updated_at else "",
-            }
-            for s in sessions
-        ],
+        "data": [serialize_session(s) for s in sessions],
     }
 
 
@@ -153,13 +175,7 @@ async def create_session(
     return {
         "code": 0,
         "message": "ok",
-        "data": {
-            "id": str(session.id),
-            "title": session.title,
-            "agentId": session.agent_id,
-            "createdAt": session.created_at.isoformat() if session.created_at else "",
-            "updatedAt": session.updated_at.isoformat() if session.updated_at else "",
-        },
+        "data": serialize_session(session),
     }
 
 
@@ -219,13 +235,7 @@ async def rename_session(
     return {
         "code": 0,
         "message": "ok",
-        "data": {
-            "id": str(session.id),
-            "title": session.title,
-            "agentId": session.agent_id,
-            "createdAt": session.created_at.isoformat() if session.created_at else "",
-            "updatedAt": session.updated_at.isoformat() if session.updated_at else "",
-        },
+        "data": serialize_session(session),
     }
 
 
@@ -249,7 +259,7 @@ async def get_session_messages(
                 "sessionId": str(m.session_id),
                 "role": m.role,
                 "content": m.content,
-                "createdAt": m.created_at.isoformat() if m.created_at else "",
+                "createdAt": iso_utc(m.created_at),
             }
             for m in messages
         ],
@@ -342,6 +352,95 @@ async def upload_material(
             "analysis": analysis,
         },
     }
+
+
+# ── Plan Generation Helper ────────────────────────────────
+
+PLAN_SYSTEM_PROMPT = """你是一个任务规划器。将用户的请求分解为有序的执行步骤。
+只返回一个 JSON 对象（不要 markdown 代码块，不要解释）：
+
+{
+  "title": "简短的任务标题（≤15字）",
+  "steps": [
+    {
+      "index": 1,
+      "title": "步骤名称（≤10字）",
+      "description": "这个步骤要做什么（一句话）",
+      "expected_tools": ["工具名"],
+      "expected_outcome": "成功标准"
+    }
+  ]
+}
+
+规则：
+- 每个步骤只调用 1-2 个工具
+- 步骤总数 1-5 个，越少越好
+- 步骤顺序要合理（先查询再操作）
+- 简单查询只返回 1 个步骤
+- expected_tools 使用英文工具名"""
+
+
+async def _generate_plan(
+    lc_messages: list,
+    system_prompt: str,
+    client: AsyncOpenAI,
+) -> Optional[ExecutionPlan]:
+    """Generate an execution plan for complex user requests.
+
+    Uses a focused LLM call. Falls back to None on any error so the agent
+    can still proceed without a plan.
+    """
+    try:
+        # Get user message content
+        user_content = ""
+        for msg in reversed(lc_messages):
+            if hasattr(msg, "content") and not isinstance(msg, SystemMessage):
+                user_content = str(msg.content)[:500]
+                break
+
+        if not user_content:
+            return None
+
+        resp = await client.chat.completions.create(
+            model=settings.deepseek_model,
+            messages=[
+                {"role": "system", "content": PLAN_SYSTEM_PROMPT},
+                {"role": "user", "content": user_content},
+            ],
+            temperature=0.3,
+            max_tokens=512,
+        )
+        raw = resp.choices[0].message.content.strip()
+
+        # Strip markdown fences
+        if raw.startswith("```"):
+            raw = re.sub(r"^```(?:json)?\s*", "", raw)
+            raw = re.sub(r"\s*```$", "", raw)
+
+        plan_data = json.loads(raw)
+
+        if "steps" not in plan_data or not plan_data["steps"]:
+            return None
+
+        steps = [
+            PlanStep(
+                index=s.get("index", i + 1),
+                title=s.get("title", f"步骤{i+1}"),
+                description=s.get("description", ""),
+                expected_tools=s.get("expected_tools", []),
+                expected_outcome=s.get("expected_outcome", ""),
+            )
+            for i, s in enumerate(plan_data["steps"])
+        ]
+
+        return ExecutionPlan(
+            plan_id=f"plan_{uuid.uuid4().hex[:8]}",
+            title=plan_data.get("title", "执行计划"),
+            steps=steps,
+            total_estimated_tools=sum(len(s.expected_tools) for s in steps),
+        )
+    except Exception:
+        return None
 
 
 @router.post("/ai-agent/suggestions/{suggestion_id}/trigger")
@@ -495,9 +594,48 @@ async def agent_chat(
                 task_id = task.id
                 await db.commit()
 
-            # Build LangGraph agent
-            langchain_tools = create_langchain_tools(agent_id)
+            # ── Intent Pre-Classification ──
+            # Classify user intent to restrict available tools (hard constraint).
+            # Uses keyword matching — fast, deterministic, no API call.
+            intent = classify_intent(message)
+
+            # Build LangGraph agent with intent-gated tools
+            if intent == "general":
+                langchain_tools = create_langchain_tools(agent_id)
+            else:
+                restricted_defs = get_tool_defs_for_intent(intent)
+                langchain_tools = create_langchain_tools_from_defs(restricted_defs)
+
             system_prompt = build_system_prompt(agent_id)
+            if intent != "general":
+                INTENT_LABELS = {
+                    "position_query": "岗位JD查询", "candidate_query": "候选人查询",
+                    "candidate_action": "候选人操作", "interview": "面试管理",
+                    "probation": "试用期考核", "performance": "绩效管理",
+                    "knowledge": "知识库", "dashboard": "数据看板", "settings": "系统设置",
+                }
+                hint = INTENT_LABELS.get(intent, intent)
+                system_prompt += (
+                    f"\n\n[Intent Gate] 当前意图: {hint}。"
+                    f"本轮仅可使用与该意图匹配的工具，禁止调用无关工具。"
+                )
+
+            # ── Plan Generation (complex queries only) ──
+            complexity = classify_complexity_sync(message)
+            if complexity == "complex":
+                plan = await _generate_plan(lc_messages, system_prompt, llm_client)
+                if plan and plan.steps:
+                    yield sse_event("plan_proposal", plan.to_sse_dict())
+                    # Inject plan into system prompt for worker agent
+                    steps_text = "\n".join(
+                        f"  {s.index}. {s.title}: {s.description}"
+                        for s in plan.steps
+                    )
+                    system_prompt += (
+                        f"\n\n[执行计划] {plan.title}\n{steps_text}\n"
+                        f"按步骤顺序执行。每完成一步，检查结果后再进行下一步。"
+                    )
+
             graph = build_agent_graph(langchain_tools, system_prompt)
 
             # Stream agent execution

@@ -16,7 +16,7 @@ TOOL_REGISTRY = {
     # Recruitment tools
     "list_resumes": {
         "name": "list_resumes",
-        "description": "查询候选人列表。可按岗位、状态、关键词筛选，支持排序和分页。",
+        "description": "查询候选人列表（按岗位/状态/关键词筛选）。仅当用户要查候选人、推荐人选时调用；查岗位 JD 时禁止调用。",
         "parameters": {
             "type": "object",
             "properties": {
@@ -30,18 +30,18 @@ TOOL_REGISTRY = {
     },
     "get_resume": {
         "name": "get_resume",
-        "description": "获取单个候选人的详细信息，包括AI分析结果。",
+        "description": "获取单个候选人的详细信息（含 AI 分析）。仅当用户明确要求查看某位候选人简历/详情时调用；查岗位 JD 时禁止调用。",
         "parameters": {
             "type": "object",
             "properties": {
-                "id": {"type": "string", "description": "候选人ID"},
+                "id": {"type": "string", "description": "候选人 UUID（必须是 list_resumes 返回的真实 id，禁止编造如 resume-trade）"},
             },
             "required": ["id"],
         },
     },
     "list_positions": {
         "name": "list_positions",
-        "description": "获取所有岗位列表。",
+        "description": "获取所有岗位列表（id + 名称 + 部门）。按岗位名查 JD 时：先用本工具找 id，再调 get_position；不要 list_resumes。",
         "parameters": {"type": "object", "properties": {}},
     },
     "update_resume": {
@@ -107,11 +107,11 @@ TOOL_REGISTRY = {
     # Position tools (write)
     "get_position": {
         "name": "get_position",
-        "description": "获取单个岗位的详细信息（含 JD、筛选标准、面试标准等）。",
+        "description": "获取单个岗位 JD 详情（职责/任职要求/加分项/技术栈）。用户说「查看XX岗位JD」时用此工具；不要同时查候选人。",
         "parameters": {
             "type": "object",
             "properties": {
-                "id": {"type": "string", "description": "岗位ID"},
+                "id": {"type": "string", "description": "岗位 UUID（来自 list_positions）"},
             },
             "required": ["id"],
         },
@@ -900,6 +900,46 @@ def create_langchain_tools(agent_id: str = "recruit") -> list:
             return await _execute_tool_sync(tool_name, **kwargs)
 
         # Attach proper signature for LangChain
+        tool_func.__name__ = tool_name
+        tool_func.__doc__ = description
+
+        structured_tool = StructuredTool.from_function(
+            name=tool_name,
+            description=description,
+            args_schema=args_model,
+            coroutine=tool_func,
+        )
+        lc_tools.append(structured_tool)
+
+    return lc_tools
+
+
+def create_langchain_tools_from_defs(tool_defs: list[dict]) -> list:
+    """Convert a list of tool definition dicts into LangChain StructuredTool objects.
+
+    Unlike ``create_langchain_tools``, this bypasses ``get_tools_for_agent``
+    and accepts pre-filtered tool definitions directly — used by the intent
+    classifier to inject a restricted tool set into the ReAct agent.
+
+    Args:
+        tool_defs: Tool definitions from ``TOOL_REGISTRY`` (already filtered).
+
+    Returns:
+        List of ``StructuredTool`` instances ready for ``build_agent_graph``.
+    """
+    from langchain_core.tools import StructuredTool
+
+    lc_tools = []
+    for td in tool_defs:
+        tool_name = td["name"]
+        description = td["description"]
+        params_schema = td.get("parameters", {})
+
+        args_model = _build_pydantic_model(tool_name, params_schema)
+
+        async def tool_func(tool_name=tool_name, **kwargs) -> str:
+            return await _execute_tool_sync(tool_name, **kwargs)
+
         tool_func.__name__ = tool_name
         tool_func.__doc__ = description
 

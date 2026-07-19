@@ -180,24 +180,30 @@ async def execute_tool_call(tool_name: str, params: dict, db: AsyncSession) -> s
             d = result.get("data") or {}
             if not d:
                 return "岗位不存在"
+            # 默认只返回 JD 正文，避免把整份评分表 JSON 塞进上下文诱使模型做「匹配分析」
             lines = [
                 f"岗位「{d.get('name', '')}」(ID: {d.get('id', '')})",
                 f"  部门: {d.get('department', '未设置')}",
             ]
             if d.get("jdResponsibilities"):
-                lines.append(f"  岗位职责: {d['jdResponsibilities']}")
+                lines.append(f"  岗位职责:\n{d['jdResponsibilities']}")
             if d.get("jdRequirements"):
-                lines.append(f"  任职要求: {d['jdRequirements']}")
+                lines.append(f"  任职要求:\n{d['jdRequirements']}")
             if d.get("jdPreferred"):
-                lines.append(f"  加分项: {d['jdPreferred']}")
+                lines.append(f"  加分项:\n{d['jdPreferred']}")
             if d.get("jdTechStack"):
                 lines.append(f"  技术栈: {d['jdTechStack']}")
+            extras = []
             if d.get("screeningCriteria"):
-                lines.append(f"  筛选标准: {json.dumps(d['screeningCriteria'], ensure_ascii=False)}")
+                extras.append("筛选评分标准")
             if d.get("interviewCriteriaR1"):
-                lines.append(f"  一面标准: {json.dumps(d['interviewCriteriaR1'], ensure_ascii=False)}")
+                extras.append("一面评分标准")
             if d.get("interviewCriteriaR2"):
-                lines.append(f"  二面标准: {json.dumps(d['interviewCriteriaR2'], ensure_ascii=False)}")
+                extras.append("二面评分标准")
+            if extras:
+                lines.append(
+                    f"  （另有配置未展开：{' / '.join(extras)}。用户明确要求查看评分标准时再说明即可）"
+                )
             return "\n".join(lines)
 
         elif tool_name == "create_position":
