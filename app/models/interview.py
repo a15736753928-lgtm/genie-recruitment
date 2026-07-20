@@ -68,6 +68,14 @@ class InterviewTranscript(Base):
     source = Column(String(16))
     # 原始文件名，用于历史记录展示
     filename = Column(String(255), nullable=True)
+    # AI 全方位评定报告（JSON）
+    assessment_report = Column(JSON, nullable=True)
+    # ── 异步处理进度（转写→抽问答→评分→片段→报告，后台任务回写，前端轮询）──
+    # pending / transcribing / extracting / scoring / segment / report / completed / failed
+    process_status = Column(String(16), nullable=False, default="completed")
+    process_progress = Column(Integer, nullable=False, default=100)  # 0-100
+    process_stage = Column(String(64), nullable=True)                # 人类可读阶段名
+    process_message = Column(Text, nullable=True)                    # 错误详情或补充说明
     created_at = Column(DateTime, default=datetime.utcnow)
 
     candidate = relationship("Candidate", back_populates="transcripts")

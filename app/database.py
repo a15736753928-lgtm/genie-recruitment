@@ -236,6 +236,13 @@ def _run_migrations(connection):
         "agent_sessions",
         "project_id",
     )
+    # v12: 面试转写记录存 AI 全方位评定报告
+    _add_column_if_missing(connection, "interview_transcripts", "assessment_report", "JSON")
+    # v13: 面试转写异步处理进度（后台任务回写 + 前端轮询）。历史记录默认 completed/100，不影响展示。
+    _add_column_if_missing(connection, "interview_transcripts", "process_status", "VARCHAR(16) NOT NULL DEFAULT 'completed'")
+    _add_column_if_missing(connection, "interview_transcripts", "process_progress", "INTEGER NOT NULL DEFAULT 100")
+    _add_column_if_missing(connection, "interview_transcripts", "process_stage", "VARCHAR(64)")
+    _add_column_if_missing(connection, "interview_transcripts", "process_message", "TEXT")
 
 
 def _migrate_transcript_history(connection) -> None:

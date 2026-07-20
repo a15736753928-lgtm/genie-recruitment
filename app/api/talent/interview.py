@@ -9,14 +9,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, and_, case, or_, text
 from sqlalchemy.orm import selectinload
 from pydantic import BaseModel
-from app.database import get_db
+from app.database import get_db, async_session_factory
 from app.models.recruitment import Candidate, Position
 from app.models.interview import InterviewQuestion, InterviewEvaluation, InterviewTranscript, InterviewSegmentEvaluation
 from app.config import get_settings
 from app.infrastructure import minio_storage
 from app.services.system.system_settings import get_system_setting
 from app.services.ai import get_llm_client
+import logging
 
+logger = logging.getLogger("genie.interview")
 router = APIRouter(tags=["面试"])
 settings = get_settings()
 
@@ -56,7 +58,14 @@ _funasr_pipeline = None
 
 
 def _get_funasr_pipeline():
-    """Return the cached FunASR pipeline, creating it on first call."""
+    """Return the cached FunASR pipeline, creating it on first call.
+
+    附带 VAD（语音活动检测）+ 标点模型：
+    - vad_model: 把长录音先切成一句一句的短片段再逐段识别，避免 Paraformer 对
+      整段音频做 O(T²) self-attention 时一次性申请几十 GB 内存而 OOM（长面试录音必踩）。
+    - punc_model: 给识别结果加标点，问答/片段抽取更准。
+    三个模型首次会各下载一次并缓存到 ~/.cache/modelscope，之后重启从磁盘加载、不再联网下载。
+    """
     global _funasr_pipeline
     if _funasr_pipeline is None:
         from modelscope.pipelines import pipeline
@@ -64,8 +73,36 @@ def _get_funasr_pipeline():
         _funasr_pipeline = pipeline(
             task=Tasks.auto_speech_recognition,
             model="iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
+            vad_model="iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
+            punc_model="iic/punc_ct-transformer_zh-cn-common-vocab272727-pytorch",
+            # 完全离线环境下跳过 hub 更新检查，直接用本地缓存
+            disable_update=True,
         )
     return _funasr_pipeline
+
+
+def _transcribe_audio_bytes(audio_bytes: bytes) -> str:
+    """把音频字节转写成带标点的中文文本（同步，供后台线程 asyncio.to_thread 调用）。
+
+    走 VAD 分段的 FunASR 单例，长录音不会 OOM。识别不到语音时返回占位串。
+    """
+    import tempfile
+    import os as _os
+
+    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    try:
+        tmp.write(audio_bytes)
+        tmp.close()
+        asr = _get_funasr_pipeline()
+        result = asr(tmp.name)
+        item = result[0] if isinstance(result, list) and result else result
+        text = (item.get("text", "") if isinstance(item, dict) else "").strip()
+        return text or "[转写完成，但未识别到语音内容]"
+    finally:
+        try:
+            _os.unlink(tmp.name)
+        except OSError:
+            pass
 
 
 # ── Helpers ─────────────────────────────────────────────
@@ -260,12 +297,12 @@ async def extract_qa_from_transcript(transcript_text: str, position_name: str) -
     if not transcript_text or not transcript_text.strip():
         return []
 
-    MAX_CHARS = 8000
+    MAX_CHARS = 15000
     truncated = len(transcript_text) > MAX_CHARS
     transcript_slice = transcript_text[:MAX_CHARS]
     if truncated:
-        print(f"[extract_qa] 转写文本长度 {len(transcript_text)} 超过 {MAX_CHARS}，"
-              f"仅解析前 {MAX_CHARS} 字符")
+        logger.info("[extract_qa] 转写文本长度 %d 超过 %d，仅解析前 %d 字符",
+                    len(transcript_text), MAX_CHARS, MAX_CHARS)
 
     system_prompt = f"""你是一位资深的面试记录分析专家。请从下面这段面试转写文本中，抽取面试官实际提出的问题以及候选人对应的回答原文。
 
@@ -299,24 +336,40 @@ async def extract_qa_from_transcript(transcript_text: str, position_name: str) -
 面试转写文本：
 {transcript_slice}"""
 
-    try:
-        response = await get_llm_client().chat.completions.create(
-            model=settings.deepseek_model,
-            messages=[{"role": "system", "content": system_prompt}],
-            temperature=0.2,
-            max_tokens=4096,
-        )
-        raw_content = response.choices[0].message.content or ""
-        data = _extract_json_array(raw_content)
-        result = [d for d in data if isinstance(d, dict) and d.get("question")]
-        if not result:
-            preview = raw_content.strip().replace("\n", " ")[:300]
-            print(f"[extract_qa] 未抽取到问答。LLM 原始返回长度={len(raw_content)}，"
-                  f"解析后条目数={len(data)}，预览：{preview}")
-        return result
-    except Exception as e:
-        print(f"Transcript QA extraction error: {e}")
-        return []
+    # DeepSeek 偶发返回空串/非法 JSON，重试最多 3 次；重试时略升 temperature 打破确定性空返回。
+    MAX_ATTEMPTS = 3
+    last_reason = ""
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            response = await get_llm_client().chat.completions.create(
+                model=settings.deepseek_model,
+                messages=[{"role": "system", "content": system_prompt}],
+                temperature=0.2 if attempt == 1 else 0.4,
+                max_tokens=8192,
+            )
+            raw_content = response.choices[0].message.content or ""
+            data = _extract_json_array(raw_content)
+            result = [d for d in data if isinstance(d, dict) and d.get("question")]
+            if result:
+                if attempt > 1:
+                    logger.info("[extract_qa] 第 %d 次尝试成功，抽取到 %d 条问答", attempt, len(result))
+                return result
+            # 空结果：可能是「确实不是面试对话」返回 []，也可能是 LLM 空返回/坏 JSON。
+            # 前者不该重试，后者该重试——用原始返回长度区分：有内容且解析出 [] 视为真空。
+            last_reason = (f"LLM 原始返回长度={len(raw_content)}，解析后条目数={len(data)}，"
+                           f"预览：{raw_content.strip().replace(chr(10), ' ')[:200]}")
+            if raw_content.strip() and isinstance(data, list):
+                # 有实质返回且是合法空数组 → 判定为「非面试对话」，不再重试
+                logger.info("[extract_qa] 判定为非面试对话或无问答（第 %d 次）：%s", attempt, last_reason)
+                return []
+            logger.warning("[extract_qa] 空/坏返回，准备重试（第 %d/%d 次）：%s",
+                           attempt, MAX_ATTEMPTS, last_reason)
+        except Exception as e:
+            last_reason = f"异常: {e}"
+            logger.warning("[extract_qa] 调用异常，准备重试（第 %d/%d 次）：%s",
+                           attempt, MAX_ATTEMPTS, e)
+    logger.error("[extract_qa] %d 次尝试后仍未抽取到问答：%s", MAX_ATTEMPTS, last_reason)
+    return []
 
 
 async def extract_segments_from_transcript(transcript_text: str, position_name: str) -> dict:
@@ -345,7 +398,7 @@ async def extract_segments_from_transcript(transcript_text: str, position_name: 
 {{"self_intro": "...", "reverse_questions": "..."}}
 
 面试转写文本：
-{transcript_text[:8000]}"""
+{transcript_text[:15000]}"""
 
     try:
         response = await get_llm_client().chat.completions.create(
@@ -497,6 +550,138 @@ def _segment_to_dict(e: InterviewSegmentEvaluation) -> dict:
         "hrDimensions": e.hr_dimensions,
         "status": e.status if e.status else "pending",
     }
+
+
+async def _build_assessment_context(
+    db: AsyncSession,
+    candidate_id: str,
+    round: str,
+    transcript_id,
+) -> dict | None:
+    """组装全方位评定所需的上下文。"""
+    t_result = await db.execute(
+        select(InterviewTranscript).where(InterviewTranscript.id == transcript_id)
+    )
+    transcript = t_result.scalar_one_or_none()
+    if not transcript:
+        return None
+
+    cand_result = await db.execute(
+        select(Candidate)
+        .options(
+            selectinload(Candidate.position),
+            selectinload(Candidate.skills),
+            selectinload(Candidate.ai_analysis),
+        )
+        .where(Candidate.id == candidate_id)
+    )
+    candidate = cand_result.scalar_one_or_none()
+    if not candidate:
+        return None
+
+    pos = candidate.position
+    position_payload = {
+        "name": pos.name if pos else "未知岗位",
+        "requirements": " ".join(filter(None, [
+            getattr(pos, "jd_requirements", None) if pos else None,
+            getattr(pos, "jd_content", None) if pos else None,
+        ])),
+    }
+
+    resume_analysis = {}
+    if candidate.ai_analysis:
+        a = candidate.ai_analysis
+        resume_analysis = {
+            "overallScore": a.overall_score,
+            "summary": a.summary,
+            "highlights": a.highlights or [],
+            "risks": a.risks or [],
+            "recommendation": a.recommendation,
+        }
+
+    q_result = await db.execute(
+        select(InterviewQuestion).where(and_(
+            InterviewQuestion.candidate_id == candidate_id,
+            InterviewQuestion.round == round,
+            InterviewQuestion.source == "transcript",
+            InterviewQuestion.transcript_id == transcript_id,
+        )).order_by(InterviewQuestion.index_num)
+    )
+    questions = q_result.scalars().all()
+
+    eval_result = await db.execute(
+        select(InterviewEvaluation).where(and_(
+            InterviewEvaluation.candidate_id == candidate_id,
+            InterviewEvaluation.round == round,
+        ))
+    )
+    evals = {str(e.question_id): e for e in eval_result.scalars().all()}
+
+    qa_items = []
+    ai_scores = []
+    for q in questions:
+        e = evals.get(str(q.id))
+        ai_score = e.ai_score if e else None
+        if ai_score is not None:
+            ai_scores.append(ai_score)
+        qa_items.append({
+            "question": q.content,
+            "answer": e.answer if e else None,
+            "category": q.category,
+            "aiScore": ai_score,
+            "aiDimensions": e.ai_dimensions if e else None,
+        })
+
+    seg_result = await db.execute(
+        select(InterviewSegmentEvaluation).where(and_(
+            InterviewSegmentEvaluation.candidate_id == candidate_id,
+            InterviewSegmentEvaluation.round == round,
+            InterviewSegmentEvaluation.transcript_id == transcript_id,
+        ))
+    )
+    segments = [_segment_to_dict(s) for s in seg_result.scalars().all()]
+
+    return {
+        "round": round,
+        "transcriptExcerpt": transcript.content or "",
+        "avgQaScore": round(sum(ai_scores) / len(ai_scores), 1) if ai_scores else None,
+        "candidate": {
+            "name": candidate.name,
+            "education": candidate.education,
+            "experience": candidate.experience,
+            "skills": [s.skill for s in (candidate.skills or [])],
+        },
+        "position": position_payload,
+        "resumeAnalysis": resume_analysis,
+        "qaItems": qa_items,
+        "segments": segments,
+    }
+
+
+async def _generate_and_save_assessment_report(
+    db: AsyncSession,
+    candidate_id: str,
+    round: str,
+    transcript_id,
+) -> dict | None:
+    """生成并持久化全方位评定报告。"""
+    context = await _build_assessment_context(db, candidate_id, round, transcript_id)
+    if not context:
+        return None
+    if not context.get("transcriptExcerpt", "").strip():
+        return None
+
+    from app.agent.assessment_agent import generate_assessment_report
+
+    report = await generate_assessment_report(context)
+    t_result = await db.execute(
+        select(InterviewTranscript).where(InterviewTranscript.id == transcript_id)
+    )
+    transcript = t_result.scalar_one_or_none()
+    if transcript:
+        transcript.assessment_report = report
+        await db.flush()
+    return report
 
 
 def _question_to_dict(q: InterviewQuestion) -> dict:
@@ -1023,7 +1208,24 @@ async def get_evaluation(
     )
     segments = [_segment_to_dict(s) for s in seg_result.scalars().all()]
 
-    return {"code": 0, "message": "ok", "data": {"questions": data, "segments": segments}}
+    assessment_report = None
+    if target_tid is not None:
+        t_result = await db.execute(
+            select(InterviewTranscript).where(InterviewTranscript.id == target_tid)
+        )
+        transcript_row = t_result.scalar_one_or_none()
+        if transcript_row and transcript_row.assessment_report:
+            assessment_report = transcript_row.assessment_report
+
+    return {
+        "code": 0,
+        "message": "ok",
+        "data": {
+            "questions": data,
+            "segments": segments,
+            "assessmentReport": assessment_report,
+        },
+    }
 
 
 @router.put("/interview/evaluation/{candidate_id}")
@@ -1091,53 +1293,32 @@ async def save_evaluation(
     return {"code": 0, "message": "ok", "data": None}
 
 
-@router.post("/interview/evaluation/{candidate_id}/transcript")
-async def upload_transcript(
+async def _run_transcript_pipeline(
+    db: AsyncSession,
     candidate_id: str,
-    file: UploadFile = File(...),
-    round: str = Form(...),
-    db: AsyncSession = Depends(get_db),
-):
-    # Save to MinIO and parse file. We keep the bytes in memory to both upload
-    # to MinIO and extract text via a temp file (no re-download needed).
-    file_ext = os.path.splitext(file.filename or "transcript")[1] or ".txt"
-    object_key = f"interview/{uuid.uuid4()}{file_ext}"
-    content = await file.read()
-    try:
-        await asyncio.to_thread(
-            minio_storage.upload_bytes, object_key, content, "application/octet-stream"
-        )
-    except Exception as e:
-        return {"code": 500, "message": f"转写文件存储失败: {e}", "data": None}
+    round: str,
+    transcript_id,
+    transcript_text: str,
+    log_tag: str = "transcript_pipeline",
+    on_progress=None,
+) -> dict:
+    """面试转写文本的完整评定流水线（文本上传 / 音频转写共用）。
 
-    # Extract text from the in-memory bytes via a temp file
-    import tempfile
-    fd, tmp_path = tempfile.mkstemp(suffix=file_ext)
-    try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(content)
-        transcript_text = extract_text(tmp_path)
-    finally:
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            pass
+    从转写文本抽取问答 → 落库为 source='transcript' 的题目并 AI 评分 →
+    抽取「自我介绍 / 反问环节」片段并评分 → 生成全方位综合评定报告。
 
-    # Save transcript —— 每次上传创建一条新的历史记录（不再覆盖）
-    t = InterviewTranscript(
-        candidate_id=candidate_id,
-        round=round,
-        content=transcript_text,
-        source="upload",
-        filename=file.filename or "transcript",
-    )
-    db.add(t)
-    await db.flush()
-    transcript_id = t.id
+    on_progress: 可选异步回调 async (status:str, progress:int, stage:str)，
+    每阶段回写进度供前端轮询；None 时为纯同步调用（不追踪进度）。
 
-    # 面试评定完全由上传的面试对话驱动：从转写文本中抽取实际问答，落库为
-    # source='transcript' 的题目（关联到本次上传的 transcript_id），与「面试出题」
-    # 环节生成的题目完全独立，再对每个回答触发 AI 评分。
+    返回 {"qaCount", "selfIntro", "reverseQuestions", "assessmentReport", "warning"}。
+    """
+    async def _progress(status: str, pct: int, stage: str):
+        if on_progress is not None:
+            try:
+                await on_progress(status, pct, stage)
+            except Exception:
+                logger.exception("[%s] 进度回调失败(忽略) stage=%s", log_tag, stage)
+
     ai_scoring_enabled = await get_setting(db, "aiInterviewScoring", True)
     scoring_mode = await get_setting(db, "defaultScoringMode", "ai")
 
@@ -1148,10 +1329,16 @@ async def upload_transcript(
     candidate = cand_result.scalar_one_or_none()
     position_name = candidate.position.name if (candidate and candidate.position) else "未知岗位"
 
+    logger.info(
+        "[%s] 流水线启动 candidate=%s round=%s transcript_id=%s text_len=%d",
+        log_tag, candidate_id, round, transcript_id, len(transcript_text or ""),
+    )
+    await _progress("extracting", 45, "抽取问答中")
     qa_list = await extract_qa_from_transcript(transcript_text, position_name)
-    print(f"[upload_transcript] candidate={candidate_id} round={round} transcript_id={transcript_id} "
-          f"ai_scoring_enabled={ai_scoring_enabled} scoring_mode={scoring_mode} "
-          f"extracted_qa_count={len(qa_list)}")
+    logger.info(
+        "[%s] ai_scoring_enabled=%s scoring_mode=%s extracted_qa_count=%d",
+        log_tag, ai_scoring_enabled, scoring_mode, len(qa_list),
+    )
 
     if qa_list:
         # 先落库所有抽取出的题目（关联到本次 transcript_id），拿到 question id
@@ -1185,9 +1372,8 @@ async def upload_transcript(
                 }
                 for q, ans in created_questions
             ]
-            print(f"[upload_transcript] 抽取到 {len(batch_items)} 道题，"
-                  f"每题评 3 个维度(表达能力/逻辑思维/技术深度)，"
-                  f"最多 5 道题并行评分")
+            logger.info("[%s] 抽取到 %d 道题，最多 5 道题并行评分", log_tag, len(batch_items))
+            await _progress("scoring", 55, f"评分中（{len(batch_items)} 题）")
             results = await score_answers_batch(
                 batch_items,
                 position_name=position_name,
@@ -1218,13 +1404,13 @@ async def upload_transcript(
                     e.status = "scoring"
             await db.flush()
         else:
-            print(f"[upload_transcript] AI scoring skipped (disabled or manual mode) "
-                  f"for {len(created_questions)} questions")
+            logger.info("[%s] AI 评分已跳过(关闭或手动模式) 共 %d 题", log_tag, len(created_questions))
 
     # ── 抽取「自我介绍」「反问环节」两个特殊片段并评分 ──
     # 这两个片段不属于常规问答，独立用专门的子 Agent 评分，落库到
     # InterviewSegmentEvaluation，关联到本次 transcript_id。
     # 自我介绍评分需对照简历，反问评分需对照岗位要求，故此处加载两者作为上下文。
+    await _progress("segment", 80, "评估自我介绍与反问环节")
     segments = await extract_segments_from_transcript(transcript_text, position_name)
     segment_scored_types: list[str] = []
     if ai_scoring_enabled and scoring_mode != "manual":
@@ -1283,7 +1469,7 @@ async def upload_transcript(
             )
             segment_scored_types.append(seg_type)
         await db.flush()
-        print(f"[upload_transcript] 片段评分完成：{segment_scored_types or '无可用片段'}")
+        logger.info("[%s] 片段评分完成：%s", log_tag, segment_scored_types or "无可用片段")
     else:
         # 即便关闭 AI 评分，也把抽取到的片段原文落库（content），供前端展示与 HR 手动评分
         for seg_type, key in (("self_intro", "self_intro"), ("reverse_question", "reverse_questions")):
@@ -1299,6 +1485,21 @@ async def upload_transcript(
                 )
         await db.flush()
 
+    # 生成全方位 AI 评定报告（基于转写 + 分项评分 + 简历上下文）。
+    # 报告是「AI 供参考」，无论 ai/manual 评分模式都在后台直接生成——manual 模式下仅缺少
+    # 分项 AI 分作输入，报告仍基于转写全文+简历+岗位生成，避免前端再走旧同步端点补生成。
+    assessment_report = None
+    if ai_scoring_enabled:
+        try:
+            await _progress("report", 90, "生成综合评定报告")
+            assessment_report = await _generate_and_save_assessment_report(
+                db, candidate_id, round, transcript_id
+            )
+            logger.info("[%s] 综合评定报告已生成 overall=%s", log_tag,
+                        assessment_report.get('overallScore') if assessment_report else '—')
+        except Exception:
+            logger.exception("[%s] 综合评定报告生成失败", log_tag)
+
     qa_count = len(qa_list)
     seg_self_intro = bool(segments.get("self_intro"))
     seg_reverse = bool(segments.get("reverse_questions"))
@@ -1310,19 +1511,179 @@ async def upload_transcript(
         warnings.append("上传成功但未识别出问答、自我介绍或反问环节，请确认文件是面试对话转写而非简历/职位描述")
 
     return {
+        "qaCount": qa_count,
+        "selfIntro": seg_self_intro,
+        "reverseQuestions": seg_reverse,
+        "assessmentReport": assessment_report,
+        "warning": "；".join(warnings) if warnings else "",
+    }
+
+
+async def _set_transcript_progress(
+    session: AsyncSession,
+    transcript_id,
+    *,
+    status: str | None = None,
+    progress: int | None = None,
+    stage: str | None = None,
+    message: str | None = None,
+    content: str | None = None,
+    assessment_report=None,
+) -> None:
+    """回写一条转写记录的处理进度并提交（后台任务用独立会话调用）。"""
+    t_result = await session.execute(
+        select(InterviewTranscript).where(InterviewTranscript.id == transcript_id)
+    )
+    t = t_result.scalar_one_or_none()
+    if not t:
+        return
+    if status is not None:
+        t.process_status = status
+    if progress is not None:
+        t.process_progress = progress
+    if stage is not None:
+        t.process_stage = stage
+    if message is not None:
+        t.process_message = message
+    if content is not None:
+        t.content = content
+    if assessment_report is not None:
+        t.assessment_report = assessment_report
+    await session.commit()
+
+
+async def _process_transcript_in_background(
+    candidate_id: str,
+    round: str,
+    transcript_id,
+    *,
+    audio_bytes: bytes | None = None,
+    log_tag: str = "bg_pipeline",
+) -> None:
+    """后台任务：（音频先转写→）跑完整评定流水线，全程回写进度到转写记录。
+
+    用独立 async 会话（请求会话在响应返回时已关闭）。任一环节抛错都落 failed 状态。
+    """
+    async with async_session_factory() as session:
+        async def on_progress(status: str, pct: int, stage: str):
+            await _set_transcript_progress(
+                session, transcript_id, status=status, progress=pct, stage=stage
+            )
+
+        try:
+            transcript_text = ""
+            # ── 音频：先转写（占 5-40%），再回写 content ──
+            if audio_bytes is not None:
+                await _set_transcript_progress(
+                    session, transcript_id,
+                    status="transcribing", progress=8, stage="语音转写中",
+                )
+                transcript_text = await asyncio.to_thread(_transcribe_audio_bytes, audio_bytes)
+                logger.info("[%s] 转写完成 chars=%d", log_tag, len(transcript_text))
+                await _set_transcript_progress(
+                    session, transcript_id,
+                    status="extracting", progress=40, stage="转写完成，开始分析",
+                    content=transcript_text,
+                )
+            else:
+                # 文本上传：content 已在请求阶段落库，从库里读回
+                t_result = await session.execute(
+                    select(InterviewTranscript).where(InterviewTranscript.id == transcript_id)
+                )
+                row = t_result.scalar_one_or_none()
+                transcript_text = row.content if row else ""
+
+            pipeline = await _run_transcript_pipeline(
+                session, candidate_id, round, transcript_id, transcript_text,
+                log_tag=log_tag, on_progress=on_progress,
+            )
+
+            # 完成：报告已在流水线内落库，这里补一个终态 + warning 提示
+            final_msg = pipeline.get("warning") or ""
+            await _set_transcript_progress(
+                session, transcript_id,
+                status="completed", progress=100, stage="已完成",
+                message=final_msg,
+            )
+            logger.info("[%s] 后台流水线完成 transcript_id=%s qa=%s",
+                        log_tag, transcript_id, pipeline.get("qaCount"))
+        except Exception as exc:
+            import traceback as _tb
+            logger.error("[%s] 后台流水线异常 transcript_id=%s\n%s",
+                         log_tag, transcript_id, _tb.format_exc())
+            try:
+                await _set_transcript_progress(
+                    session, transcript_id,
+                    status="failed", progress=100, stage="处理失败",
+                    message=f"处理失败: {exc}",
+                )
+            except Exception:
+                logger.exception("[%s] 写入失败状态也失败了", log_tag)
+
+
+@router.post("/interview/evaluation/{candidate_id}/transcript")
+async def upload_transcript(
+    candidate_id: str,
+    file: UploadFile = File(...),
+    round: str = Form(...),
+    db: AsyncSession = Depends(get_db),
+):
+    # Save to MinIO and parse file. We keep the bytes in memory to both upload
+    # to MinIO and extract text via a temp file (no re-download needed).
+    file_ext = os.path.splitext(file.filename or "transcript")[1] or ".txt"
+    object_key = f"interview/{uuid.uuid4()}{file_ext}"
+    content = await file.read()
+    try:
+        await asyncio.to_thread(
+            minio_storage.upload_bytes, object_key, content, "application/octet-stream"
+        )
+    except Exception as e:
+        return {"code": 500, "message": f"转写文件存储失败: {e}", "data": None}
+
+    # Extract text from the in-memory bytes via a temp file
+    import tempfile
+    fd, tmp_path = tempfile.mkstemp(suffix=file_ext)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(content)
+        transcript_text = extract_text(tmp_path)
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+    if not transcript_text or not transcript_text.strip():
+        return {"code": 400, "message": "未能从文件中提取出文本，请检查文件内容或格式", "data": None}
+
+    # Save transcript —— 每次上传创建一条新的历史记录（不再覆盖），初始为 pending
+    t = InterviewTranscript(
+        candidate_id=candidate_id,
+        round=round,
+        content=transcript_text,
+        source="upload",
+        filename=file.filename or "transcript",
+        process_status="pending",
+        process_progress=0,
+        process_stage="排队中",
+    )
+    db.add(t)
+    await db.flush()
+    transcript_id = t.id
+    await db.commit()  # 提交，让后台任务的独立会话能读到这条记录
+
+    # 立即把完整评定流水线丢到后台跑（抽问答→评分→片段→报告），前端轮询进度。
+    asyncio.create_task(_process_transcript_in_background(
+        candidate_id, round, transcript_id, audio_bytes=None, log_tag="upload_transcript",
+    ))
+
+    return {
         "code": 0,
         "message": "ok",
         "data": {
-            "transcript": transcript_text,
-            "stored": True,
-            "qaCount": qa_count,
             "transcriptId": str(transcript_id),
             "filename": file.filename or "transcript",
-            "segments": {
-                "selfIntro": seg_self_intro,
-                "reverseQuestions": seg_reverse,
-            },
-            "warning": "；".join(warnings) if warnings else "",
+            "status": "pending",
         },
     }
 
@@ -1389,6 +1750,32 @@ async def delete_transcript(
     return {"code": 0, "message": "ok", "data": None}
 
 
+@router.get("/interview/evaluation/transcript/{transcript_id}/status")
+async def get_transcript_status(
+    transcript_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """轮询一条转写记录的后台处理进度。完成时一并返回综合评定报告。"""
+    t_result = await db.execute(
+        select(InterviewTranscript).where(InterviewTranscript.id == transcript_id)
+    )
+    t = t_result.scalar_one_or_none()
+    if not t:
+        return {"code": 404, "message": "记录不存在", "data": None}
+    return {
+        "code": 0,
+        "message": "ok",
+        "data": {
+            "transcriptId": str(t.id),
+            "status": t.process_status or "completed",
+            "progress": t.process_progress if t.process_progress is not None else 100,
+            "stage": t.process_stage or "",
+            "message": t.process_message or "",
+            "assessmentReport": t.assessment_report if t.process_status == "completed" else None,
+        },
+    }
+
+
 @router.post("/interview/evaluation/{candidate_id}/transcribe")
 async def transcribe_audio(
     candidate_id: str,
@@ -1396,79 +1783,88 @@ async def transcribe_audio(
     round: str = Form(...),
     db: AsyncSession = Depends(get_db),
 ):
+    logger.info("[transcribe_audio] 收到音频上传 candidate=%s round=%s file=%s",
+                candidate_id, round, file.filename)
     allow_audio = await get_setting(db, "allowAudioUpload", True)
     if not allow_audio:
         return {"code": 403, "message": "系统已关闭音频上传功能", "data": None}
 
-    # Audio file — transcribe with FunASR Paraformer (Chinese-optimized)
     audio_bytes = await file.read()
+    if not audio_bytes:
+        return {"code": 400, "message": "音频文件为空", "data": None}
 
-    try:
-        import tempfile
-        import os as _os
+    # 建一条 pending 转写记录（content 先空，转写完成后由后台任务回写），
+    # 每次上传独立历史记录，可选择/删除，并关联本次抽取的题目与评定报告。
+    t = InterviewTranscript(
+        candidate_id=candidate_id,
+        round=round,
+        content="",
+        source="transcribe",
+        filename=file.filename or "audio",
+        process_status="pending",
+        process_progress=0,
+        process_stage="排队中",
+    )
+    db.add(t)
+    await db.flush()
+    transcript_id = t.id
 
-        # Write audio to temp WAV (FunASR pipeline accepts file path)
-        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-        try:
-            tmp.write(audio_bytes)
-            tmp.close()
+    # 标记已上传音频（供榜单「已上传音频」逻辑），本轮已有评分记录时置位
+    evals = await db.execute(
+        select(InterviewEvaluation).where(and_(
+            InterviewEvaluation.candidate_id == candidate_id,
+            InterviewEvaluation.round == round,
+        ))
+    )
+    for e in evals.scalars().all():
+        e.audio_uploaded = True
+    await db.commit()  # 提交，让后台任务独立会话能读到这条记录
 
-            # Singleton pipeline — loaded once, reused across all requests
-            from modelscope.pipelines import pipeline
-            from modelscope.utils.constant import Tasks
-            import asyncio as _asyncio
+    # 立即把「转写 + 完整评定流水线」丢到后台跑（长录音转写~90s + 多次 LLM），前端轮询进度。
+    asyncio.create_task(_process_transcript_in_background(
+        candidate_id, round, transcript_id, audio_bytes=audio_bytes, log_tag="transcribe_audio",
+    ))
 
-            asr = await _asyncio.to_thread(_get_funasr_pipeline)
-            result = await _asyncio.to_thread(asr, tmp.name)
-            # result is list[dict] when input is a file path
-            item = result[0] if isinstance(result, list) else result
-            transcribed_text = item.get("text", "").strip()
+    return {
+        "code": 0,
+        "message": "ok",
+        "data": {
+            "transcriptId": str(transcript_id),
+            "filename": file.filename or "audio",
+            "status": "pending",
+        },
+    }
 
-            if not transcribed_text:
-                transcribed_text = "[转写完成，但未识别到语音内容]"
-        finally:
-            try:
-                _os.unlink(tmp.name)
-            except OSError:
-                pass
 
-        t_result = await db.execute(
-            select(InterviewTranscript).where(and_(
+@router.post("/interview/evaluation/{candidate_id}/assessment-report")
+async def generate_assessment_report_endpoint(
+    candidate_id: str,
+    round: str = Query("first"),
+    transcriptId: Optional[str] = Query(None),
+    db: AsyncSession = Depends(get_db),
+):
+    """手动触发或重新生成全方位面试评定报告。"""
+    target_tid = transcriptId
+    if not target_tid:
+        latest = await db.execute(
+            select(InterviewTranscript.id).where(and_(
                 InterviewTranscript.candidate_id == candidate_id,
                 InterviewTranscript.round == round,
-            ))
+            )).order_by(InterviewTranscript.created_at.desc()).limit(1)
         )
-        t = t_result.scalar_one_or_none()
-        if t:
-            t.content = transcribed_text
-            t.source = "transcribe"
-        else:
-            t = InterviewTranscript(
-                candidate_id=candidate_id,
-                round=round,
-                content=transcribed_text,
-                source="transcribe",
-            )
-            db.add(t)
+        target_tid = latest.scalar_one_or_none()
+    if not target_tid:
+        return {"code": 404, "message": "未找到面试转写记录", "data": None}
 
-        # Mark as audio uploaded on evaluations
-        evals = await db.execute(
-            select(InterviewEvaluation).where(and_(
-                InterviewEvaluation.candidate_id == candidate_id,
-                InterviewEvaluation.round == round,
-            ))
+    try:
+        report = await _generate_and_save_assessment_report(
+            db, candidate_id, round, target_tid
         )
-        for e in evals.scalars().all():
-            e.audio_uploaded = True
-
-        await db.flush()
-        return {
-            "code": 0,
-            "message": "ok",
-            "data": {"transcript": transcribed_text, "stored": True},
-        }
-    except Exception as e:
-        return {"code": 500, "message": f"转写失败: {str(e)}", "data": None}
+        if not report:
+            return {"code": 400, "message": "无法生成评定报告", "data": None}
+        return {"code": 0, "message": "ok", "data": report}
+    except Exception as exc:
+        return {"code": 500, "message": f"生成失败: {exc}", "data": None}
 
 
 @router.post("/interview/evaluation/{candidate_id}/submit")
@@ -1644,7 +2040,7 @@ async def _score_question_with_llm(
 @router.post("/interview/score/{question_id}")
 async def ai_score_question(
     question_id: str,
-    body: dict,
+    body: Optional[dict] = None,
     db: AsyncSession = Depends(get_db),
 ):
     # AI 评分开关 + 手动模式拒绝
@@ -1653,13 +2049,25 @@ async def ai_score_question(
     if not ai_scoring or scoring_mode == "manual":
         return {"code": 403, "message": "当前设置不允许 AI 评分", "data": None}
 
-    answer = body.get("answer", "")
+    answer = (body or {}).get("answer", "")
     question_result = await db.execute(
         select(InterviewQuestion).where(InterviewQuestion.id == question_id)
     )
     question = question_result.scalar_one_or_none()
     if not question:
         return {"code": 404, "message": "题目不存在", "data": None}
+
+    # 前端补评分时通常不带 answer——回答已在转写抽取阶段落库到
+    # InterviewEvaluation.answer，这里回退读取，保证评分有回答上下文。
+    if not answer:
+        e_result = await db.execute(
+            select(InterviewEvaluation).where(
+                InterviewEvaluation.question_id == question.id
+            )
+        )
+        existing_eval = e_result.scalar_one_or_none()
+        if existing_eval and existing_eval.answer:
+            answer = existing_eval.answer
 
     result = await _score_question_with_llm(question, answer, db)
     return {"code": 0, "message": "ok", "data": result}
