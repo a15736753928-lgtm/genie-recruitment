@@ -15,13 +15,14 @@ from typing import Optional, List, AsyncGenerator, Any
 from fastapi import APIRouter, Depends, File, Form, Query, UploadFile, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, desc
+from sqlalchemy import select, desc, func
 from sqlalchemy.orm import selectinload
 from pydantic import BaseModel
 from openai import AsyncOpenAI
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from app.database import get_db, async_session_factory
-from app.models.agent_session import AgentSession, AgentMessage, AgentMaterial, AgentTask
+from app.models.agent_session import AgentProject, AgentSession, AgentMessage, AgentMaterial, AgentTask
+from app.models.recruitment import Candidate, Position
 from app.agent.tools import create_langchain_tools, create_langchain_tools_from_defs
 from app.agent.intent_classifier import classify_intent, get_tool_defs_for_intent
 from app.agent.supervisor_graph import classify_complexity_sync, ExecutionPlan, PlanStep
@@ -127,8 +128,19 @@ def serialize_session(s: AgentSession) -> dict:
         "id": str(s.id),
         "title": s.title or "新对话",
         "agentId": s.agent_id,
+        "projectId": str(s.project_id) if s.project_id else None,
         "createdAt": iso_utc(s.created_at),
         "updatedAt": iso_utc(s.updated_at),
+    }
+
+
+def serialize_project(p: AgentProject, session_count: int = 0) -> dict:
+    return {
+        "id": str(p.id),
+        "name": p.name,
+        "sessionCount": session_count,
+        "createdAt": iso_utc(p.created_at),
+        "updatedAt": iso_utc(p.updated_at),
     }
 
 
@@ -136,53 +148,165 @@ def serialize_session(s: AgentSession) -> dict:
 #  API Endpoints
 # ═══════════════════════════════════════════════════════════
 
-@router.get("/ai-agent/overview")
-async def get_ai_agent_overview(db: AsyncSession = Depends(get_db)):
-    """Workspace overview."""
-    # Active task
+async def _build_global_overview(db: AsyncSession) -> dict:
+    """Workspace overview for all projects (global recruitment stats)."""
+    job_hunting = (await db.execute(
+        select(func.count()).select_from(Candidate).where(Candidate.status == "job_hunting")
+    )).scalar() or 0
+    interview_count = (await db.execute(
+        select(func.count()).select_from(Candidate).where(
+            Candidate.status.in_(["passed", "first_interview", "second_interview"])
+        )
+    )).scalar() or 0
+    passed_count = (await db.execute(
+        select(func.count()).select_from(Candidate).where(Candidate.status == "passed")
+    )).scalar() or 0
+    position_count = (await db.execute(select(func.count()).select_from(Position))).scalar() or 0
+
     task_result = await db.execute(
         select(AgentTask).where(AgentTask.status == "running").limit(1)
     )
     active_task = task_result.scalar_one_or_none()
 
     return {
+        "projectId": None,
+        "projectName": None,
+        "agents": [
+            {
+                "id": aid, "name": cfg["name"], "description": cfg["description"],
+                "status": "就绪" if aid != "genie" else "全能就绪",
+                "tone": "active",
+                "icon": cfg["icon"], "iconBg": cfg["iconBg"], "iconColor": cfg["iconColor"],
+            }
+            for aid, cfg in AGENT_CONFIGS.items()
+        ],
+        "workflowSteps": [
+            {"key": "recruit", "label": "筛选", "count": int(job_hunting), "active": True, "badgeTone": "green"},
+            {"key": "interview", "label": "面试", "count": int(interview_count), "active": interview_count > 0, "badgeTone": "blue"},
+            {"key": "training", "label": "试用", "count": 0, "active": False, "badgeTone": "gray"},
+            {"key": "performance", "label": "绩效", "count": 0, "active": False, "badgeTone": "gray"},
+        ],
+        "stats": [
+            {"key": "resumes", "label": "待处理简历", "value": int(job_hunting), "hint": "求职中", "hintTone": "up"},
+            {"key": "interviews", "label": "待面试", "value": int(interview_count), "hint": "流程中", "hintTone": "default"},
+            {"key": "offers", "label": "待发offer", "value": int(passed_count), "hint": "已通过", "hintTone": "default"},
+            {"key": "positions", "label": "在招岗位", "value": int(position_count), "hint": "持续招聘", "hintTone": "up"},
+        ],
+        "suggestions": [
+            {"id": "s1", "priority": "P1", "title": "处理高匹配候选人", "description": "筛选并推进高匹配简历", "actionLabel": "查看详情"},
+            {"id": "s2", "priority": "P2", "title": "安排面试", "description": "为已通过候选人安排面试", "actionLabel": "立即安排"},
+        ],
+        "teamDynamics": [],
+        "teamOutput": {"completedTasks": 0, "savedHours": "0h"},
+        "activeTask": {
+            "title": active_task.title, "description": active_task.description or "",
+            "progress": active_task.progress or 0, "elapsed": "刚刚开始",
+        } if active_task else None,
+        "collaborationSteps": [],
+        "phaseResults": [],
+    }
+
+
+async def _build_project_overview(db: AsyncSession, project_id: str) -> dict | None:
+    """Workspace overview scoped to one project folder."""
+    result = await db.execute(select(AgentProject).where(AgentProject.id == project_id))
+    project = result.scalar_one_or_none()
+    if not project:
+        return None
+
+    session_rows = await db.execute(
+        select(AgentSession.id).where(AgentSession.project_id == project_id)
+    )
+    session_ids = [row[0] for row in session_rows.all()]
+
+    session_count = len(session_ids)
+    message_count = 0
+    material_count = 0
+    resume_count = 0
+    completed_tasks = 0
+    active_task = None
+
+    if session_ids:
+        message_count = (await db.execute(
+            select(func.count()).select_from(AgentMessage).where(
+                AgentMessage.session_id.in_(session_ids)
+            )
+        )).scalar() or 0
+        material_count = (await db.execute(
+            select(func.count()).select_from(AgentMaterial).where(
+                AgentMaterial.session_id.in_(session_ids)
+            )
+        )).scalar() or 0
+        resume_count = (await db.execute(
+            select(func.count()).select_from(AgentMaterial).where(
+                AgentMaterial.session_id.in_(session_ids),
+                AgentMaterial.type == "resume",
+            )
+        )).scalar() or 0
+        completed_tasks = (await db.execute(
+            select(func.count()).select_from(AgentTask).where(
+                AgentTask.session_id.in_(session_ids),
+                AgentTask.status == "completed",
+            )
+        )).scalar() or 0
+        task_result = await db.execute(
+            select(AgentTask)
+            .where(AgentTask.session_id.in_(session_ids), AgentTask.status == "running")
+            .limit(1)
+        )
+        active_task = task_result.scalar_one_or_none()
+
+    base = await _build_global_overview(db)
+    base["projectId"] = str(project.id)
+    base["projectName"] = project.name
+    base["workflowSteps"] = [
+        {"key": "recruit", "label": "对话", "count": session_count, "active": True, "badgeTone": "green"},
+        {"key": "interview", "label": "消息", "count": int(message_count), "active": message_count > 0, "badgeTone": "blue"},
+        {"key": "training", "label": "资料", "count": int(material_count), "active": material_count > 0, "badgeTone": "gray"},
+        {"key": "performance", "label": "简历", "count": int(resume_count), "active": resume_count > 0, "badgeTone": "gray"},
+    ]
+    base["stats"] = [
+        {"key": "sessions", "label": "项目对话", "value": session_count, "hint": project.name, "hintTone": "default"},
+        {"key": "messages", "label": "消息轮次", "value": int(message_count), "hint": "累计往返", "hintTone": "default"},
+        {"key": "materials", "label": "上传资料", "value": int(material_count), "hint": "含简历/JD", "hintTone": "up"},
+        {"key": "tasks", "label": "已完成任务", "value": int(completed_tasks), "hint": "本项目内", "hintTone": "default"},
+    ]
+    base["suggestions"] = [
+        {
+            "id": "p1",
+            "priority": "P1",
+            "title": f"在「{project.name}」继续推进",
+            "description": f"当前 {session_count} 个对话、{resume_count} 份简历",
+            "actionLabel": "新建对话",
+        },
+    ]
+    base["teamOutput"] = {"completedTasks": int(completed_tasks), "savedHours": f"{int(message_count * 0.1)}h"}
+    base["activeTask"] = {
+        "title": active_task.title,
+        "description": active_task.description or "",
+        "progress": active_task.progress or 0,
+        "elapsed": "进行中",
+    } if active_task else None
+    return base
+
+
+@router.get("/ai-agent/overview")
+async def get_ai_agent_overview(
+    projectId: Optional[str] = Query(None),
+    db: AsyncSession = Depends(get_db),
+):
+    """Workspace overview, optionally scoped to a project folder."""
+    if projectId:
+        data = await _build_project_overview(db, projectId)
+        if data is None:
+            return {"code": 404, "message": "项目不存在", "data": None}
+    else:
+        data = await _build_global_overview(db)
+
+    return {
         "code": 0,
         "message": "ok",
-        "data": {
-            "agents": [
-                {
-                    "id": aid, "name": cfg["name"], "description": cfg["description"],
-                    "status": "就绪" if aid != "genie" else "全能就绪",
-                    "tone": "active",
-                    "icon": cfg["icon"], "iconBg": cfg["iconBg"], "iconColor": cfg["iconColor"],
-                }
-                for aid, cfg in AGENT_CONFIGS.items()
-            ],
-            "workflowSteps": [
-                {"key": "recruit", "label": "筛选", "count": 0, "active": True, "badgeTone": "green"},
-                {"key": "interview", "label": "面试", "count": 0, "active": False, "badgeTone": "blue"},
-                {"key": "training", "label": "试用", "count": 0, "active": False, "badgeTone": "gray"},
-                {"key": "performance", "label": "绩效", "count": 0, "active": False, "badgeTone": "gray"},
-            ],
-            "stats": [
-                {"key": "resumes", "label": "待处理简历", "value": 0, "hint": "今日新增", "hintTone": "up"},
-                {"key": "interviews", "label": "待面试", "value": 0, "hint": "本周安排", "hintTone": "default"},
-                {"key": "offers", "label": "待发offer", "value": 0, "hint": "审批中", "hintTone": "default"},
-                {"key": "hours", "label": "AI节省工时", "value": "0h", "hint": "本月累计", "hintTone": "up"},
-            ],
-            "suggestions": [
-                {"id": "s1", "priority": "P1", "title": "处理高匹配候选人", "description": "有3位候选人匹配度超过90分", "actionLabel": "查看详情"},
-                {"id": "s2", "priority": "P2", "title": "安排面试", "description": "5位候选人等待一面安排", "actionLabel": "立即安排"},
-            ],
-            "teamDynamics": [],
-            "teamOutput": {"completedTasks": 0, "savedHours": "0h"},
-            "activeTask": {
-                "title": active_task.title, "description": active_task.description or "",
-                "progress": active_task.progress or 0, "elapsed": "刚刚开始",
-            } if active_task else None,
-            "collaborationSteps": [],
-            "phaseResults": [],
-        },
+        "data": data,
     }
 
 
@@ -220,18 +344,148 @@ async def list_sessions(
     }
 
 
+@router.get("/ai-agent/projects")
+async def list_projects(
+    db: AsyncSession = Depends(get_db),
+):
+    """List agent conversation projects with session counts."""
+    from sqlalchemy import func
+
+    count_subq = (
+        select(
+            AgentSession.project_id.label("project_id"),
+            func.count(AgentSession.id).label("session_count"),
+        )
+        .where(AgentSession.project_id.isnot(None))
+        .group_by(AgentSession.project_id)
+        .subquery()
+    )
+    result = await db.execute(
+        select(AgentProject, count_subq.c.session_count)
+        .outerjoin(count_subq, AgentProject.id == count_subq.c.project_id)
+        .order_by(desc(AgentProject.updated_at))
+    )
+    rows = result.all()
+    return {
+        "code": 0,
+        "message": "ok",
+        "data": [
+            serialize_project(project, int(session_count or 0))
+            for project, session_count in rows
+        ],
+    }
+
+
+class CreateProjectRequest(BaseModel):
+    name: str
+
+
+@router.post("/ai-agent/projects")
+async def create_project(
+    body: CreateProjectRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    name = (body.name or "").strip()
+    if not name:
+        return {"code": 400, "message": "项目名称不能为空", "data": None}
+    if len(name) > 64:
+        return {"code": 400, "message": "项目名称过长（最多 64 字）", "data": None}
+
+    project = AgentProject(name=name)
+    db.add(project)
+    await db.flush()
+    await db.refresh(project)
+    return {
+        "code": 0,
+        "message": "ok",
+        "data": serialize_project(project, 0),
+    }
+
+
+class RenameProjectRequest(BaseModel):
+    name: str
+
+
+@router.patch("/ai-agent/projects/{project_id}")
+async def rename_project(
+    project_id: str,
+    body: RenameProjectRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    name = (body.name or "").strip()
+    if not name:
+        return {"code": 400, "message": "项目名称不能为空", "data": None}
+    if len(name) > 64:
+        return {"code": 400, "message": "项目名称过长（最多 64 字）", "data": None}
+
+    result = await db.execute(
+        select(AgentProject).where(AgentProject.id == project_id)
+    )
+    project = result.scalar_one_or_none()
+    if not project:
+        return {"code": 404, "message": "项目不存在", "data": None}
+
+    project.name = name
+    project.updated_at = datetime.utcnow()
+    await db.flush()
+    return {
+        "code": 0,
+        "message": "ok",
+        "data": serialize_project(project),
+    }
+
+
+@router.delete("/ai-agent/projects/{project_id}")
+async def delete_project(
+    project_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(AgentProject).where(AgentProject.id == project_id)
+    )
+    project = result.scalar_one_or_none()
+    if not project:
+        return {"code": 404, "message": "项目不存在", "data": None}
+
+    # Sessions become ungrouped; FK ondelete=SET NULL also handles this.
+    await db.delete(project)
+    return {"code": 0, "message": "ok", "data": None}
+
+
+class CreateSessionRequest(BaseModel):
+    projectId: Optional[str] = None
+
+
 @router.post("/ai-agent/sessions")
 async def create_session(
+    body: Optional[CreateSessionRequest] = None,
     db: AsyncSession = Depends(get_db),
 ):
     """Create a new empty chat session."""
+    project_id = None
+    if body and body.projectId:
+        proj_result = await db.execute(
+            select(AgentProject).where(AgentProject.id == body.projectId)
+        )
+        project = proj_result.scalar_one_or_none()
+        if not project:
+            return {"code": 404, "message": "项目不存在", "data": None}
+        project_id = project.id
+
     session = AgentSession(
         title="新对话",
         agent_id="genie",
+        project_id=project_id,
     )
     db.add(session)
     await db.flush()
     await db.refresh(session)
+
+    if project_id:
+        proj = await db.get(AgentProject, project_id)
+        if proj:
+            proj.updated_at = datetime.utcnow()
+
     return {
         "code": 0,
         "message": "ok",
@@ -265,23 +519,18 @@ async def delete_session(
     return {"code": 0, "message": "ok", "data": None}
 
 
-class RenameSessionRequest(BaseModel):
-    title: str
+class PatchSessionRequest(BaseModel):
+    title: Optional[str] = None
+    projectId: Optional[str] = None
 
 
 @router.patch("/ai-agent/sessions/{session_id}")
-async def rename_session(
+async def patch_session(
     session_id: str,
-    body: RenameSessionRequest,
+    body: PatchSessionRequest,
     db: AsyncSession = Depends(get_db),
 ):
-    """重命名对话（支持用户自定义对话名称）。"""
-    new_title = (body.title or "").strip()
-    if not new_title:
-        return {"code": 400, "message": "对话名称不能为空", "data": None}
-    if len(new_title) > 100:
-        return {"code": 400, "message": "对话名称过长（最多 100 字）", "data": None}
-
+    """更新对话名称或所属项目。"""
     result = await db.execute(
         select(AgentSession).where(AgentSession.id == session_id)
     )
@@ -289,7 +538,27 @@ async def rename_session(
     if not session:
         return {"code": 404, "message": "对话不存在", "data": None}
 
-    session.title = new_title
+    if body.title is not None:
+        new_title = body.title.strip()
+        if not new_title:
+            return {"code": 400, "message": "对话名称不能为空", "data": None}
+        if len(new_title) > 100:
+            return {"code": 400, "message": "对话名称过长（最多 100 字）", "data": None}
+        session.title = new_title
+
+    if body.projectId is not None:
+        if body.projectId == "":
+            session.project_id = None
+        else:
+            proj_result = await db.execute(
+                select(AgentProject).where(AgentProject.id == body.projectId)
+            )
+            project = proj_result.scalar_one_or_none()
+            if not project:
+                return {"code": 404, "message": "项目不存在", "data": None}
+            session.project_id = project.id
+            project.updated_at = datetime.utcnow()
+
     session.updated_at = datetime.utcnow()
     await db.flush()
     return {

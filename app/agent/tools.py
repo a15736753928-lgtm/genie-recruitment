@@ -919,6 +919,7 @@ def get_tools_for_agent(agent_id: str = "recruit") -> List[dict]:
 import inspect
 from typing import get_type_hints
 from pydantic import create_model, Field
+from app.database import async_session_factory
 
 
 _JSON_TYPE_MAP = {

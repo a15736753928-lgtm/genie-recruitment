@@ -7,6 +7,7 @@ formulate its response to the user.  Separated from agent_chat.py so the
 
 from __future__ import annotations
 
+import json
 import logging
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.middleware.trace import get_trace_id

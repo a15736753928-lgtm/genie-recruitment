@@ -11,7 +11,7 @@ from app.models.knowledge import (
     KnowledgeCategory, KnowledgeItem
 )
 from app.models.agent_session import (
-    AgentSession, AgentMessage, AgentMaterial, AgentTask
+    AgentProject, AgentSession, AgentMessage, AgentMaterial, AgentTask
 )
 from app.models.settings import SystemSetting, AuditLog
 
@@ -22,6 +22,6 @@ __all__ = [
     "Employee", "ProbationTask",
     "PerformanceRecord", "PerformanceQuarter",
     "KnowledgeCategory", "KnowledgeItem",
-    "AgentSession", "AgentMessage", "AgentMaterial", "AgentTask",
+    "AgentProject", "AgentSession", "AgentMessage", "AgentMaterial", "AgentTask",
     "SystemSetting", "AuditLog",
 ]

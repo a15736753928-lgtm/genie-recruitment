@@ -87,7 +87,7 @@ async def list_resumes(
     minScore: Optional[int] = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
-    query = select(Candidate).options(*CANDIDATE_LIST_OPTIONS)
+    query = select(Candidate).options(*CANDIDATE_LOAD_OPTIONS)
 
     # Filter by position
     if positionId and positionId != "all":

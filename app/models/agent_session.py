@@ -8,15 +8,33 @@ from sqlalchemy.orm import relationship
 from app.database import Base
 
 
+class AgentProject(Base):
+    """Agent 对话项目分组（类似 Codex 的 Project）。"""
+    __tablename__ = "agent_projects"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name = Column(String(64), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    sessions = relationship("AgentSession", back_populates="project")
+
+
 class AgentSession(Base):
     __tablename__ = "agent_sessions"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     title = Column(String(128))
     agent_id = Column(String(32))
+    project_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("agent_projects.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
+    project = relationship("AgentProject", back_populates="sessions")
     messages = relationship("AgentMessage", back_populates="session", cascade="all, delete-orphan")
     tasks = relationship("AgentTask", back_populates="session", cascade="all, delete-orphan")
     materials = relationship("AgentMaterial", back_populates="session", cascade="all, delete-orphan")

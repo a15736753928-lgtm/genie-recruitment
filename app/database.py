@@ -67,6 +67,8 @@ def get_sync_db() -> _SyncSession:
 
 async def init_db():
     """Create all tables and apply pending migrations."""
+    import app.models  # noqa: F401 — register all ORM tables before create_all
+
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         # Auto-migration: add owner_id column to existing knowledge_bases tables
@@ -169,6 +171,30 @@ def _migrate_audit_logs(connection) -> None:
     ))
 
 
+def _ensure_agent_projects_table(connection) -> None:
+    """Create agent_projects if missing (covers DBs initialized before the model existed)."""
+    from sqlalchemy import text
+
+    exists = connection.execute(text(
+        "SELECT EXISTS ("
+        "  SELECT 1 FROM information_schema.tables"
+        "  WHERE table_schema = 'public' AND table_name = 'agent_projects'"
+        ")"
+    )).scalar()
+    if exists:
+        return
+
+    connection.execute(text("SET LOCAL lock_timeout = '3s'"))
+    connection.execute(text(
+        "CREATE TABLE agent_projects ("
+        "  id UUID PRIMARY KEY,"
+        "  name VARCHAR(64) NOT NULL,"
+        "  created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW(),"
+        "  updated_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()"
+        ")"
+    ))
+
+
 def _run_migrations(connection):
     """Idempotent schema migrations for existing databases."""
     # v1: Add owner_id column for KB ownership (security)
@@ -200,6 +226,15 @@ def _run_migrations(connection):
         "ix_candidates_resume_file_hash",
         "candidates",
         "resume_file_hash",
+    )
+    # v11: Agent 对话项目分组
+    _ensure_agent_projects_table(connection)
+    _add_column_if_missing(connection, "agent_sessions", "project_id", "UUID NULL")
+    _ensure_index_if_missing(
+        connection,
+        "ix_agent_sessions_project_id",
+        "agent_sessions",
+        "project_id",
     )
 
 
