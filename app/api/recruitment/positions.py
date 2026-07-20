@@ -3,43 +3,47 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from app.database import get_db
 from app.models.recruitment import Position, Candidate, PositionQuestion
 router = APIRouter(tags=["岗位"])
 
 
 class CreatePositionRequest(BaseModel):
+    model_config = {"populate_by_name": True}
+
     name: str
     department: Optional[str] = None
-    jd_responsibilities: Optional[str] = None
-    jd_requirements: Optional[str] = None
-    jd_preferred: Optional[str] = None
-    jd_tech_stack: Optional[str] = None
-    education_requirement: Optional[str] = None
-    experience_requirement: Optional[str] = None
-    age_requirement: Optional[str] = None
-    salary_range: Optional[str] = None
+    jd_responsibilities: Optional[str] = Field(None, alias="jdResponsibilities")
+    jd_requirements: Optional[str] = Field(None, alias="jdRequirements")
+    jd_preferred: Optional[str] = Field(None, alias="jdPreferred")
+    jd_tech_stack: Optional[str] = Field(None, alias="jdTechStack")
+    education_requirement: Optional[str] = Field(None, alias="educationRequirement")
+    experience_requirement: Optional[str] = Field(None, alias="experienceRequirement")
+    age_requirement: Optional[str] = Field(None, alias="ageRequirement")
+    salary_range: Optional[str] = Field(None, alias="salaryRange")
 
 
 class UpdatePositionRequest(BaseModel):
+    model_config = {"populate_by_name": True}
+
     name: Optional[str] = None
     department: Optional[str] = None
-    jd_responsibilities: Optional[str] = None
-    jd_requirements: Optional[str] = None
-    jd_preferred: Optional[str] = None
-    jd_tech_stack: Optional[str] = None
-    education_requirement: Optional[str] = None
-    experience_requirement: Optional[str] = None
-    age_requirement: Optional[str] = None
-    salary_range: Optional[str] = None
-    screening_criteria: Optional[dict] = None
-    interview_criteria_r1: Optional[dict] = None
-    interview_criteria_r2: Optional[dict] = None
-    week1_project_requirement: Optional[dict] = None
-    weeks_2_4_plan: Optional[dict] = None
-    later_week_scoring: Optional[dict] = None
-    conversion_criteria: Optional[dict] = None
+    jd_responsibilities: Optional[str] = Field(None, alias="jdResponsibilities")
+    jd_requirements: Optional[str] = Field(None, alias="jdRequirements")
+    jd_preferred: Optional[str] = Field(None, alias="jdPreferred")
+    jd_tech_stack: Optional[str] = Field(None, alias="jdTechStack")
+    education_requirement: Optional[str] = Field(None, alias="educationRequirement")
+    experience_requirement: Optional[str] = Field(None, alias="experienceRequirement")
+    age_requirement: Optional[str] = Field(None, alias="ageRequirement")
+    salary_range: Optional[str] = Field(None, alias="salaryRange")
+    screening_criteria: Optional[dict] = Field(None, alias="screeningCriteria")
+    interview_criteria_r1: Optional[dict] = Field(None, alias="interviewCriteriaR1")
+    interview_criteria_r2: Optional[dict] = Field(None, alias="interviewCriteriaR2")
+    week1_project_requirement: Optional[dict] = Field(None, alias="week1ProjectRequirement")
+    weeks_2_4_plan: Optional[dict] = Field(None, alias="weeks24Plan")
+    later_week_scoring: Optional[dict] = Field(None, alias="laterWeekScoring")
+    conversion_criteria: Optional[dict] = Field(None, alias="conversionCriteria")
 
 
 def serialize_position(p: Position) -> dict:

@@ -746,6 +746,47 @@ TOOL_REGISTRY = {
             "required": ["fields"],
         },
     },
+
+    # ── Database direct-access tools (natural-language CRUD) ──
+    "db_list_tables": {
+        "name": "db_list_tables",
+        "description": "列出数据库中所有表名。修改数据库前先用此工具了解有哪些表。",
+        "parameters": {"type": "object", "properties": {}},
+    },
+    "db_describe_table": {
+        "name": "db_describe_table",
+        "description": "查看某张表的列名、类型、是否可空。修改数据前先了解表结构。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "table": {"type": "string", "description": "表名，如 positions/candidates/employees"},
+            },
+            "required": ["table"],
+        },
+    },
+    "db_query": {
+        "name": "db_query",
+        "description": "执行只读 SQL 查询（仅支持 SELECT）。用于查看表中数据、按条件筛选、验证修改结果。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "sql": {"type": "string", "description": "SELECT 查询语句"},
+                "limit": {"type": "integer", "description": "返回行数上限，默认20"},
+            },
+            "required": ["sql"],
+        },
+    },
+    "db_update": {
+        "name": "db_update",
+        "description": "直接修改数据库中任意表的任意字段。支持 UPDATE/INSERT/DELETE。用户说「改数据库」时用此工具。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "sql": {"type": "string", "description": "要执行的 SQL（UPDATE/INSERT/DELETE）。UPDATE 和 DELETE 必须包含 WHERE 条件。执行后会自动 COMMIT。"},
+            },
+            "required": ["sql"],
+        },
+    },
 }
 
 

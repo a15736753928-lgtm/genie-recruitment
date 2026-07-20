@@ -9,9 +9,37 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import asyncio
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.infrastructure import minio_storage
+
+
+def _camel_to_snake(name: str) -> str:
+    """Convert camelCase or PascalCase to snake_case.
+
+    >>> _camel_to_snake("jdRequirements")
+    'jd_requirements'
+    >>> _camel_to_snake("interviewCriteriaR1")
+    'interview_criteria_r1'
+    >>> _camel_to_snake("weeks24Plan")
+    'weeks_2_4_plan'
+    """
+    # Insert underscore before capital letters that follow lowercase or digits
+    s = re.sub(r"([a-z\d])([A-Z])", r"\1_\2", name)
+    # Insert underscore between digit sequences and letters
+    s = re.sub(r"(\d+)([A-Za-z])", r"\1_\2", s)
+    s = re.sub(r"([A-Za-z])(\d+)", r"\1_\2", s)
+    return s.lower()
+
+
+def _convert_keys(obj: dict, converter=_camel_to_snake) -> dict:
+    """Recursively convert dict keys using *converter*."""
+    result = {}
+    for k, v in obj.items():
+        new_key = converter(k)
+        result[new_key] = _convert_keys(v, converter) if isinstance(v, dict) else v
+    return result
 
 
 def sse_event(event_type: str, data: dict) -> str:
@@ -207,18 +235,93 @@ async def execute_tool_call(tool_name: str, params: dict, db: AsyncSession) -> s
             return "\n".join(lines)
 
         elif tool_name == "create_position":
-            from app.api.recruitment.positions import create_position as fn, CreatePositionRequest
-            req = CreatePositionRequest(**params)
-            result = await fn(req=req, db=db)
-            if result["code"] == 0:
-                return f"已创建岗位「{params['name']}」"
-            return f"创建失败：{result.get('message', '')}"
+            from sqlalchemy import text as sa_text
+            col_map = {
+                "name": "name", "department": "department",
+                "jdResponsibilities": "jd_responsibilities",
+                "jdRequirements": "jd_requirements",
+                "jdPreferred": "jd_preferred",
+                "jdTechStack": "jd_tech_stack",
+                "educationRequirement": "education_requirement",
+                "experienceRequirement": "experience_requirement",
+                "ageRequirement": "age_requirement",
+                "salaryRange": "salary_range",
+            }
+            columns = []
+            values = {}
+            for camel_key, value in params.items():
+                col = col_map.get(camel_key)
+                if col and value is not None:
+                    columns.append(col)
+                    values[col] = value
+            if not columns:
+                return "创建失败：没有提供有效字段"
+            placeholders = ", ".join(f":{c}" for c in columns)
+            cols_str = ", ".join(columns)
+            sql = f"INSERT INTO positions ({cols_str}) VALUES ({placeholders}) RETURNING id"
+            result = await db.execute(sa_text(sql), values)
+            row = result.fetchone()
+            new_id = str(row[0]) if row else "?"
+            await db.flush()
+            return f"已创建岗位「{params.get('name', '未命名')}」(ID: {new_id})"
 
         elif tool_name == "update_position":
-            from app.api.recruitment.positions import update_position as fn, UpdatePositionRequest
-            req = UpdatePositionRequest(**params.get("fields", {}))
-            result = await fn(position_id=params["id"], req=req, db=db)
-            return f"已更新岗位 {params['id']}" if result["code"] == 0 else f"更新失败：{result.get('message', '')}"
+            from sqlalchemy import text as sa_text
+            fields = params.get("fields", {})
+            position_id = params["id"]
+            col_map = {
+                "name": "name", "department": "department",
+                "jdResponsibilities": "jd_responsibilities",
+                "jdRequirements": "jd_requirements",
+                "jdPreferred": "jd_preferred",
+                "jdTechStack": "jd_tech_stack",
+                "educationRequirement": "education_requirement",
+                "experienceRequirement": "experience_requirement",
+                "ageRequirement": "age_requirement",
+                "salaryRange": "salary_range",
+                "screeningCriteria": "screening_criteria",
+                "interviewCriteriaR1": "interview_criteria_r1",
+                "interviewCriteriaR2": "interview_criteria_r2",
+                "week1ProjectRequirement": "week1_project_requirement",
+                "weeks24Plan": "weeks_2_4_plan",
+                "laterWeekScoring": "later_week_scoring",
+                "conversionCriteria": "conversion_criteria",
+            }
+            set_clauses = []
+            values = {"id": position_id}
+            for camel_key, value in fields.items():
+                col = col_map.get(camel_key)
+                if col and value is not None:
+                    set_clauses.append(f"{col} = :{col}")
+                    # JSON fields: dump to string if dict
+                    if isinstance(value, dict):
+                        values[col] = json.dumps(value, ensure_ascii=False)
+                    else:
+                        values[col] = value
+            if not set_clauses:
+                return "没有可更新的字段（提供的字段名可能不正确）"
+            sql = f"UPDATE positions SET {', '.join(set_clauses)} WHERE id = :id"
+            result = await db.execute(sa_text(sql), values)
+            await db.flush()
+            rowcount = result.rowcount
+            # Verify: read back the updated columns
+            verify_cols = ", ".join(col_map[c] for c in fields if c in col_map)
+            previews = []
+            if verify_cols:
+                verify = await db.execute(
+                    sa_text(f"SELECT {verify_cols} FROM positions WHERE id = :id"),
+                    {"id": position_id},
+                )
+                row = verify.fetchone()
+                if row:
+                    for i, col_name in enumerate(verify_cols.split(", ")):
+                        val = row[i]
+                        preview = (str(val) or "")[:80]
+                        previews.append(f"{col_name}={preview}")
+            preview_text = "; ".join(previews) if previews else "ok"
+            return (
+                f"已更新岗位，影响 {rowcount} 行。回读验证: {preview_text}"
+            )
 
         elif tool_name == "delete_position":
             from app.api.recruitment.positions import delete_position as fn
@@ -625,6 +728,83 @@ async def execute_tool_call(tool_name: str, params: dict, db: AsyncSession) -> s
             from app.api.system.settings import update_settings as fn
             result = await fn(body=params.get("fields", {}), db=db)
             return f"已更新系统设置" if result["code"] == 0 else f"更新失败：{result.get('message', '')}"
+
+        # ── Database direct access (natural-language CRUD) ──
+
+        elif tool_name == "db_list_tables":
+            from sqlalchemy import text
+            result = await db.execute(text(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema = 'public' ORDER BY table_name"
+            ))
+            tables = [row[0] for row in result.fetchall()]
+            if not tables:
+                return "数据库中没有找到任何表"
+            lines = [f"数据库共 {len(tables)} 张表："]
+            for t in tables:
+                lines.append(f"  - {t}")
+            return "\n".join(lines)
+
+        elif tool_name == "db_describe_table":
+            from sqlalchemy import text
+            table = params["table"]
+            result = await db.execute(text(
+                "SELECT column_name, data_type, is_nullable, column_default "
+                "FROM information_schema.columns "
+                "WHERE table_schema = 'public' AND table_name = :tbl "
+                "ORDER BY ordinal_position"
+            ), {"tbl": table})
+            rows = result.fetchall()
+            if not rows:
+                return f"表「{table}」不存在或没有列"
+            lines = [f"表「{table}」结构（共 {len(rows)} 列）："]
+            for col in rows:
+                nullable = "可空" if col[2] == "YES" else "非空"
+                default = f" 默认={col[3]}" if col[3] else ""
+                lines.append(f"  {col[0]:30s} {col[1]:20s} {nullable}{default}")
+            return "\n".join(lines)
+
+        elif tool_name == "db_query":
+            from sqlalchemy import text as sa_text
+            sql = params["sql"].strip()
+            sql_upper = sql.upper()
+            if not sql_upper.startswith("SELECT"):
+                return "❌ db_query 只允许执行 SELECT 查询。如需修改数据请使用 db_update。"
+            if any(kw in sql_upper for kw in ("DROP", "DELETE", "UPDATE", "INSERT", "ALTER", "TRUNCATE")):
+                return "❌ db_query 只允许只读的 SELECT 查询。如需修改数据请使用 db_update。"
+            limit = params.get("limit", 20)
+            if "LIMIT" not in sql_upper:
+                sql = f"{sql.rstrip(';')} LIMIT {limit}"
+            result = await db.execute(sa_text(sql))
+            rows = result.fetchall()
+            cols = list(result.keys())
+            if not rows:
+                return "查询结果为空"
+            lines = [f"查询返回 {len(rows)} 行（列: {', '.join(cols)}）："]
+            for i, row in enumerate(rows):
+                cells = ", ".join(f"{cols[j]}={row[j]!r}" for j in range(len(cols)))
+                lines.append(f"  [{i+1}] {cells}")
+            return "\n".join(lines)
+
+        elif tool_name == "db_update":
+            from sqlalchemy import text as sa_text
+            sql = params["sql"].strip()
+            sql_upper = sql.upper()
+            # Safety: UPDATE/DELETE must have WHERE
+            if sql_upper.startswith("UPDATE") or sql_upper.startswith("DELETE"):
+                if "WHERE" not in sql_upper:
+                    return (
+                        "❌ 安全限制：UPDATE 和 DELETE 必须包含 WHERE 条件，"
+                        "禁止全表修改。请加上 WHERE 后重试。"
+                    )
+            if sql_upper.startswith("SELECT"):
+                return "❌ db_update 用于写操作。查询请使用 db_query。"
+            # Execute
+            result = await db.execute(sa_text(sql))
+            # Flush first so rowcount is available, then commit via the caller
+            await db.flush()
+            rowcount = result.rowcount if hasattr(result, 'rowcount') else "?"
+            return f"✅ SQL 执行成功，影响 {rowcount} 行。已提交到数据库。你可以用 db_query 验证结果。"
 
         else:
             return f"工具 {tool_name} 执行完成"

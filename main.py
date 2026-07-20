@@ -1,6 +1,14 @@
 """Genie 招聘系统 - 启动入口"""
+import asyncio
 import os
+import sys
+
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+
+# Windows 默认 ProactorEventLoop 在客户端提前断开连接时会在日志里刷
+# ConnectionResetError (WinError 10054)，接口本身往往已成功返回 200。
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 import uvicorn
 from app.config import get_settings
