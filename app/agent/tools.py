@@ -47,11 +47,25 @@ TOOL_REGISTRY = {
     },
     "get_resume": {
         "name": "get_resume",
-        "description": "获取单个候选人的详细信息（含 AI 分析）。仅当用户明确要求查看某位候选人简历/详情时调用；查岗位 JD 时禁止调用。",
+        "description": (
+            "获取候选人信息。按意图选字段，不要默认拉全量。"
+            "view: summary|core|detail|contact|screening|interview|full；"
+            "或 fields 指定字段列表。改状态/联系方式前先用合适 view 确认 id。"
+        ),
         "parameters": {
             "type": "object",
             "properties": {
-                "id": {"type": "string", "description": "候选人 UUID（必须是 list_resumes 返回的真实 id，禁止编造如 resume-trade）"},
+                "id": {"type": "string", "description": "候选人 UUID（必须是 list_resumes 返回的真实 id）"},
+                "view": {
+                    "type": "string",
+                    "description": "summary|core|detail|contact|screening|interview|full，默认 detail",
+                },
+                "fields": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "精确字段列表，优先于 view",
+                },
+                "purpose": {"type": "string", "description": "本轮用户意图摘要，用于自动选字段"},
             },
             "required": ["id"],
         },
@@ -124,11 +138,26 @@ TOOL_REGISTRY = {
     # Position tools (write)
     "get_position": {
         "name": "get_position",
-        "description": "获取单个岗位 JD 详情（职责/任职要求/加分项/技术栈）。用户说「查看XX岗位JD」时用此工具；不要同时查候选人。",
+        "description": (
+            "获取岗位信息。按意图选字段，默认 core（含学历/经验/年龄/薪资独立字段 + JD 正文）。"
+            "view: summary|core|jd|requirements|edit|criteria|probation_plan|full；"
+            "或 fields 指定字段。改学历必须先看到 educationRequirement 字段再 update_position。"
+            "用户说「查看XX岗位JD」时用此工具；不要同时查候选人。"
+        ),
         "parameters": {
             "type": "object",
             "properties": {
                 "id": {"type": "string", "description": "岗位 UUID（来自 list_positions）"},
+                "view": {
+                    "type": "string",
+                    "description": "summary|core|jd|requirements|edit|criteria|probation_plan|full",
+                },
+                "fields": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "精确字段列表（如 [\"educationRequirement\",\"salaryRange\"]），优先于 view",
+                },
+                "purpose": {"type": "string", "description": "本轮用户意图摘要，用于自动选字段"},
             },
             "required": ["id"],
         },
@@ -354,11 +383,17 @@ TOOL_REGISTRY = {
     },
     "get_probation_employee": {
         "name": "get_probation_employee",
-        "description": "获取单个试用期员工详情（含任务、周报、转正评估）。",
+        "description": (
+            "获取试用期员工信息。按意图选字段，默认 core（日期/导师/周考/转正/AI分）。"
+            "view: summary|core|tasks|week1|conversion|full；或 fields 指定字段。"
+        ),
         "parameters": {
             "type": "object",
             "properties": {
                 "id": {"type": "string", "description": "员工ID"},
+                "view": {"type": "string", "description": "summary|core|tasks|week1|conversion|full"},
+                "fields": {"type": "array", "items": {"type": "string"}, "description": "精确字段列表"},
+                "purpose": {"type": "string", "description": "本轮用户意图摘要"},
             },
             "required": ["id"],
         },
@@ -761,16 +796,27 @@ TOOL_REGISTRY = {
     # System
     "get_settings": {
         "name": "get_settings",
-        "description": "获取系统设置。",
-        "parameters": {"type": "object", "properties": {}},
-    },
-    "update_settings": {
-        "name": "update_settings",
-        "description": "更新系统设置（如公司名、自动解析开关、合格分数线、试用期天数等）。",
+        "description": (
+            "获取系统设置。按意图选字段，默认 core。"
+            "view: summary|core|scoring|ai|notify|full；或 fields 指定 key。"
+            "修改前先 get 再 update_settings，key 必须与返回的 [字段: xxx] 一致。"
+        ),
         "parameters": {
             "type": "object",
             "properties": {
-                "fields": {"type": "object", "description": "要更新的设置字段，如 companyName/autoParseResume/minMatchScore 等"},
+                "view": {"type": "string", "description": "summary|core|scoring|ai|notify|full"},
+                "fields": {"type": "array", "items": {"type": "string"}, "description": "精确设置 key 列表"},
+                "purpose": {"type": "string", "description": "本轮用户意图摘要"},
+            },
+        },
+    },
+    "update_settings": {
+        "name": "update_settings",
+        "description": "更新系统设置。fields 的 key 必须来自 get_settings 返回的字段名（如 minMatchScore/passScoreThreshold/probationDays）。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "fields": {"type": "object", "description": "要更新的设置字段 key→value"},
             },
             "required": ["fields"],
         },

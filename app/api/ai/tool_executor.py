@@ -13,6 +13,10 @@ import re
 import asyncio
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.infrastructure import minio_storage
+from app.agent.field_profiles import (
+    POSITION_FIELDS, RESUME_FIELDS, PROBATION_FIELDS, SETTINGS_FIELDS,
+    resolve_fields, format_projected, parse_fields_param,
+)
 
 
 def _camel_to_snake(name: str) -> str:
@@ -87,58 +91,18 @@ async def execute_tool_call(tool_name: str, params: dict, db: AsyncSession) -> s
             from app.api.recruitment.resumes import get_resume as fn
             result = await fn(resume_id=params["id"], db=db)
             data = result.get("data")
-            if data:
-                ai = data.get("aiAnalysis") or {}
-                lines = [
-                    f"候选人「{data['name']}」(ID: {data['id']})",
-                    f"  岗位: {data['position']}({data.get('positionId','')}) | 匹配度: {data['score']} 分 | 状态: {data['status']}",
-                    f"  性别: {data.get('gender','未知')} | 年龄: {data.get('age') or '未知'} | 民族: {data.get('ethnicity','未知')} | 籍贯: {data.get('nativePlace','未知')}",
-                    f"  学历: {data.get('education','未知')} | 经验: {data.get('experience','未知')}",
-                    f"  电话: {data.get('phone','未知')} | 邮箱: {data.get('email','未知')}",
-                    f"  技能: {', '.join(data.get('skills', [])) or '无'}",
-                ]
-                if data.get("educationHistory"):
-                    lines.append("  教育经历:")
-                    for e in data["educationHistory"]:
-                        lines.append(f"    - {e.get('school','')} | {e.get('degree','')} | {e.get('major','')} | {e.get('period','')}")
-                if data.get("workHistory"):
-                    lines.append("  工作经历:")
-                    for w in data["workHistory"]:
-                        lines.append(f"    - {w.get('company','')} | {w.get('role','')} | {w.get('period','')}")
-                        if w.get('description'):
-                            lines.append(f"      描述: {w['description'][:200]}")
-                if data.get("projectHistory"):
-                    lines.append("  项目经历:")
-                    for p in data["projectHistory"]:
-                        lines.append(f"    - {p.get('name','')} | {p.get('role','')} | {p.get('period','')}")
-                        if p.get('description'):
-                            lines.append(f"      描述: {p['description'][:200]}")
-                if ai:
-                    lines.append(f"  AI综合分析:")
-                    if ai.get("summary"):
-                        lines.append(f"    总结: {ai['summary']}")
-                    if ai.get("overallScore"):
-                        lines.append(f"    综合分: {ai['overallScore']}")
-                    if ai.get("positionMatch"):
-                        lines.append(f"    岗位匹配: {ai['positionMatch']}")
-                    if ai.get("experienceInsight"):
-                        lines.append(f"    经验洞察: {ai['experienceInsight']}")
-                    if ai.get("keywords"):
-                        lines.append(f"    关键词: {', '.join(ai['keywords'])}")
-                    if ai.get("highlights"):
-                        lines.append(f"    亮点: {'; '.join(ai['highlights'])}")
-                    if ai.get("risks"):
-                        lines.append(f"    风险: {'; '.join(ai['risks'])}")
-                    if ai.get("recommendation"):
-                        lines.append(f"    建议: {ai['recommendation']}")
-                    if ai.get("dimensions"):
-                        lines.append(f"    维度评分:")
-                        for d in ai["dimensions"]:
-                            comment = (d.get('comment') or '').strip()
-                            suffix = f" — {comment[:200]}" if comment else ""
-                            lines.append(f"      - {d.get('name','')}: {d.get('score',0)}分{suffix}")
-                return "\n".join(lines)
-            return "候选人不存在"
+            if not data:
+                return "候选人不存在"
+            view, fields, purpose = parse_fields_param(params)
+            selected = resolve_fields(
+                "resume", view=view, fields=fields, purpose=purpose, default_view="detail",
+            )
+            # Flatten a few nested display helpers for projection
+            flat = dict(data)
+            if "skills" in flat and isinstance(flat["skills"], list):
+                flat["skills"] = ", ".join(flat["skills"]) or "无"
+            title = f"候选人「{data.get('name', '')}」(ID: {data.get('id', '')})  [视图字段: {', '.join(selected)}]"
+            return format_projected(flat, selected, RESUME_FIELDS, title=title, max_text=1200, max_json=900)
 
         elif tool_name == "list_positions":
             from app.api.recruitment.positions import list_positions as fn
@@ -146,7 +110,16 @@ async def execute_tool_call(tool_name: str, params: dict, db: AsyncSession) -> s
             data = result["data"]
             lines = [f"共 {len(data)} 个岗位："]
             for p in data:
-                lines.append(f"  [{p['id']}] {p['name']} | 部门: {p.get('department', '未设置')}")
+                edu = p.get("educationRequirement") or p.get("education_requirement") or ""
+                exp = p.get("experienceRequirement") or p.get("experience_requirement") or ""
+                sal = p.get("salaryRange") or p.get("salary_range") or ""
+                extra = " | ".join(x for x in [
+                    f"学历:{edu}" if edu else "",
+                    f"经验:{exp}" if exp else "",
+                    f"薪资:{sal}" if sal else "",
+                ] if x)
+                base = f"  [{p['id']}] {p['name']} | 部门: {p.get('department', '未设置')}"
+                lines.append(f"{base} | {extra}" if extra else base)
             return "\n".join(lines)
 
         elif tool_name == "update_resume":
@@ -208,47 +181,29 @@ async def execute_tool_call(tool_name: str, params: dict, db: AsyncSession) -> s
             d = result.get("data") or {}
             if not d:
                 return "岗位不存在"
-            lines = [
-                f"岗位「{d.get('name', '')}」(ID: {d.get('id', '')})",
-                f"  部门: {d.get('department', '未设置')}",
-            ]
-            # ── 专项字段（有独立数据库列，修改时必须用对应 camelCase key） ──
-            # 这些字段有专门的列，update_position 时要用 educationRequirement /
-            # experienceRequirement / ageRequirement / salaryRange 这些 key，
-            # 不要写进 jdRequirements 正文。
-            spec_fields = []
-            if d.get("educationRequirement"):
-                spec_fields.append(f"学历要求={d['educationRequirement']}（字段: educationRequirement）")
-            if d.get("experienceRequirement"):
-                spec_fields.append(f"经验要求={d['experienceRequirement']}（字段: experienceRequirement）")
-            if d.get("ageRequirement"):
-                spec_fields.append(f"年龄要求={d['ageRequirement']}（字段: ageRequirement）")
-            if d.get("salaryRange"):
-                spec_fields.append(f"薪资范围={d['salaryRange']}（字段: salaryRange）")
-            if spec_fields:
-                lines.append("  【专项字段 — 修改请用 update_position 并指定对应 key，勿写入 JD 正文】")
-                for sf in spec_fields:
-                    lines.append(f"    {sf}")
-            if d.get("jdResponsibilities"):
-                lines.append(f"  岗位职责:\n{d['jdResponsibilities']}")
-            if d.get("jdRequirements"):
-                lines.append(f"  任职要求:\n{d['jdRequirements']}")
-            if d.get("jdPreferred"):
-                lines.append(f"  加分项:\n{d['jdPreferred']}")
-            if d.get("jdTechStack"):
-                lines.append(f"  技术栈: {d['jdTechStack']}")
-            extras = []
-            if d.get("screeningCriteria"):
-                extras.append("筛选评分标准")
-            if d.get("interviewCriteriaR1"):
-                extras.append("一面评分标准")
-            if d.get("interviewCriteriaR2"):
-                extras.append("二面评分标准")
-            if extras:
-                lines.append(
-                    f"  （另有配置未展开：{' / '.join(extras)}。用户明确要求查看评分标准时再说明即可）"
+            # Intent-aware projection: default "core" = 专项字段 + JD 正文，
+            # not the full criteria/probation JSON dump. Model can pass
+            # view=requirements|edit|jd|criteria|probation_plan|full or fields=[...].
+            view, fields, purpose = parse_fields_param(params)
+            selected = resolve_fields(
+                "position", view=view, fields=fields, purpose=purpose, default_view="core",
+            )
+            title = (
+                f"岗位「{d.get('name', '')}」(ID: {d.get('id', '')})  "
+                f"[视图字段: {', '.join(selected)}]"
+            )
+            body = format_projected(d, selected, POSITION_FIELDS, title=title)
+            # Hint which other views exist without dumping them
+            available = []
+            if d.get("screeningCriteria") and "screeningCriteria" not in selected:
+                available.append("criteria")
+            if (d.get("week1ProjectRequirement") or d.get("conversionCriteria")) and "week1ProjectRequirement" not in selected:
+                available.append("probation_plan")
+            if available:
+                body += (
+                    f"\n  （未展开的配置可用 view={{{','.join(available)},full}} 再查）"
                 )
-            return "\n".join(lines)
+            return body
 
         elif tool_name == "create_position":
             from sqlalchemy import text as sa_text
@@ -418,8 +373,17 @@ async def execute_tool_call(tool_name: str, params: dict, db: AsyncSession) -> s
         elif tool_name == "get_leaderboard":
             from app.api.talent.interview import get_leaderboard as fn
             result = await fn(category=params["category"], db=db)
-            data = result.get("data", [])
-            return f"排行榜共 {len(data)} 人"
+            data = result.get("data", []) or []
+            if not data:
+                return "排行榜暂无数据"
+            limit = int(params.get("limit", 20) or 20)
+            lines = [f"排行榜（{params.get('category','')}）共 {len(data)} 人，前 {min(limit, len(data))} 名："]
+            for i, r in enumerate(data[:limit], 1):
+                lines.append(
+                    f"  #{r.get('rank', i)} [{r.get('id','')}] {r.get('name','?')} | "
+                    f"分:{r.get('score') or r.get('totalScore','—')} | 状态:{r.get('status','—')}"
+                )
+            return "\n".join(lines)
 
         elif tool_name == "save_questions":
             from app.api.talent.interview import save_questions as fn
@@ -462,9 +426,23 @@ async def execute_tool_call(tool_name: str, params: dict, db: AsyncSession) -> s
             from app.api.talent.probation import list_probation as fn
             result = await fn(department=params.get("department", "all"), status=params.get("status", "all"), db=db)
             data = result.get("data", {})
-            if isinstance(data, dict):
-                return f"试用期员工：共 {data.get('total', 0)} 人"
-            return "查询完成"
+            if not isinstance(data, dict):
+                return "查询完成"
+            total = data.get("total", 0)
+            # API may return list under "list" or "employees"
+            items = data.get("list") or data.get("employees") or data.get("items") or []
+            if not items:
+                return f"试用期员工：共 {total} 人（无明细列表）"
+            limit = int(params.get("limit", 15) or 15)
+            lines = [f"试用期员工：共 {total} 人，以下前 {min(limit, len(items))} 位："]
+            for e in items[:limit]:
+                lines.append(
+                    f"  [{e.get('id','')}] {e.get('name','')} | "
+                    f"{e.get('positionName') or e.get('position') or ''} | "
+                    f"状态:{e.get('status','')} | 导师:{e.get('mentorName') or '—'} | "
+                    f"进度:{e.get('taskProgress', '—')}%"
+                )
+            return "\n".join(lines)
 
         elif tool_name == "get_probation_stats":
             from app.api.talent.probation import get_probation_stats as fn
@@ -476,7 +454,17 @@ async def execute_tool_call(tool_name: str, params: dict, db: AsyncSession) -> s
             from app.api.talent.probation import get_probation_employee as fn
             result = await fn(employee_id=params["id"], db=db)
             d = result.get("data") or {}
-            return f"员工「{d.get('name', '')}」- {d.get('positionName', '')}，状态 {d.get('status', '')}，任务进度 {d.get('taskProgress', 0)}%"
+            if not d:
+                return "试用期员工不存在"
+            view, fields, purpose = parse_fields_param(params)
+            selected = resolve_fields(
+                "probation", view=view, fields=fields, purpose=purpose, default_view="core",
+            )
+            title = (
+                f"试用期员工「{d.get('name', '')}」(ID: {d.get('id', '')})  "
+                f"[视图字段: {', '.join(selected)}]"
+            )
+            return format_projected(d, selected, PROBATION_FIELDS, title=title, max_text=600, max_json=800)
 
         elif tool_name == "create_probation_employee":
             from app.api.talent.probation import create_employee as fn, CreateEmployeeRequest
@@ -540,9 +528,22 @@ async def execute_tool_call(tool_name: str, params: dict, db: AsyncSession) -> s
             from app.api.talent.performance import list_performance as fn
             result = await fn(quarter=params["quarter"], db=db)
             data = result.get("data", {})
-            if isinstance(data, dict):
-                return f"绩效数据：共 {data.get('total', 0)} 条记录"
-            return "查询完成"
+            if not isinstance(data, dict):
+                return "查询完成"
+            total = data.get("total", 0)
+            items = data.get("list") or data.get("records") or data.get("items") or []
+            if not items:
+                return f"绩效数据：共 {total} 条记录（无明细）"
+            limit = int(params.get("limit", 15) or 15)
+            lines = [f"绩效数据（{params.get('quarter','')}）：共 {total} 条，前 {min(limit, len(items))} 条："]
+            for r in items[:limit]:
+                lines.append(
+                    f"  [{r.get('id') or r.get('employeeId','')}] "
+                    f"{r.get('name') or r.get('employeeName','')} | "
+                    f"分:{r.get('totalScore') or r.get('score','—')} | "
+                    f"等级:{r.get('grade','—')} | 奖金:{r.get('bonus','—')}"
+                )
+            return "\n".join(lines)
 
         elif tool_name == "get_performance_stats":
             from app.api.talent.performance import get_performance_stats as fn
@@ -614,9 +615,21 @@ async def execute_tool_call(tool_name: str, params: dict, db: AsyncSession) -> s
             from app.api.knowledge.knowledge_base import list_knowledge as fn
             result = await fn(categoryKey=params.get("categoryKey", "all"), keyword=params.get("keyword", ""), db=db)
             data = result.get("data", {})
-            if isinstance(data, dict):
-                return f"知识库：共 {data.get('total', 0)} 条素材"
-            return "查询完成"
+            if not isinstance(data, dict):
+                return "查询完成"
+            total = data.get("total", 0)
+            items = data.get("list") or data.get("items") or []
+            if not items:
+                return f"知识库：共 {total} 条素材（无明细）"
+            limit = int(params.get("limit", 15) or 15)
+            lines = [f"知识库：共 {total} 条，前 {min(limit, len(items))} 条："]
+            for it in items[:limit]:
+                lines.append(
+                    f"  [{it.get('id','')}] {it.get('name') or it.get('title','')} | "
+                    f"分类:{it.get('category') or it.get('categoryKey','—')} | "
+                    f"类型:{it.get('type','—')}"
+                )
+            return "\n".join(lines)
 
         elif tool_name == "get_knowledge_stats":
             from app.api.knowledge.knowledge_base import get_knowledge_stats as fn
@@ -737,8 +750,18 @@ async def execute_tool_call(tool_name: str, params: dict, db: AsyncSession) -> s
         elif tool_name == "get_settings":
             from app.api.system.settings import get_settings as fn
             result = await fn(db=db)
-            data = result.get("data", {})
-            return f"系统设置：公司「{data.get('companyName', '')}」，AI解析={'开启' if data.get('aiResumeAnalysis') else '关闭'}"
+            data = result.get("data", {}) or {}
+            view, fields, purpose = parse_fields_param(params)
+            selected = resolve_fields(
+                "settings", view=view, fields=fields, purpose=purpose, default_view="core",
+            )
+            # Settings keys may include extras beyond catalog — honor explicit fields
+            if fields and ("*" in fields or "all" in [str(f).lower() for f in fields]):
+                selected = list(data.keys())
+            title = f"系统设置  [视图字段: {', '.join(selected)}]"
+            # Build label map dynamically for unknown keys
+            labels = {**SETTINGS_FIELDS, **{k: k for k in data.keys() if k not in SETTINGS_FIELDS}}
+            return format_projected(data, selected, labels, title=title, max_text=200)
 
         elif tool_name == "update_settings":
             from app.api.system.settings import update_settings as fn
