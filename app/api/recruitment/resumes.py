@@ -9,6 +9,7 @@ from typing import Optional, List, Tuple
 from fastapi import APIRouter, Depends, File, Form, UploadFile, Query
 from fastapi.responses import FileResponse
 from fastapi.responses import StreamingResponse, JSONResponse
+
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, or_, func, desc, asc
 from sqlalchemy.orm import selectinload
@@ -811,12 +812,10 @@ async def _upload_one_resume(
                     match_reason = match_reason or "AI 匹配未命中，已回退到系统默认岗位"
 
         if not position:
-            try:
-                await asyncio.to_thread(minio_storage.delete_object, object_key)
-            except Exception:
-                pass
-            return _fail("no_position", 400,
-                         f"AI 未能判断该简历的应聘岗位：{match_reason or '无匹配'}。请手动选择岗位后重新上传。")
+            # 匹配不到岗位时标记"未知"而非拒绝，简历仍正常入库
+            position_source = "unknown"
+            resolved_position_id = None
+            match_reason = match_reason or "AI 未能匹配到在招岗位"
 
     # 3) 校验是否为个人求职简历
     ai_enabled = await get_system_setting(db, "aiResumeAnalysis", True)
@@ -887,9 +886,11 @@ async def _upload_one_resume(
     try:
         from app.services.system.notification import notify_if
         from app.services.system.webhook import dispatch_webhook
-        position_label = position.name
+        position_label = position.name if position else "未知"
         if position_source == "agent":
             position_label = f"{position.name}（AI 匹配：{match_reason}）"
+        elif position_source == "unknown":
+            position_label = f"未知（{match_reason}）"
         await notify_if(db, "notifyNewResume", "new_resume",
                         f"新简历入库：{original_name}（岗位：{position_label}）",
                         {"candidateId": str(candidate.id)})
@@ -905,7 +906,7 @@ async def _upload_one_resume(
         return _fail("failed", 500, "候选人加载失败")
 
     response_data = serialize_candidate(candidate)
-    if position_source == "agent":
+    if position_source in ("agent", "unknown"):
         response_data["positionMatchReason"] = match_reason
     if parse_message and response_data["parseStatus"] != "parsed":
         return _ok(response_data, f"简历已上传，但自动解析未完成：{parse_message}")
@@ -1106,7 +1107,7 @@ async def batch_upload_resumes(
     files: List[UploadFile] = File(...),
     positionId: Optional[str] = Form(None),
 ):
-    """批量上传简历，并发处理（最多 5 份并发，双 Key 负载均衡）。返回每份文件的处理结果汇总。"""
+    """批量上传简历，并发处理（最多 5 份并发），SSE 流式推送每份文件的处理进度。"""
     position_id = positionId if positionId else None
 
     # 先读取所有文件内容
@@ -1149,25 +1150,35 @@ async def batch_upload_resumes(
                     await task_db.rollback()
                     raise
 
-    tasks = [_process_one(p) for p in file_payloads]
-    raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+    total = len(file_payloads)
 
-    items = []
-    success = 0
-    failed = 0
-    skipped = 0
-    invalid = 0
-    no_position = 0
+    async def _stream():
+        items = []
+        success = 0
+        failed = 0
+        skipped = 0
+        invalid = 0
+        done = 0
 
-    for i, r in enumerate(raw_results):
-        if isinstance(r, Exception):
-            failed += 1
-            items.append({
-                "fileName": file_payloads[i]["original_name"],
-                "status": "failed",
-                "message": str(r),
-            })
-        elif isinstance(r, dict):
+        # 使用 as_completed 逐份推送进度
+        pending = {
+            asyncio.ensure_future(_process_one(p)): p
+            for p in file_payloads
+        }
+
+        for coro in asyncio.as_completed(pending):
+            payload = pending[coro]
+            done += 1
+            try:
+                r = await coro
+            except Exception as e:
+                failed += 1
+                r = {
+                    "fileName": payload["original_name"],
+                    "status": "failed",
+                    "message": str(e),
+                }
+
             s = r.get("status", "failed")
             if s == "success":
                 success += 1
@@ -1175,33 +1186,50 @@ async def batch_upload_resumes(
                 skipped += 1
             elif s == "invalid":
                 invalid += 1
-            elif s == "no_position":
-                no_position += 1
-                failed += 1
             else:
                 failed += 1
-            items.append(r)
-        else:
-            failed += 1
-            items.append({
-                "fileName": file_payloads[i]["original_name"],
-                "status": "failed",
-                "message": "未知错误",
-            })
 
-    return {
-        "code": 0,
-        "message": "ok",
-        "data": {
-            "total": len(files),
+            items.append(r)
+
+            # 推送单文件进度事件
+            progress_event = {
+                "type": "progress",
+                "fileName": r["fileName"],
+                "status": r["status"],
+                "position": r.get("position"),
+                "score": r.get("score"),
+                "message": r.get("message", ""),
+                "existingCandidateName": r.get("existingCandidateName"),
+                "done": done,
+                "total": total,
+                "success": success,
+                "failed": failed,
+                "skipped": skipped,
+                "invalid": invalid,
+            }
+            yield f"data: {json.dumps(progress_event, ensure_ascii=False)}\n\n"
+
+        # 推送汇总事件
+        summary_event = {
+            "type": "summary",
+            "total": total,
             "success": success,
             "failed": failed,
             "skipped": skipped,
             "invalid": invalid,
-            "noPosition": no_position,
             "items": items,
+        }
+        yield f"data: {json.dumps(summary_event, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        _stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
         },
-    }
+    )
 
 
 @router.post("/resumes/batch-parse")
