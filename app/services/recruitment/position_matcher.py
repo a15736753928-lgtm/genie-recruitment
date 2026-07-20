@@ -13,12 +13,12 @@ import json
 import logging
 from typing import List, Optional, Tuple
 
-from openai import AsyncOpenAI
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.models.recruitment import Position
+from app.services.ai import get_llm_client
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -85,17 +85,12 @@ async def match_position_for_resume(
     )
 
     try:
-        client = AsyncOpenAI(
-            api_key=settings.deepseek_api_key,
-            base_url=settings.deepseek_base_url,
-            timeout=60.0,
-            max_retries=0,
-        )
+        client = get_llm_client()
         resp = await client.chat.completions.create(
             model=settings.deepseek_model,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.2,
-            max_tokens=512,
+            max_tokens=1024,
         )
         content = (resp.choices[0].message.content or "").strip()
         if content.startswith("```json"):

@@ -3,7 +3,6 @@ import uuid
 import json
 import logging
 import re
-import hashlib
 import asyncio
 from datetime import date
 from typing import Optional, List, Tuple
@@ -14,8 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, or_, func, desc, asc
 from sqlalchemy.orm import selectinload
 from pydantic import BaseModel
-from openai import AsyncOpenAI
-from app.database import get_db
+from app.database import get_db, async_session_factory
 from app.models.recruitment import (
     Candidate, Position, CandidateSkill, CandidateEducation,
     CandidateWorkExperience, CandidateProjectExperience, CandidateAIAnalysis
@@ -33,6 +31,7 @@ from app.services.recruitment.education_tier_tag import (
     SCHOOL_TIER_TAGS,
 )
 from app.services.system.system_settings import get_system_setting
+from app.services.ai import get_llm_client
 
 router = APIRouter(tags=["简历"])
 settings = get_settings()
@@ -46,14 +45,6 @@ NO_WORK_EXPERIENCE_VALUES = {
 }
 
 os.makedirs(settings.upload_dir, exist_ok=True)
-
-# ── LLM Client ──────────────────────────────────────────
-llm_client = AsyncOpenAI(
-    api_key=settings.deepseek_api_key,
-    base_url=settings.deepseek_base_url,
-    timeout=60.0,
-    max_retries=0,
-)
 
 
 # ── Helpers ─────────────────────────────────────────────
@@ -381,7 +372,7 @@ async def parse_resume_with_llm(text: str, position_name: str = "") -> Tuple[dic
 注意：age字段不要自行填写，留null即可；若识别到出生日期请填入birthDate，系统会自动计算年龄。
 注意：不要输出 analysis.dimensions 字段，维度评分由系统独立子 Agent 计算。"""
     try:
-        response = await llm_client.chat.completions.create(
+        response = await get_llm_client().chat.completions.create(
             model=settings.deepseek_model,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3,
@@ -682,6 +673,179 @@ async def get_auto_parse_setting(db: AsyncSession) -> bool:
     return bool(await get_system_setting(db, "autoParseResume", True))
 
 
+# ── Shared upload helper ─────────────────────────────────
+
+async def _upload_one_resume(
+    db: AsyncSession,
+    *,
+    original_name: str,
+    content: bytes,
+    file_ext: str,
+    position_id: Optional[str] = None,
+) -> dict:
+    """处理单份简历上传的核心逻辑，返回统一的结果 dict。
+
+    供 ``upload_resume``（单份）和 ``batch_upload_resumes``（批量并发）共用。
+    每份文件独立管理自己的 DB 会话。
+    """
+    def _ok(data=None, message="ok"):
+        return {"status": "success", "statusCode": 200, "message": message, "data": data}
+
+    def _fail(status, code, message, **extra):
+        return {"status": status, "statusCode": code, "message": message, "data": None, **extra}
+
+    # 1) 保存文件到 MinIO
+    object_key = f"resumes/{uuid.uuid4()}{file_ext}"
+    try:
+        await asyncio.to_thread(
+            minio_storage.upload_bytes, object_key, content, "application/octet-stream"
+        )
+    except Exception as e:
+        return _fail("failed", 500, f"简历存储失败: {e}")
+
+    resume_text, extract_error = extract_text_from_file(object_key)
+    if extract_error or not resume_text.strip():
+        try:
+            await asyncio.to_thread(minio_storage.delete_object, object_key)
+        except Exception:
+            pass
+        return _fail("invalid", 422, f"无法读取文档内容：{extract_error or '内容为空'}")
+
+    # 2) 解析应聘岗位
+    resolved_position_id = (position_id or "").strip()
+    position_source = "user"
+    match_reason = ""
+    position: Optional[Position] = None
+
+    if resolved_position_id:
+        pos_result = await db.execute(select(Position).where(Position.id == resolved_position_id))
+        position = pos_result.scalar_one_or_none()
+        if not position:
+            return _fail("failed", 404, "岗位不存在")
+    else:
+        from app.services.recruitment.position_matcher import match_position_for_resume
+        resolved_position_id, position_name, match_reason = await match_position_for_resume(db, resume_text)
+        if resolved_position_id:
+            position_source = "agent"
+            pos_result = await db.execute(select(Position).where(Position.id == resolved_position_id))
+            position = pos_result.scalar_one_or_none()
+            if not position:
+                logger.warning("AI 匹配到的岗位 id=%s 在数据库中不存在", resolved_position_id)
+                resolved_position_id = ""
+                position = None
+
+        if not position:
+            fallback_id = str(await get_system_setting(db, "defaultPositionId", "") or "")
+            if fallback_id:
+                pos_result = await db.execute(select(Position).where(Position.id == fallback_id))
+                position = pos_result.scalar_one_or_none()
+                if position:
+                    resolved_position_id = fallback_id
+                    position_source = "default"
+                    match_reason = match_reason or "AI 匹配未命中，已回退到系统默认岗位"
+
+        if not position:
+            try:
+                await asyncio.to_thread(minio_storage.delete_object, object_key)
+            except Exception:
+                pass
+            return _fail("no_position", 400,
+                         f"AI 未能判断该简历的应聘岗位：{match_reason or '无匹配'}。请手动选择岗位后重新上传。")
+
+    # 3) 校验是否为个人求职简历
+    ai_enabled = await get_system_setting(db, "aiResumeAnalysis", True)
+    pre_parsed: Optional[dict] = None
+    if ai_enabled:
+        pre_parsed, _ = await extract_and_parse_resume(
+            object_key, position.name if position else "", db=db, resume_text=resume_text
+        )
+
+    is_resume_doc, reject_reason, document_type = await validate_is_resume(
+        resume_text, parsed=pre_parsed, use_llm=ai_enabled
+    )
+    if not is_resume_doc:
+        try:
+            await asyncio.to_thread(minio_storage.delete_object, object_key)
+        except Exception:
+            pass
+        return _fail("invalid", 422, f"上传的文件不是简历：{reject_reason}")
+
+    # 4) 姓名查重（仅按姓名判断）
+    if ai_enabled and pre_parsed:
+        duplicate_person = await find_duplicate_candidate(db, pre_parsed)
+        if duplicate_person:
+            try:
+                await asyncio.to_thread(minio_storage.delete_object, object_key)
+            except Exception:
+                pass
+            return _fail("duplicate", 409,
+                         f"该候选人与已有记录为同一人（姓名一致），对应候选人：{duplicate_person.name}",
+                         existingCandidateId=str(duplicate_person.id),
+                         existingCandidateName=duplicate_person.name)
+
+    # 5) 创建候选人
+    candidate = Candidate(
+        name=original_name,
+        position_id=resolved_position_id,
+        status="job_hunting",
+        resume_file=object_key,
+        upload_time=date.today(),
+    )
+    db.add(candidate)
+    await db.flush()
+
+    parse_message = None
+    auto_parse = await get_auto_parse_setting(db)
+    if auto_parse:
+        candidate = await load_candidate(db, candidate.id)
+        if candidate:
+            parse_message = await run_resume_parse(
+                candidate, position.name, db, pre_parsed=pre_parsed
+            )
+            if parse_message and is_candidate_parsed(candidate):
+                parse_message = None
+
+    await db.flush()
+
+    # 6) RAG 知识库入库
+    try:
+        from app.services.recruitment.resume_kb import ingest_resume_to_kb
+        await ingest_resume_to_kb(
+            db, content=content, file_name=original_name,
+            source_object_key=object_key, candidate_id=str(candidate.id),
+        )
+    except Exception as e:
+        logger.warning("简历知识库入库钩子失败: %s", e)
+
+    # 7) 通知 + Webhook
+    try:
+        from app.services.system.notification import notify_if
+        from app.services.system.webhook import dispatch_webhook
+        position_label = position.name
+        if position_source == "agent":
+            position_label = f"{position.name}（AI 匹配：{match_reason}）"
+        await notify_if(db, "notifyNewResume", "new_resume",
+                        f"新简历入库：{original_name}（岗位：{position_label}）",
+                        {"candidateId": str(candidate.id)})
+        await dispatch_webhook(db, "candidate.uploaded",
+                               {"candidateId": str(candidate.id), "name": original_name,
+                                "positionId": resolved_position_id})
+    except Exception as e:
+        logger.warning("通知/Webhook 钩子失败: %s", e)
+
+    # 8) 返回结果
+    candidate = await load_candidate(db, candidate.id)
+    if not candidate:
+        return _fail("failed", 500, "候选人加载失败")
+
+    response_data = serialize_candidate(candidate)
+    if position_source == "agent":
+        response_data["positionMatchReason"] = match_reason
+    if parse_message and response_data["parseStatus"] != "parsed":
+        return _ok(response_data, f"简历已上传，但自动解析未完成：{parse_message}")
+    return _ok(response_data)
+
+
 # ── Endpoints ───────────────────────────────────────────
 
 @router.get("/resumes")
@@ -850,236 +1014,128 @@ async def upload_resume(
 ):
     original_name = file.filename or "resume.pdf"
     file_ext = os.path.splitext(original_name)[1].lower() or ".pdf"
-
     content = await file.read()
-    file_hash = hashlib.sha256(content).hexdigest()
 
-    dup_result = await db.execute(
-        select(Candidate).where(Candidate.resume_file_hash == file_hash)
+    result = await _upload_one_resume(
+        db,
+        original_name=original_name,
+        content=content,
+        file_ext=file_ext,
+        position_id=positionId if positionId else None,
     )
-    duplicate = dup_result.scalar_one_or_none()
-    if duplicate:
-        return {
-            "code": 409,
-            "message": f"该简历文件已存在，对应候选人：{duplicate.name}",
-            "data": {
-                "duplicate": True,
-                "duplicateType": "file",
-                "existingCandidateId": str(duplicate.id),
-                "existingCandidateName": duplicate.name,
-            },
-        }
 
-    # 1) 保存文件到 MinIO（先存，后续无论岗位是否匹配上都能用）
-    object_key = f"resumes/{uuid.uuid4()}{file_ext}"
-    try:
-        await asyncio.to_thread(
-            minio_storage.upload_bytes, object_key, content, "application/octet-stream"
-        )
-    except Exception as e:
-        return {"code": 500, "message": f"简历存储失败: {e}", "data": None}
-
-    resume_text, extract_error = extract_text_from_file(object_key)
-    if extract_error or not resume_text.strip():
-        try:
-            await asyncio.to_thread(minio_storage.delete_object, object_key)
-        except Exception:
-            pass
-        return {
-            "code": 422,
-            "message": f"无法读取文档内容，请确认文件格式正确：{extract_error or '内容为空'}",
-            "data": {"notResume": True, "documentType": "未知"},
-        }
-
-    # 2) 解析应聘岗位：
-    #    - 用户显式传了 positionId → 直接用（保持原行为）；
-    #    - 没传 → 调用「岗位匹配 Agent」由 AI 根据简历内容 + 在招岗位自动判断；
-    #    - AI 匹配失败时，再回退到系统默认岗位，保证可用性。
-    resolved_position_id = (positionId or "").strip()
-    position_source = "user"  # 用于日志/通知里说明岗位来源
-    match_reason = ""
-
-    position: Optional[Position] = None
-
-    if resolved_position_id:
-        # 用户指定岗位：直接校验存在性
-        pos_result = await db.execute(select(Position).where(Position.id == resolved_position_id))
-        position = pos_result.scalar_one_or_none()
-        if not position:
-            return {"code": 404, "message": "岗位不存在", "data": None}
+    if result["status"] == "success":
+        response_data = result["data"]
+        return {"code": 0, "message": result["message"], "data": response_data}
     else:
-        # 没传岗位 → 走 AI 岗位匹配 Agent
-        from app.services.recruitment.position_matcher import match_position_for_resume
-
-        resolved_position_id, position_name, match_reason = await match_position_for_resume(
-            db, resume_text
-        )
-        if resolved_position_id:
-            position_source = "agent"
-            pos_result = await db.execute(select(Position).where(Position.id == resolved_position_id))
-            position = pos_result.scalar_one_or_none()
-            if not position:
-                # AI 返回的 id 在在招列表里但库里查不到（极少见），清空走回退
-                logger.warning("AI 匹配到的岗位 id=%s 在数据库中不存在", resolved_position_id)
-                resolved_position_id = ""
-                position = None
-
-        # AI 未匹配上 → 回退到系统默认岗位
-        if not position:
-            fallback_id = str(await get_system_setting(db, "defaultPositionId", "") or "")
-            if fallback_id:
-                pos_result = await db.execute(select(Position).where(Position.id == fallback_id))
-                position = pos_result.scalar_one_or_none()
-                if position:
-                    resolved_position_id = fallback_id
-                    position_source = "default"
-                    match_reason = match_reason or "AI 匹配未命中，已回退到系统默认岗位"
-
-        if not position:
-            # 既没有 AI 匹配，也没有默认岗位：删掉刚上传的文件，提示用户
-            try:
-                await asyncio.to_thread(minio_storage.delete_object, object_key)
-            except Exception:
-                pass
-            return {
-                "code": 400,
-                "message": (
-                    f"AI 未能判断该简历的应聘岗位：{match_reason or '无匹配'}。"
-                    "请手动选择岗位后重新上传，或在系统设置中配置默认岗位。"
-                ),
-                "data": None,
-            }
-
-    # 2.4) 校验是否为个人求职简历
-    ai_enabled = await get_system_setting(db, "aiResumeAnalysis", True)
-    pre_parsed: Optional[dict] = None
-    if ai_enabled:
-        pre_parsed, dedup_parse_error = await extract_and_parse_resume(
-            object_key,
-            position.name if position else "",
-            db=db,
-            resume_text=resume_text,
-        )
-
-    is_resume_doc, reject_reason, document_type = await validate_is_resume(
-        resume_text,
-        parsed=pre_parsed,
-        use_llm=ai_enabled,
-    )
-    if not is_resume_doc:
-        try:
-            await asyncio.to_thread(minio_storage.delete_object, object_key)
-        except Exception:
-            pass
         return {
-            "code": 422,
-            "message": f"上传的文件不是简历：{reject_reason}",
-            "data": {"notResume": True, "documentType": document_type},
+            "code": result["statusCode"],
+            "message": result["message"],
+            "data": result.get("data"),
         }
 
-    # 2.5) AI 解析后按姓名/年龄/性别/学历/工作经历判断是否同一人
-    if ai_enabled and pre_parsed:
-        duplicate_person = await find_duplicate_candidate(db, pre_parsed)
-        if duplicate_person:
-            try:
-                await asyncio.to_thread(minio_storage.delete_object, object_key)
-            except Exception:
-                pass
-            return {
-                "code": 409,
-                "message": (
-                    f"该候选人与已有记录为同一人"
-                    f"（姓名、年龄、性别、学历、工作经历一致），"
-                    f"对应候选人：{duplicate_person.name}"
-                ),
-                "data": {
-                    "duplicate": True,
-                    "duplicateType": "person",
-                    "existingCandidateId": str(duplicate_person.id),
-                    "existingCandidateName": duplicate_person.name,
-                },
-            }
-    elif ai_enabled and not pre_parsed:
-        logger.info("入库前身份查重跳过：未能解析简历结构化信息")
 
-    # 3) 创建候选人
-    candidate = Candidate(
-        name=original_name,
-        position_id=resolved_position_id,
-        status="job_hunting",
-        resume_file=object_key,
-        resume_file_hash=file_hash,
-        upload_time=date.today(),
-    )
-    db.add(candidate)
-    await db.flush()
+@router.post("/resumes/batch-upload")
+async def batch_upload_resumes(
+    files: List[UploadFile] = File(...),
+    positionId: Optional[str] = Form(None),
+):
+    """批量上传简历，并发处理（最多 5 份并发，双 Key 负载均衡）。返回每份文件的处理结果汇总。"""
+    position_id = positionId if positionId else None
 
-    parse_message = None
-    # Auto-parse if enabled
-    auto_parse = await get_auto_parse_setting(db)
-    if auto_parse:
-        candidate = await load_candidate(db, candidate.id)
-        if candidate:
-            parse_message = await run_resume_parse(
-                candidate,
-                position.name,
-                db,
-                pre_parsed=pre_parsed,
-            )
-            if parse_message and is_candidate_parsed(candidate):
-                parse_message = None  # partial success is ok
+    # 先读取所有文件内容
+    file_payloads: list[dict] = []
+    for f in files:
+        original_name = f.filename or "resume.pdf"
+        file_ext = os.path.splitext(original_name)[1].lower() or ".pdf"
+        content = await f.read()
+        file_payloads.append({
+            "original_name": original_name,
+            "content": content,
+            "file_ext": file_ext,
+        })
 
-    await db.flush()
+    sem = asyncio.Semaphore(5)
 
-    # 自动进入 RAG「简历」知识库：无则创建，有则复用，并触发分片/向量化
-    try:
-        from app.services.recruitment.resume_kb import ingest_resume_to_kb
-        await ingest_resume_to_kb(
-            db,
-            content=content,
-            file_name=original_name,
-            source_object_key=object_key,
-            candidate_id=str(candidate.id),
-        )
-    except Exception as e:
-        logger.warning("简历知识库入库钩子失败: %s", e)
+    async def _process_one(payload: dict) -> dict:
+        async with sem:
+            async with async_session_factory() as task_db:
+                try:
+                    result = await _upload_one_resume(
+                        task_db,
+                        original_name=payload["original_name"],
+                        content=payload["content"],
+                        file_ext=payload["file_ext"],
+                        position_id=position_id,
+                    )
+                    await task_db.commit()
+                    return {
+                        "fileName": payload["original_name"],
+                        "status": result["status"],
+                        "message": result["message"],
+                        "candidateId": result["data"]["id"] if result["data"] and result["status"] == "success" else None,
+                        "position": result["data"]["position"] if result["data"] and result["status"] == "success" else None,
+                        "score": result["data"]["score"] if result["data"] and result["status"] == "success" else None,
+                        "parseStatus": result["data"]["parseStatus"] if result["data"] and result["status"] == "success" else None,
+                        "existingCandidateName": result.get("existingCandidateName"),
+                    }
+                except Exception:
+                    await task_db.rollback()
+                    raise
 
-    # 新简历入库通知 + Webhook
-    try:
-        from app.services.system.notification import notify_if
-        from app.services.system.webhook import dispatch_webhook
-        position_label = position.name
-        if position_source == "agent":
-            position_label = f"{position.name}（AI 匹配：{match_reason}）"
-        await notify_if(
-            db,
-            "notifyNewResume",
-            "new_resume",
-            f"新简历入库：{original_name}（岗位：{position_label}）",
-            {"candidateId": str(candidate.id)},
-        )
-        await dispatch_webhook(
-            db,
-            "candidate.uploaded",
-            {"candidateId": str(candidate.id), "name": original_name, "positionId": resolved_position_id},
-        )
-    except Exception as e:
-        logger.warning("通知/Webhook 钩子失败: %s", e)
+    tasks = [_process_one(p) for p in file_payloads]
+    raw_results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    # Reload with relationships
-    candidate = await load_candidate(db, candidate.id)
-    if not candidate:
-        return {"code": 500, "message": "候选人加载失败", "data": None}
-    response_data = serialize_candidate(candidate)
-    if position_source == "agent":
-        response_data["positionMatchReason"] = match_reason
-    if parse_message and response_data["parseStatus"] != "parsed":
-        return {
-            "code": 0,
-            "message": f"简历已上传，但自动解析未完成：{parse_message}",
-            "data": response_data,
-        }
-    return {"code": 0, "message": "ok", "data": response_data}
+    items = []
+    success = 0
+    failed = 0
+    skipped = 0
+    invalid = 0
+    no_position = 0
+
+    for i, r in enumerate(raw_results):
+        if isinstance(r, Exception):
+            failed += 1
+            items.append({
+                "fileName": file_payloads[i]["original_name"],
+                "status": "failed",
+                "message": str(r),
+            })
+        elif isinstance(r, dict):
+            s = r.get("status", "failed")
+            if s == "success":
+                success += 1
+            elif s == "duplicate":
+                skipped += 1
+            elif s == "invalid":
+                invalid += 1
+            elif s == "no_position":
+                no_position += 1
+                failed += 1
+            else:
+                failed += 1
+            items.append(r)
+        else:
+            failed += 1
+            items.append({
+                "fileName": file_payloads[i]["original_name"],
+                "status": "failed",
+                "message": "未知错误",
+            })
+
+    return {
+        "code": 0,
+        "message": "ok",
+        "data": {
+            "total": len(files),
+            "success": success,
+            "failed": failed,
+            "skipped": skipped,
+            "invalid": invalid,
+            "noPosition": no_position,
+            "items": items,
+        },
+    }
 
 
 @router.post("/resumes/batch-parse")

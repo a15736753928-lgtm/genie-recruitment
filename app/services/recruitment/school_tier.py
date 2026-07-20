@@ -19,9 +19,8 @@ import logging
 import re
 from typing import Optional
 
-from openai import AsyncOpenAI
-
 from app.config import get_settings
+from app.services.ai import get_llm_client
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -109,12 +108,7 @@ async def classify_school_tier(school_name: str) -> str:
 
     # 一本/二本/民办本/专科/未知：用 DeepSeek 自身知识判断（无需联网搜索）。
     try:
-        client = AsyncOpenAI(
-            api_key=settings.deepseek_api_key,
-            base_url=settings.deepseek_base_url,
-            timeout=60.0,
-            max_retries=0,
-        )
+        client = get_llm_client()
         prompt = (
             f"判断「{key}」这所中国高校的招生层次。只回答一个词，从以下选一个："
             f"一本、二本、民办本、专科、未知。\n"
@@ -125,7 +119,7 @@ async def classify_school_tier(school_name: str) -> str:
             model=settings.deepseek_model,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.0,
-            max_tokens=20,
+            max_tokens=200,
         )
         ans = (resp.choices[0].message.content or "").strip()
         for t in ("一本", "二本", "民办本", "专科", "未知"):

@@ -238,7 +238,7 @@ def infer_gender_from_vision(image_bytes: bytes, client: Optional[OpenAI] = None
                 ],
             }],
             temperature=0.1,
-            max_tokens=16,
+            max_tokens=50,
         )
         return _parse_gender_answer(response.choices[0].message.content or "")
     except Exception as exc:

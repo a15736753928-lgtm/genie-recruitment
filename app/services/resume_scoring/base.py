@@ -12,9 +12,8 @@ import re
 from pathlib import Path
 from typing import Optional
 
-from openai import AsyncOpenAI
-
 from app.config import get_settings
+from app.services.ai import get_llm_client
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -41,17 +40,12 @@ async def _llm_score(rubric: str, resume_text: str, position_name: str) -> Optio
         f"请只输出一个 0 到 100 的整数分数，不要任何其它文字、解释或标点。"
     )
     try:
-        client = AsyncOpenAI(
-            api_key=settings.deepseek_api_key,
-            base_url=settings.deepseek_base_url,
-            timeout=60.0,
-            max_retries=0,
-        )
+        client = get_llm_client()
         resp = await client.chat.completions.create(
             model=settings.deepseek_model,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.2,
-            max_tokens=20,
+            max_tokens=200,
         )
         content = (resp.choices[0].message.content or "").strip()
         m = re.search(r"\d{1,3}", content)
