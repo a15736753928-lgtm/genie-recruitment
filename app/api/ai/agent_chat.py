@@ -10,8 +10,8 @@ import json
 import re
 import uuid
 import asyncio
-from datetime import datetime
-from typing import Optional, List, AsyncGenerator
+from datetime import datetime, date
+from typing import Optional, List, AsyncGenerator, Any
 from fastapi import APIRouter, Depends, File, Form, Query, UploadFile, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -32,6 +32,7 @@ from app.api.recruitment.resumes import extract_text_from_file, parse_resume_wit
 from app.api.ai.prompt import AGENT_CONFIGS, build_system_prompt
 from app.api.ai.tool_executor import sse_event, execute_tool_call
 import os
+import tempfile
 
 router = APIRouter(tags=["AI Agent"])
 settings = get_settings()
@@ -338,6 +339,14 @@ async def upload_material(
     knowledgeName: str = Form(None),
     db: AsyncSession = Depends(get_db),
 ):
+    """Upload a material (resume/document/knowledge) for the current session.
+
+    Resumes (type="resume" or "file") are auto-detected: if the content parses
+    as a real resume the file goes through the same full ingestion pipeline as
+    the dedicated POST /api/resumes/upload endpoint — MinIO storage, position
+    matching, Candidate creation, parsing, scoring, RAG ingest.  Non-resume
+    files are stored as session attachments with a plain AI analysis preview.
+    """
     # Get or create session
     session_result = await db.execute(
         select(AgentSession).order_by(desc(AgentSession.updated_at)).limit(1)
@@ -348,71 +357,268 @@ async def upload_material(
         db.add(session)
         await db.flush()
 
-    material_name = ""
-    material_path = ""
-    if file:
-        file_ext = os.path.splitext(file.filename or "material")[1] or ".pdf"
-        object_key = f"agent/{uuid.uuid4()}{file_ext}"
-        content = await file.read()
+    # ── Knowledge-base picker (no file) ─────────────────────
+    if not file:
+        material_name = knowledgeName or "知识库素材"
+        material = AgentMaterial(
+            session_id=session.id, name=material_name,
+            type=type, knowledge_id=knowledgeId, file_path="",
+        )
+        db.add(material)
+        await db.flush()
+        await db.refresh(material)
+        return {
+            "code": 0, "message": "ok",
+            "data": {
+                "id": str(material.id), "name": material.name, "type": material.type,
+                "uploadedAt": material.uploaded_at.isoformat() if material.uploaded_at else "",
+                "analysis": None,
+            },
+        }
+
+    # ── File upload: detect whether this is a real resume ───
+    filename = file.filename or "material"
+    file_ext = os.path.splitext(filename)[1].lower() or ".pdf"
+    content = await file.read()
+
+    # Save to a temp file on disk so extract_text_from_file can read it.
+    # (extract_text_from_file handles both local paths and MinIO keys;
+    #  we give it a local temp so we can decide the final MinIO prefix
+    #  after detection without uploading twice.)
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix=file_ext, delete=False) as tf:
+        tf.write(content)
+        tmp_path = tf.name
+
+    try:
+        text, extract_error = extract_text_from_file(tmp_path)
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+    is_resume = False
+    parsed = {}
+    if text and text.strip():
+        try:
+            parsed, _ = await parse_resume_with_llm(text)
+            name = (parsed.get("name") or "").strip()
+            education = (parsed.get("education") or "").strip()
+            skills = parsed.get("skills") or []
+            # Heuristic: must have a plausible Chinese name (≥2 chars,
+            # no pure ASCII) AND at least one of education/skills/experience
+            # with a real value.
+            has_real_name = (
+                name and name != "未知"
+                and len(re.sub(r"[a-zA-Z\s]", "", name)) >= 2
+            )
+            has_real_edu = education and education not in ("未知", "其他")
+            has_real_skills = bool(skills) and any(
+                s and s != "未知" for s in skills
+            )
+            exp = (parsed.get("experience") or "").strip()
+            has_real_exp = exp and exp not in ("未知", "应届", "在校中")
+            if has_real_name and (has_real_edu or has_real_skills or has_real_exp):
+                is_resume = True
+        except Exception:
+            pass
+
+    if is_resume and type in ("resume", "file"):
+        # ── Full DB ingestion (same as dedicated endpoint) ──
+
+        # 1) Store to MinIO with proper resumes/ prefix
+        object_key = f"resumes/{uuid.uuid4()}{file_ext}"
         try:
             await asyncio.to_thread(
                 minio_storage.upload_bytes, object_key, content, "application/octet-stream"
             )
         except Exception as e:
-            return {"code": 500, "message": f"资料存储失败: {e}", "data": None}
-        material_path = object_key
-        material_name = file.filename or "material"
-    elif knowledgeName:
-        material_name = knowledgeName
+            return {"code": 500, "message": f"简历存储失败: {e}", "data": None}
+
+        # 2) AI position matching
+        from app.models.recruitment import Candidate, Position
+        from app.services.recruitment.position_matcher import match_position_for_resume
+        from app.services.system.system_settings import get_system_setting
+
+        resolved_position_id = ""
+        position_name = ""
+        match_reason = ""
+        position_source = "user"
+        position: Optional[Any] = None
+
+        resolved_position_id, position_name, match_reason = (
+            await match_position_for_resume(db, text)
+        )
+        if resolved_position_id:
+            position_source = "agent"
+            pos_result = await db.execute(
+                select(Position).where(Position.id == resolved_position_id)
+            )
+            position = pos_result.scalar_one_or_none()
+
+        if not position:
+            # Fallback to system default position
+            fallback_id = str(await get_system_setting(db, "defaultPositionId", "") or "")
+            if fallback_id:
+                pos_result = await db.execute(
+                    select(Position).where(Position.id == fallback_id)
+                )
+                position = pos_result.scalar_one_or_none()
+                if position:
+                    resolved_position_id = fallback_id
+                    position_source = "default"
+                    position_name = position.name
+                    match_reason = match_reason or "AI 匹配未命中，已回退到系统默认岗位"
+
+        if not position:
+            # Can't match any position — clean up and fail
+            try:
+                await asyncio.to_thread(minio_storage.delete_object, object_key)
+            except Exception:
+                pass
+            return {
+                "code": 400,
+                "message": (
+                    f"AI 未能判断该简历的应聘岗位：{match_reason or '无匹配'}。"
+                    "请手动选择岗位后重新上传。"
+                ),
+                "data": None,
+            }
+
+        # 3) Create Candidate record
+        candidate = Candidate(
+            name=parsed.get("name") or filename,
+            position_id=resolved_position_id,
+            status="job_hunting",
+            resume_file=object_key,
+            upload_time=date.today(),
+        )
+        db.add(candidate)
+        await db.flush()
+
+        # 4) Full parse + scoring
+        from app.api.recruitment.resumes import load_candidate, run_resume_parse
+        from app.services.resume_scoring import score_all
+        candidate = await load_candidate(db, candidate.id)
+        if candidate:
+            parse_msg = await run_resume_parse(candidate, position_name, db)
+            # Score (may already be done by run_resume_parse; score_all is
+            # idempotent — calls the same sub-agents but won't overwrite if
+            # dimensions already populated)
+            try:
+                dims = await score_all(text, parsed, position_name)
+                if dims and candidate.ai_analysis:
+                    candidate.ai_analysis.dimensions = dims
+            except Exception:
+                pass
+
+        # 5) RAG knowledge-base ingest
+        try:
+            from app.services.recruitment.resume_kb import ingest_resume_to_kb
+            await ingest_resume_to_kb(
+                db, content=content, file_name=filename,
+                source_object_key=object_key, candidate_id=str(candidate.id),
+            )
+        except Exception:
+            pass
+
+        # 6) Notifications
+        try:
+            from app.services.system.notification import notify_if
+            await notify_if(
+                db, "notifyNewResume", "new_resume",
+                f"新简历入库：{filename}（岗位：{position_name}）",
+                {"candidateId": str(candidate.id)},
+            )
+        except Exception:
+            pass
+
+        await db.flush()
+
+        # 7) Reload with relationships for response
+        candidate = await load_candidate(db, candidate.id)
+        resp_data = {}
+        if candidate:
+            resp_data = {
+                "id": str(candidate.id),
+                "name": candidate.name or filename,
+                "position": position_name,
+                "positionId": resolved_position_id,
+                "score": candidate.score or 0,
+                "status": candidate.status or "job_hunting",
+                "skills": [s.skill for s in (candidate.skills or [])],
+            }
+
+        # 8) Create AgentMaterial referencing the ingested candidate
+        material = AgentMaterial(
+            session_id=session.id, name=filename, type="resume",
+            file_path=object_key,
+        )
+        db.add(material)
+        await db.flush()
+        await db.refresh(material)
+
+        return {
+            "code": 0,
+            "message": "简历已入库",
+            "data": {
+                "id": str(material.id),
+                "name": material.name,
+                "type": "resume",
+                "uploadedAt": material.uploaded_at.isoformat() if material.uploaded_at else "",
+                "ingested": True,
+                **resp_data,
+            },
+        }
+
+    # ── Not a resume (or type=knowledge) → old attachment flow ──
+    object_key = f"agent/{uuid.uuid4()}{file_ext}"
+    try:
+        await asyncio.to_thread(
+            minio_storage.upload_bytes, object_key, content, "application/octet-stream"
+        )
+    except Exception as e:
+        return {"code": 500, "message": f"资料存储失败: {e}", "data": None}
 
     material = AgentMaterial(
-        session_id=session.id,
-        name=material_name,
-        type=type,
-        knowledge_id=knowledgeId,
-        file_path=material_path,
+        session_id=session.id, name=filename, type=type,
+        knowledge_id=knowledgeId, file_path=object_key,
     )
     db.add(material)
     await db.flush()
     await db.refresh(material)
 
-    # If uploading a resume, trigger AI analysis
+    # AI analysis preview
     analysis = None
-    if type in ("resume", "file") and material_path:
+    if type in ("resume", "file") and text and text.strip():
         try:
-            text, extract_error = extract_text_from_file(material_path)
-            if text.strip():
-                parsed, _ = await parse_resume_with_llm(text)
-                analysis_data = parsed.get("analysis", {}) if parsed else {}
-                # 维度评分由 5 个独立子 Agent 计算（教育背景走规则，其余走 LLM）。
-                from app.services.resume_scoring import score_all
-                dimensions = await score_all(text, parsed or {}, "")
-                analysis = {
-                    "overallScore": analysis_data.get("overallScore"),
-                    "summary": analysis_data.get("summary", ""),
-                    "keywords": analysis_data.get("keywords", []),
-                    "dimensions": dimensions,
-                    "highlights": analysis_data.get("highlights", []),
-                    "risks": analysis_data.get("risks", []),
-                    "recommendation": analysis_data.get("recommendation", ""),
-                    "positionMatch": analysis_data.get("positionMatch", ""),
-                    "experienceInsight": analysis_data.get("experienceInsight", ""),
-                }
-                # Also extract basic candidate info
-                analysis["candidateName"] = parsed.get("name", "")
-                analysis["skills"] = parsed.get("skills", [])
-        except Exception as e:
-            print(f"AI Agent resume analysis error: {e}")
+            analysis_data = parsed.get("analysis", {}) if parsed else {}
+            from app.services.resume_scoring import score_all
+            dimensions = await score_all(text, parsed or {}, "")
+            analysis = {
+                "overallScore": analysis_data.get("overallScore"),
+                "summary": analysis_data.get("summary", ""),
+                "keywords": analysis_data.get("keywords", []),
+                "dimensions": dimensions,
+                "highlights": analysis_data.get("highlights", []),
+                "risks": analysis_data.get("risks", []),
+                "recommendation": analysis_data.get("recommendation", ""),
+                "positionMatch": analysis_data.get("positionMatch", ""),
+                "experienceInsight": analysis_data.get("experienceInsight", ""),
+            }
+            analysis["candidateName"] = parsed.get("name", "")
+            analysis["skills"] = parsed.get("skills", [])
+        except Exception:
+            pass
 
     return {
-        "code": 0,
-        "message": "ok",
+        "code": 0, "message": "ok",
         "data": {
-            "id": str(material.id),
-            "name": material.name,
-            "type": material.type,
+            "id": str(material.id), "name": material.name, "type": material.type,
             "knowledgeId": str(material.knowledge_id) if material.knowledge_id else None,
             "uploadedAt": material.uploaded_at.isoformat() if material.uploaded_at else "",
+            "ingested": False,
             "analysis": analysis,
         },
     }
@@ -539,7 +745,10 @@ async def agent_chat(
     mentioned_agent_ids = body.get("mentionedAgentIds", [])
     material_ids = body.get("materialIds", [])
 
-    # ── Fetch attached materials and build context ──
+    # ── Fetch attached materials and build compact context ────────
+    # Ingested resumes (file_path starts with "resumes/") are already in the
+    # candidates table — give the AI a compact reference with the candidate ID
+    # so it can use get_resume / update_resume instead of reprocessing raw text.
     material_context = ""
     if material_ids:
         try:
@@ -549,14 +758,47 @@ async def agent_chat(
                 )
                 attached_materials = mat_result.scalars().all()
             if attached_materials:
+                from app.models.recruitment import Candidate
                 lines = ["\n\n--- 附件资料 ---"]
                 for mat in attached_materials:
-                    lines.append(f"\n[{mat.type}] {mat.name}")
-                    if mat.file_path:
+                    fp = (mat.file_path or "")
+                    # ── Ingested resume → compact candidate reference ──
+                    if mat.type in ("resume", "file") and fp.startswith("resumes/"):
+                        lines.append(f"\n[已入库简历] {mat.name}")
                         try:
-                            file_text, _ = extract_text_from_file(mat.file_path)
+                            async with async_session_factory() as db2:
+                                cand_result = await db2.execute(
+                                    select(Candidate).where(
+                                        Candidate.resume_file == fp
+                                    ).limit(1)
+                                )
+                                c = cand_result.scalar_one_or_none()
+                            if c:
+                                skills_str = ", ".join(
+                                    s.skill for s in (c.skills or [])
+                                )[:80] or "无"
+                                lines.append(
+                                    f"候选人「{c.name}」(ID: {c.id}) | "
+                                    f"岗位ID: {c.position_id} | 匹配分: {c.score or 0} | "
+                                    f"状态: {c.status} | 技能: {skills_str}\n"
+                                    f"（已入库，请用 get_resume / update_resume 操作，勿当作文本重复解析）"
+                                )
+                            else:
+                                lines.append("（已入库，但未找到候选人记录）")
+                        except Exception:
+                            lines.append("（已入库，查找候选人信息失败）")
+                    # ── Knowledge picker ──
+                    elif mat.type == "knowledge":
+                        lines.append(f"\n[知识库素材] {mat.name}")
+                        if mat.knowledge_id:
+                            lines.append(f"（knowledgeId: {mat.knowledge_id}）")
+                    # ── Other file → extract text (clipped) ──
+                    elif fp:
+                        lines.append(f"\n[{mat.type}] {mat.name}")
+                        try:
+                            file_text, _ = extract_text_from_file(fp)
                             if file_text.strip():
-                                truncated = file_text[:3000] + ("..." if len(file_text) > 3000 else "")
+                                truncated = file_text[:2000] + ("..." if len(file_text) > 2000 else "")
                                 lines.append(f"内容:\n{truncated}")
                         except Exception:
                             pass

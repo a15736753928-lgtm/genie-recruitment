@@ -229,7 +229,10 @@ async def execute_tool_call(tool_name: str, params: dict, db: AsyncSession) -> s
                 return "创建失败：没有提供有效字段"
             placeholders = ", ".join(f":{c}" for c in columns)
             cols_str = ", ".join(columns)
-            sql = f"INSERT INTO positions ({cols_str}) VALUES ({placeholders}) RETURNING id"
+            sql = (
+                f"INSERT INTO positions (id, {cols_str}) "
+                f"VALUES (gen_random_uuid(), {placeholders}) RETURNING id"
+            )
             result = await db.execute(sa_text(sql), values)
             row = result.fetchone()
             new_id = str(row[0]) if row else "?"
