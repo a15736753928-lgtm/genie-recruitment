@@ -8,6 +8,7 @@ import sys
 import io
 import os
 from app.config import get_settings
+from app.middleware.trace import get_trace_id
 
 # ── Early logging setup (before uvicorn takes over) ──
 # On Windows the default stdout/stderr encoding is often GBK and chokes on
@@ -45,8 +46,10 @@ class _ColoredFormatter(logging.Formatter):
         record.levelname = f"{color}{record.levelname:8}{self._RESET}"
         record.name = f"{self._DIM}{record.name}{self._RESET}"
         record.asctime = self.formatTime(record, self.datefmt)
+        trace_id = get_trace_id()
+        trace = f" {self._WHITE}[{trace_id}]{self._RESET}" if trace_id else ""
         # asctime 也做 dim 处理，整体视觉更柔和
-        return f"{self._DIM}{record.asctime}{self._RESET} {record.name} {record.levelname} {record.getMessage()}"
+        return f"{self._DIM}{record.asctime}{self._RESET} {record.name} {record.levelname}{trace} {record.getMessage()}"
 
 
 # 强制 Rich / uvicorn 等库启用颜色（它们依赖 FORCE_COLOR 环境变量）
@@ -209,6 +212,10 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+# ── Trace ID (before everything — injects per-request trace_id into contextvars) ──
+from app.middleware.trace import TraceMiddleware
+app.add_middleware(TraceMiddleware)
 
 # ── Request logger (before CORS so we see everything) ──
 @app.middleware("http")

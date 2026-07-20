@@ -271,11 +271,11 @@ async def _enrich_results(combined: list[dict]) -> list[dict]:
 # ── Community Attachment ───────────────────────────────
 
 async def _attach_community_info(results: list[dict]) -> None:
-    """Attach community_id and community_name to results."""
+    """Attach community_id and community_name to results (O(n+m) indexed lookup)."""
     if not results or not settings.community_enabled:
         return
 
-    pks = [int(r["id"]) for r in results if r["id"].isdigit()]
+    pks = {int(r["id"]) for r in results if r["id"].isdigit()}
     if not pks:
         return
 
@@ -284,18 +284,22 @@ async def _attach_community_info(results: list[dict]) -> None:
             com_result = await db.execute(select(GraphCommunity))
             communities = com_result.scalars().all()
 
-            for r in results:
-                pk = int(r["id"]) if r["id"].isdigit() else 0
-                for com in communities:
-                    try:
-                        com_chunk_ids = json.loads(com.chunk_ids) if com.chunk_ids else []
-                    except (json.JSONDecodeError, TypeError):
-                        continue
+            # Build inverted index: chunk_id → (community_id, community_name)
+            pk_to_community: dict[int, tuple] = {}
+            for com in communities:
+                try:
+                    com_chunk_ids = json.loads(com.chunk_ids) if com.chunk_ids else []
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                for cid in com_chunk_ids:
+                    if isinstance(cid, int):
+                        pk_to_community[cid] = (com.id, com.name)
 
-                    if pk in com_chunk_ids:
-                        r["community_id"] = com.id
-                        r["community_name"] = com.name
-                        break
+            for r in results:
+                info = pk_to_community.get(int(r["id"]))
+                if info:
+                    r["community_id"] = info[0]
+                    r["community_name"] = info[1]
     except Exception:
         pass
 

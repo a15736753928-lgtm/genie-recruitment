@@ -27,6 +27,7 @@ from app.agent.intent_classifier import classify_intent, get_tool_defs_for_inten
 from app.agent.supervisor_graph import classify_complexity_sync, ExecutionPlan, PlanStep
 from app.agent.graph import build_agent_graph, stream_agent_response, AgentResult
 from app.config import get_settings
+from app.middleware.trace import get_trace_id
 from app.infrastructure import minio_storage
 from app.api.recruitment.resumes import extract_text_from_file, parse_resume_with_llm
 from app.api.ai.prompt import AGENT_CONFIGS, build_system_prompt
@@ -676,12 +677,10 @@ async def _generate_plan(
         )
         raw = resp.choices[0].message.content.strip()
 
-        # Strip markdown fences
-        if raw.startswith("```"):
-            raw = re.sub(r"^```(?:json)?\s*", "", raw)
-            raw = re.sub(r"\s*```$", "", raw)
-
-        plan_data = json.loads(raw)
+        # Use shared JSON extraction (handles markdown fences + trailing commas)
+        from app.utils.json_utils import extract_json_from_text
+        clean = extract_json_from_text(raw)
+        plan_data = json.loads(clean)
 
         if "steps" not in plan_data or not plan_data["steps"]:
             return None
@@ -897,6 +896,11 @@ async def agent_chat(
         task_id = None
 
         try:
+            # Send trace ID so the frontend can correlate logs
+            trace_id = get_trace_id()
+            if trace_id:
+                yield sse_event("meta", {"traceId": trace_id})
+
             # Send initial thinking
             thinking_text = f"收到任务，正在作为{AGENT_CONFIGS.get(agent_id, {}).get('name', 'AI Agent')}分析您的指令..."
             yield sse_event("thinking", {"text": thinking_text, "append": False})

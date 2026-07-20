@@ -91,8 +91,8 @@ async def graph_search(
         return {"chunk_hits": [], "community_summaries": []}
 
     # 1. LLM extract query entities
-    query_entities = await _extract_entities_from_query(query)
-    if not query_entities:
+    entity_names = await _extract_entities_from_query(query)
+    if not entity_names:
         return {"chunk_hits": [], "community_summaries": []}
 
     # 2. For each KB, fuzzy match + expand
@@ -103,8 +103,8 @@ async def graph_search(
     for kb_id in kb_list:
         kb = kb_id if kb_id else ""
 
-        # Fuzzy match entities
-        matched = query_entities(matched_names, kb_id=kb) if kb else query_entities(matched_names)
+        # Fuzzy match entities (graph_store.query_entities)
+        matched = query_entities(entity_names, kb_id=kb)
         matched_names = [e["name"] for e in matched]
 
         # 1-hop expand
@@ -119,7 +119,7 @@ async def graph_search(
         return {"chunk_hits": [], "community_summaries": []}
 
     # 3. Score by entity overlap rate
-    total_query_entities = len(query_entities)
+    total_query_entities = len(entity_names)
     chunk_hits = []
     for chunk_id, hit_count in chunk_entity_hits.items():
         score = min(hit_count / total_query_entities, 1.0)
