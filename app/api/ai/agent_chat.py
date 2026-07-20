@@ -43,6 +43,70 @@ llm_client = AsyncOpenAI(
     max_retries=0,
 )
 
+# ── Agent OS singletons (memory / skills / quality) ───────────
+# These are the genuinely useful pieces merged in from the former v2/v3
+# "Agent OS" stack. Everything else (query_loop, streaming_executor,
+# context engine, cache builder, orchestration, hooks, retry) was dead
+# code and has been removed — this v1 endpoint is now the ONLY agent path.
+from app.agent_os.memory.manager import MemoryManager
+from app.agent_os.memory.retriever import MemoryRetriever
+from app.agent_os.skills.registry import SkillRegistry
+from app.agent_os.quality.guard import QualityGuard
+
+_memory_manager = MemoryManager(memory_dir=settings.memory_dir)
+_memory_retriever = MemoryRetriever(_memory_manager)
+_skill_registry = SkillRegistry(skills_dir=settings.skills_dir)
+_quality_guard = QualityGuard()
+
+
+def _estimate_tokens(text: str) -> int:
+    """Rough token estimate: CJK ≈ 1 token/char, ASCII ≈ 0.25 token/char."""
+    if not text:
+        return 0
+    cjk = sum(1 for c in text if "一" <= c <= "鿿")
+    return cjk + (len(text) - cjk) // 4 + 1
+
+
+def _estimate_tokens_msgs(messages: list) -> int:
+    """Estimate total tokens across a list of messages."""
+    return sum(_estimate_tokens(str(getattr(m, "content", "") or "")) for m in messages)
+
+
+def _compact_messages(messages: list, max_tokens: int = 6000) -> tuple[list, int]:
+    """Token-budget truncation: drop oldest messages when over budget.
+
+    Returns (compacted_messages, n_dropped).
+    Keeps at least the final message (current user turn). Simpler and
+    safer than the old CompactionPipeline, which was coupled to LoopState
+    and silently corrupted ToolMessage metadata.
+    """
+    if not messages:
+        return messages, 0
+    total = _estimate_tokens_msgs(messages)
+    if total <= max_tokens:
+        return messages, 0
+    result = list(messages)
+    dropped = 0
+    # Drop from the front (oldest) but never drop the last message.
+    while len(result) > 1 and total > max_tokens:
+        removed = result.pop(0)
+        total -= _estimate_tokens(str(getattr(removed, "content", "") or ""))
+        dropped += 1
+    return result, dropped
+
+
+async def _verify_executor(tool_name: str, params: dict) -> str:
+    """Executor wrapper for QualityGuard read-back verification.
+
+    Matches the ``async (tool_name, params) -> str`` signature that
+    WriteVerifier expects, using a fresh short-lived DB session.
+    """
+    from app.agent.tools import _execute_tool_sync
+    try:
+        return await _execute_tool_sync(tool_name, **params)
+    except Exception as e:
+        return f"验证查询失败: {e}"
+
 
 def iso_utc(dt: Optional[datetime]) -> str:
     """Serialize naive UTC datetime with trailing Z so browsers parse correctly.
@@ -547,18 +611,49 @@ async def agent_chat(
         )
         history = history_result.scalars().all()
         for h in history[:-1]:  # exclude the just-saved user message
-            history_rows.append((h.role, h.content or ""))
+            history_rows.append((h.role, h.content or "", h.tool_blocks or []))
 
         await db.commit()
         session_obj_id = session.id
 
     # ── Build LangChain message history from plain data ──
+    # Previous-turn tool calls are re-attached so the model can reference IDs
+    # returned earlier (e.g. the position UUID from get_position → update_position).
+    # Each reconstructed AIMessage with tool_calls MUST be immediately followed
+    # by a matching ToolMessage per tool_call_id, or the OpenAI API rejects the
+    # request — so we only reconstruct blocks that actually have a result.
+    from langchain_core.messages import ToolMessage
     lc_messages = []
-    for role, content in history_rows:
+    for role, content, tool_blocks in history_rows:
         if role == "user":
             lc_messages.append(HumanMessage(content=content))
         elif role == "assistant":
-            lc_messages.append(AIMessage(content=content))
+            resolved_blocks = [
+                tb for tb in (tool_blocks or [])
+                if isinstance(tb, dict) and tb.get("id") and tb.get("result")
+            ]
+            if resolved_blocks:
+                # 1 tool_call per AIMessage, each immediately answered by its
+                # ToolMessage — guarantees a valid, well-paired message list.
+                first = True
+                for tb in resolved_blocks:
+                    lc_messages.append(AIMessage(
+                        content=content if first else "",
+                        tool_calls=[{
+                            "id": tb["id"],
+                            "name": tb.get("name", ""),
+                            "args": tb.get("params") or tb.get("args") or {},
+                            "type": "tool_call",
+                        }],
+                    ))
+                    lc_messages.append(ToolMessage(
+                        content=str(tb["result"])[:1000],
+                        tool_call_id=tb["id"],
+                        name=tb.get("name", ""),
+                    ))
+                    first = False
+            elif content:
+                lc_messages.append(AIMessage(content=content))
     lc_messages.append(HumanMessage(content=message + material_context))
 
     async def event_stream() -> AsyncGenerator[str, None]:
@@ -620,6 +715,39 @@ async def agent_chat(
                     f"本轮仅可使用与该意图匹配的工具，禁止调用无关工具。"
                 )
 
+            # ── Memory retrieval + Skill matching (Agent OS merge) ──
+            memories = []
+            matched_skills = []
+            try:
+                memories = await _memory_retriever.retrieve(
+                    query=message, llm_client=llm_client, limit=5
+                )
+            except Exception:
+                memories = []
+            try:
+                matched_skills = await _skill_registry.match(
+                    message, llm_client=llm_client, limit=3
+                )
+            except Exception:
+                matched_skills = []
+
+            if memories:
+                yield sse_event("memory_loaded", {
+                    "count": len(memories),
+                    "memories": [
+                        {"name": m.name, "description": m.description,
+                         "type": m.memory_type, "scope": m.scope}
+                        for m in memories
+                    ],
+                })
+                mem_lines = ["## 相关记忆（供参考，不要照搬）\n"]
+                for m in memories:
+                    mem_lines.append(f"- **{m.description}**: {m.content[:300]}")
+                system_prompt += "\n\n" + "\n".join(mem_lines)
+
+            if matched_skills:
+                system_prompt = _skill_registry.inject_skills(system_prompt, matched_skills)
+
             # ── Plan Generation (complex queries only) ──
             complexity = classify_complexity_sync(message)
             if complexity == "complex":
@@ -636,13 +764,42 @@ async def agent_chat(
                         f"按步骤顺序执行。每完成一步，检查结果后再进行下一步。"
                     )
 
+            # ── Context compaction: keep history within token budget ──
+            compacted, dropped = _compact_messages(lc_messages, max_tokens=6000)
+            if dropped > 0:
+                yield sse_event("context_compressed", {
+                    "layer": 1,
+                    "tokenEstimate": _estimate_tokens_msgs(compacted),
+                    "message": f"上下文较长，已省略最早的 {dropped} 条历史消息",
+                })
+
             graph = build_agent_graph(langchain_tools, system_prompt)
 
             # Stream agent execution
-            async for sse_str in stream_agent_response(graph, lc_messages, result):
+            async for sse_str in stream_agent_response(graph, compacted, result):
                 if await request.is_disconnected():
                     break
                 yield sse_str
+
+            # ── Quality Guard: verify writes actually took effect ──
+            try:
+                if result.tool_blocks:
+                    guard_result = await _quality_guard.guard(
+                        user_message=message,
+                        agent_response=result.full_content,
+                        tool_calls=result.tool_blocks,
+                        tool_results=[tb.get("result", "") for tb in result.tool_blocks],
+                        tool_executor=_verify_executor,
+                    )
+                    if not guard_result.passed:
+                        yield sse_event("verification", {
+                            "verified": False,
+                            "issues": guard_result.issues[:5],
+                        })
+                    else:
+                        yield sse_event("verification", {"verified": True, "issues": []})
+            except Exception:
+                pass
 
             # Save assistant message + update task (short-lived session)
             async with async_session_factory() as db:
@@ -692,6 +849,20 @@ async def agent_chat(
 
                 await db.commit()
 
+            # ── Fire-and-forget: capture session learnings into memory ──
+            # Runs in the background so it never blocks the response. Degrades
+            # to a no-op if the LLM client or extraction fails.
+            async def _auto_capture():
+                try:
+                    captured = await _memory_manager.auto_capture(
+                        session_messages=lc_messages + [AIMessage(content=result.full_content)],
+                        session_id=str(session_obj_id),
+                        llm_client=llm_client,
+                    )
+                except Exception:
+                    captured = []
+            asyncio.create_task(_auto_capture())
+
             yield sse_event("phase_result", {
                 "id": f"phase_{uuid.uuid4().hex[:6]}",
                 "tone": "success",
@@ -737,3 +908,30 @@ async def agent_chat(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+# ── Plan confirmation (formerly /agent-os/confirm-plan) ───────
+# Moved here so the frontend PlanConfirmCard keeps working without any
+# change, while we remove the entire agent_chat_v2 / Agent OS dead stack.
+# The plan_coordinator module is intentionally NOT imported — we do not
+# need the full coordinator state machine; the endpoint only needs to
+# acknowledge the user's decision (approve/reject/modify) and the current
+# LangGraph turn will simply continue without pausing on plan approval.
+
+@router.post("/agent-os/confirm-plan")
+async def confirm_plan(body: dict):
+    """Acknowledge a plan proposal from the frontend.
+
+    The plan was already injected into the system prompt before the LangGraph
+    run, so the agent proceeds regardless. This endpoint simply returns success
+    so PlanConfirmCard can dismiss its UI state without an error.
+    """
+    plan_id = (body.get("plan_id") or "").strip()
+    action  = (body.get("action")  or "approve").strip()
+    if not plan_id:
+        return {"code": 400, "message": "plan_id 是必填字段", "data": None}
+    return {
+        "code": 0,
+        "message": f"计划 {plan_id} 已{action}",
+        "data": {"plan_id": plan_id, "action": action},
+    }

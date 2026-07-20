@@ -208,11 +208,27 @@ async def execute_tool_call(tool_name: str, params: dict, db: AsyncSession) -> s
             d = result.get("data") or {}
             if not d:
                 return "岗位不存在"
-            # 默认只返回 JD 正文，避免把整份评分表 JSON 塞进上下文诱使模型做「匹配分析」
             lines = [
                 f"岗位「{d.get('name', '')}」(ID: {d.get('id', '')})",
                 f"  部门: {d.get('department', '未设置')}",
             ]
+            # ── 专项字段（有独立数据库列，修改时必须用对应 camelCase key） ──
+            # 这些字段有专门的列，update_position 时要用 educationRequirement /
+            # experienceRequirement / ageRequirement / salaryRange 这些 key，
+            # 不要写进 jdRequirements 正文。
+            spec_fields = []
+            if d.get("educationRequirement"):
+                spec_fields.append(f"学历要求={d['educationRequirement']}（字段: educationRequirement）")
+            if d.get("experienceRequirement"):
+                spec_fields.append(f"经验要求={d['experienceRequirement']}（字段: experienceRequirement）")
+            if d.get("ageRequirement"):
+                spec_fields.append(f"年龄要求={d['ageRequirement']}（字段: ageRequirement）")
+            if d.get("salaryRange"):
+                spec_fields.append(f"薪资范围={d['salaryRange']}（字段: salaryRange）")
+            if spec_fields:
+                lines.append("  【专项字段 — 修改请用 update_position 并指定对应 key，勿写入 JD 正文】")
+                for sf in spec_fields:
+                    lines.append(f"    {sf}")
             if d.get("jdResponsibilities"):
                 lines.append(f"  岗位职责:\n{d['jdResponsibilities']}")
             if d.get("jdRequirements"):

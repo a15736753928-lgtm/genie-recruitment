@@ -10,7 +10,24 @@ async def _get_db() -> AsyncSession:
         return session
 
 
-# ── Tool Definitions ────────────────────────────────────
+# ── Permission engine singleton ────────────────────────────
+_perm_engine = None
+
+def _get_permission_engine():
+    """Lazy singleton for the PermissionEngine (Agent OS merge)."""
+    global _perm_engine
+    if _perm_engine is None:
+        from app.agent_os.permissions.engine import PermissionEngine
+        from app.agent_os.permissions.safety import (
+            safety_check_destructive_operations,
+            safety_check_protected_paths,
+        )
+        _perm_engine = PermissionEngine()
+        # Register safety checks that are currently never called by default
+        _perm_engine.add_safety_check(safety_check_destructive_operations)
+        _perm_engine.add_safety_check(safety_check_protected_paths)
+    return _perm_engine
+
 
 TOOL_REGISTRY = {
     # Recruitment tools
@@ -134,12 +151,24 @@ TOOL_REGISTRY = {
     },
     "update_position": {
         "name": "update_position",
-        "description": "更新岗位信息，包括 JD、筛选标准、面试标准、试用期项目要求等所有配置。",
+        "description": (
+            "更新岗位信息。重要：学历/经验/年龄/薪资有专门的独立字段，"
+            "修改这些属性时必须改对应字段，禁止把它们当文字写进 jdRequirements 正文！\n"
+            "- educationRequirement: 学历要求（如「本科」「硕士」「博士」「不限」）\n"
+            "- experienceRequirement: 经验要求（如「3-5年」「应届」）\n"
+            "- ageRequirement: 年龄要求（如「25-35岁」）\n"
+            "- salaryRange: 薪资范围（如「10-20K」）\n"
+            "其余字段：name/department/jdResponsibilities/jdRequirements(职责/要求正文)/"
+            "jdPreferred/jdTechStack/screeningCriteria/interviewCriteriaR1/interviewCriteriaR2 等。"
+        ),
         "parameters": {
             "type": "object",
             "properties": {
                 "id": {"type": "string", "description": "岗位ID"},
-                "fields": {"type": "object", "description": "要更新的字段（name/department/jdResponsibilities/jdRequirements/screeningCriteria/interviewCriteriaR1 等）"},
+                "fields": {"type": "object", "description": (
+                    "要更新的字段。改学历用 educationRequirement，改经验用 experienceRequirement，"
+                    "改年龄用 ageRequirement，改薪资用 salaryRange——不要写进 jdRequirements。"
+                )},
             },
             "required": ["id", "fields"],
         },
@@ -903,6 +932,21 @@ async def _execute_tool_sync(tool_name: str, **kwargs) -> str:
     params = {k: v for k, v in kwargs.items() if v is not None}
     # Remove the dummy field if present
     params.pop("dummy", None)
+
+    # ── Permission gate (Agent OS merge) ──────────────────────
+    # Only a hard DENY blocks execution here (e.g. delete_knowledge_base
+    # needs admin rights). ASK/ALLOW proceed — the model handles any
+    # confirmation conversationally, and destructive SQL is already guarded
+    # by the WHERE-clause check in execute_tool_call's db_update branch.
+    try:
+        engine = _get_permission_engine()
+        from app.agent_os.permissions.engine import PermissionDecision, PermissionMode
+        perm = engine.evaluate(tool_name, params, PermissionMode.DEFAULT)
+        if perm.decision == PermissionDecision.DENY:
+            return f"❌ 权限拒绝：{perm.reason}"
+    except Exception:
+        # Permission engine must never break tool execution.
+        pass
 
     db = async_session_factory()
     try:

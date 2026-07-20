@@ -116,11 +116,13 @@ def safety_check_pii_leak(
     Applied to: tools that display or export candidate data.
     """
     PII_SENSITIVE_TOOLS = {
-        "list_resumes", "get_resume", "export_*",
+        "list_resumes", "get_resume",
         "get_evaluation", "get_leaderboard", "get_rankings",
     }
-
-    if tool_name not in PII_SENSITIVE_TOOLS:
+    # Also catch tools whose names start with "export_" (fnmatch set entries
+    # like "export_*" don't work with the `in` operator — fixed here).
+    is_sensitive = tool_name in PII_SENSITIVE_TOOLS or tool_name.startswith("export_")
+    if not is_sensitive:
         return None  # Not applicable
 
     # Check if we're exporting a large batch (potential bulk PII)
