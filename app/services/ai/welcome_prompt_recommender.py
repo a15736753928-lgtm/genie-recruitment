@@ -190,12 +190,8 @@ async def _generate_with_llm(db: AsyncSession) -> List[dict]:
         return deepcopy(DEFAULT_PROMPTS)
 
     try:
-        client = AsyncOpenAI(
-            api_key=settings.deepseek_api_key,
-            base_url=settings.deepseek_base_url,
-            timeout=30.0,
-            max_retries=0,
-        )
+        from app.services.ai import get_llm_client
+        client = get_llm_client()
         resp = await client.chat.completions.create(
             model=settings.deepseek_model,
             messages=[{"role": "user", "content": _build_prompt(snapshot)}],

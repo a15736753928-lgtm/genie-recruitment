@@ -31,18 +31,12 @@ from app.infrastructure import minio_storage
 from app.api.recruitment.resumes import extract_text_from_file, parse_resume_with_llm
 from app.api.ai.prompt import AGENT_CONFIGS, build_system_prompt
 from app.api.ai.tool_executor import sse_event, execute_tool_call
+from app.services.ai import get_llm_client, create_langchain_llm
 import os
 import tempfile
 
 router = APIRouter(tags=["AI Agent"])
 settings = get_settings()
-
-llm_client = AsyncOpenAI(
-    api_key=settings.deepseek_api_key,
-    base_url=settings.deepseek_base_url,
-    timeout=60.0,
-    max_retries=0,
-)
 
 # ── Agent OS singletons (memory / skills / quality) ───────────
 # These are the genuinely useful pieces merged in from the former v2/v3
@@ -962,13 +956,13 @@ async def agent_chat(
             matched_skills = []
             try:
                 memories = await _memory_retriever.retrieve(
-                    query=message, llm_client=llm_client, limit=5
+                    query=message, llm_client=get_llm_client(), limit=5
                 )
             except Exception:
                 memories = []
             try:
                 matched_skills = await _skill_registry.match(
-                    message, llm_client=llm_client, limit=3
+                    message, llm_client=get_llm_client(), limit=3
                 )
             except Exception:
                 matched_skills = []
@@ -993,7 +987,7 @@ async def agent_chat(
             # ── Plan Generation (complex queries only) ──
             complexity = classify_complexity_sync(message)
             if complexity == "complex":
-                plan = await _generate_plan(lc_messages, system_prompt, llm_client)
+                plan = await _generate_plan(lc_messages, system_prompt, get_llm_client())
                 if plan and plan.steps:
                     yield sse_event("plan_proposal", plan.to_sse_dict())
                     # Inject plan into system prompt for worker agent
@@ -1062,7 +1056,7 @@ async def agent_chat(
                             f"根据以下对话内容，生成一个简短的标题（10个字以内，不要引号）：\n"
                             f"用户：{message[:200]}\nAI：{result.full_content[:200]}"
                         )
-                        title_resp = await llm_client.chat.completions.create(
+                        title_resp = await get_llm_client().chat.completions.create(
                             model=settings.deepseek_model,
                             messages=[{"role": "user", "content": title_prompt}],
                             temperature=0.7,
@@ -1099,7 +1093,7 @@ async def agent_chat(
                     captured = await _memory_manager.auto_capture(
                         session_messages=lc_messages + [AIMessage(content=result.full_content)],
                         session_id=str(session_obj_id),
-                        llm_client=llm_client,
+                        llm_client=get_llm_client(),
                     )
                 except Exception:
                     captured = []

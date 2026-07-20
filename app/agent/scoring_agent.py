@@ -127,12 +127,8 @@ async def score_answer(
     返回：{"score": int, "dimensions": [{"name", "score"}, ...]}（固定 3 维）。
     LLM 调用失败时返回兜底结果（调用方仍可落库展示）。
     """
-    client = AsyncOpenAI(
-        api_key=settings.deepseek_api_key,
-        base_url=settings.deepseek_base_url,
-        timeout=60.0,
-        max_retries=0,
-    )
+    from app.services.ai import get_llm_client
+    client = get_llm_client()
     system_prompt = _build_system_prompt(position_name)
     user_prompt = _build_user_prompt(question_content, category, difficulty, answer)
 

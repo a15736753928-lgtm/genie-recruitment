@@ -18,15 +18,12 @@ from typing import AsyncGenerator
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
-from langchain_openai import ChatOpenAI
 from langchain_core.messages import BaseMessage, SystemMessage
 from langchain_core.tools import BaseTool
 from typing import TypedDict, Annotated
 
-from app.config import get_settings
 from app.agent.tool_result import ToolResult, DisplayHint
-
-settings = get_settings()
+from app.services.ai import create_langchain_llm
 
 
 # ── State ───────────────────────────────────────────────
@@ -44,21 +41,6 @@ class AgentResult:
     full_content: str = ""
 
 
-# ── LLM Factory ─────────────────────────────────────────
-
-def _create_llm(temperature: float = 0.7) -> ChatOpenAI:
-    """Create a ChatOpenAI pointed at DeepSeek's OpenAI-compatible endpoint."""
-    return ChatOpenAI(
-        model=settings.deepseek_model,
-        api_key=settings.deepseek_api_key,
-        base_url=settings.deepseek_base_url,
-        temperature=temperature,
-        streaming=True,
-        timeout=60,
-        max_retries=0,
-    )
-
-
 # ── Graph Builder ───────────────────────────────────────
 
 def build_agent_graph(
@@ -74,7 +56,7 @@ def build_agent_graph(
 
     The agent node prepends the system prompt automatically.
     """
-    llm = _create_llm()
+    llm = create_langchain_llm(streaming=True, temperature=0.7)
     llm_with_tools = llm.bind_tools(tools)
 
     async def call_model(state: AgentState) -> dict:

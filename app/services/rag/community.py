@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import json
 import logging
-from openai import OpenAI
 from app.config import get_settings
 from app.database import get_sync_db
 from app.models.knowledge import GraphCommunity, _now_ms, _short_uuid
@@ -24,16 +23,10 @@ from app.infrastructure.graph_store import (
     get_all_relations_for_kb,
     is_available as kuzu_available,
 )
+from app.services.ai import get_sync_llm_client
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
-
-llm_client = OpenAI(
-    api_key=settings.deepseek_api_key,
-    base_url=settings.deepseek_base_url,
-    timeout=60.0,
-    max_retries=0,
-)
 
 _SUMMARY_SYSTEM = """你是一个技术文档摘要专家。请根据一组相关实体的信息，生成该知识社区的自然语言摘要。
 
@@ -160,7 +153,7 @@ def build_communities(kb_id: str) -> list[dict]:
 def _generate_summary(entity_descriptions: str) -> str:
     """Generate a community summary via LLM."""
     try:
-        response = llm_client.chat.completions.create(
+        response = get_sync_llm_client().chat.completions.create(
             model=settings.deepseek_model,
             messages=[
                 {"role": "system", "content": _SUMMARY_SYSTEM},

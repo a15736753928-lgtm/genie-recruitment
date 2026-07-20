@@ -164,6 +164,16 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("⚠ 定时任务未启动（可手动调用 POST /api/settings/cleanup）: %s", e)
 
+    # ── Warm up LLM Router ──
+    try:
+        from app.services.ai import _ensure_router
+        from app.database import async_session_factory
+        async with async_session_factory() as session:
+            await _ensure_router(session)
+            logger.info("✓ LLM Router 已预热 (%s)", _elapsed())
+    except Exception as e:
+        logger.warning("⚠ LLM Router 预热失败: %s (%s)", e, _elapsed())
+
     # ── Ready ──
     logger.info("=" * 55)
     logger.info("  全部配置加载完毕，开始接收请求 (%s)", _elapsed())
@@ -263,6 +273,7 @@ from app.api.knowledge import knowledge_base as knowledge, rag
 from app.api.ai import agent_chat as ai_agent
 # 系统管理
 from app.api.system import dashboard, settings as settings_router, export as export_router
+from app.api.system import llm_config as llm_config_router
 
 app.include_router(positions.router, prefix="/api")
 app.include_router(resumes.router, prefix="/api")
@@ -274,6 +285,7 @@ app.include_router(dashboard.router, prefix="/api")
 app.include_router(ai_agent.router, prefix="/api")
 app.include_router(settings_router.router, prefix="/api")
 app.include_router(export_router.router, prefix="/api")
+app.include_router(llm_config_router.router)
 app.include_router(rag.router)  # RAG endpoints (prefix defined in router)
 
 

@@ -323,6 +323,40 @@ def augment_gender_from_portrait(parsed: dict, resume_file: str) -> dict:
     return parsed
 
 
+def _extract_json_from_llm(content: str) -> str:
+    """从 LLM 返回内容中尽可能提取 JSON 字符串。
+
+    处理 DeepSeek 模型常见的非标准输出：
+    - ```json ... ``` 和 ``` ... ``` 包裹
+    - JSON 前后混入了思考/解释文本
+    - 尾随逗号（trailing comma）
+    """
+    content = content.strip()
+
+    # 1) 去掉 markdown code fence
+    if content.startswith("```json"):
+        content = content[7:]
+    elif content.startswith("```"):
+        content = content[3:]
+    if content.endswith("```"):
+        content = content[:-3]
+    content = content.strip()
+
+    # 2) 尝试找到最外层的 { ... }
+    start = content.find("{")
+    if start == -1:
+        return content  # 完全没有 JSON，交给 json.loads 报错
+    # 从末尾反向找最后一个 }
+    end = content.rfind("}")
+    if end > start:
+        content = content[start:end + 1]
+
+    # 3) 去掉尾随逗号（最常见的 JSON 格式问题）
+    content = re.sub(r",\s*([}\]])", r"\1", content)
+
+    return content
+
+
 async def parse_resume_with_llm(text: str, position_name: str = "") -> Tuple[dict, Optional[str]]:
     """Use DeepSeek to parse resume text into structured data."""
     position_hint = f"\n目标应聘岗位：{position_name}" if position_name else ""
@@ -371,31 +405,63 @@ async def parse_resume_with_llm(text: str, position_name: str = "") -> Tuple[dic
 
 注意：age字段不要自行填写，留null即可；若识别到出生日期请填入birthDate，系统会自动计算年龄。
 注意：不要输出 analysis.dimensions 字段，维度评分由系统独立子 Agent 计算。"""
-    try:
+
+    async def _call_and_parse() -> Tuple[str, dict]:
+        """Call LLM and attempt to parse. Returns (raw_content, parsed_dict)."""
         response = await get_llm_client().chat.completions.create(
             model=settings.deepseek_model,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3,
             max_tokens=4096,
         )
-        content = response.choices[0].message.content.strip()
-        if content.startswith("```json"):
-            content = content[7:]
-        if content.startswith("```"):
-            content = content[3:]
-        if content.endswith("```"):
-            content = content[:-3]
-        parsed = json.loads(content.strip())
-        parsed = enrich_parsed_fields(parsed, text)
-        if parsed.get("name") == UNKNOWN:
-            return parsed, "AI 未能识别姓名，请检查简历格式"
-        return parsed, None
+        raw = response.choices[0].message.content or ""
+        content = _extract_json_from_llm(raw)
+        parsed = json.loads(content)
+        return raw, parsed
+
+    try:
+        raw, parsed = await _call_and_parse()
     except json.JSONDecodeError as e:
-        logger.exception("LLM returned invalid JSON")
-        return {}, f"AI 返回格式错误: {e}"
+        logger.warning(
+            "LLM returned invalid JSON on first attempt: %s\n"
+            "Raw response (first 2000 chars): %s",
+            e, str(raw)[:2000] if 'raw' in dir() else "(no response)"
+        )
+        # 重试一次：把错误告诉 LLM，让它修复
+        try:
+            fix_prompt = (
+                f"你刚才返回了无效的 JSON。请修复后重新输出，只返回纯 JSON，不要任何其他文字。\n\n"
+                f"错误：{e}\n\n"
+                f"【原始任务】：{prompt}"
+            )
+            response = await get_llm_client().chat.completions.create(
+                model=settings.deepseek_model,
+                messages=[{"role": "user", "content": fix_prompt}],
+                temperature=0.1,
+                max_tokens=4096,
+            )
+            raw2 = response.choices[0].message.content or ""
+            content2 = _extract_json_from_llm(raw2)
+            parsed = json.loads(content2)
+            logger.info("LLM JSON retry succeeded")
+        except json.JSONDecodeError as e2:
+            logger.error(
+                "LLM still returned invalid JSON after retry: %s\n"
+                "Retry response (first 2000 chars): %s",
+                e2, str(raw2)[:2000] if 'raw2' in dir() else "(no response)"
+            )
+            return {}, f"AI 返回格式错误（重试后仍失败）: {e2}"
+        except Exception as e2:
+            logger.exception("LLM retry failed with unexpected error")
+            return {}, f"AI 重试失败: {e2}"
     except Exception as e:
         logger.exception("LLM parse error")
         return {}, f"AI 解析失败: {e}"
+
+    parsed = enrich_parsed_fields(parsed, text)
+    if parsed.get("name") == UNKNOWN:
+        return parsed, "AI 未能识别姓名，请检查简历格式"
+    return parsed, None
 
 
 CANDIDATE_LOAD_OPTIONS = (

@@ -6,19 +6,11 @@ import logging
 import re
 from typing import Optional, Tuple
 
-from openai import AsyncOpenAI
-
 from app.config import get_settings
+from app.services.ai import get_llm_client
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
-
-_llm_client = AsyncOpenAI(
-    api_key=settings.deepseek_api_key,
-    base_url=settings.deepseek_base_url,
-    timeout=45.0,
-    max_retries=0,
-)
 
 UNKNOWN = "未知"
 
@@ -139,7 +131,7 @@ async def classify_with_llm(text: str) -> Tuple[bool, str, str]:
   "documentType": "简历/合同/发票/论文/其他"
 }}"""
 
-    response = await _llm_client.chat.completions.create(
+    response = await get_llm_client().chat.completions.create(
         model=settings.deepseek_model,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.1,

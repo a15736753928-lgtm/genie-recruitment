@@ -9,23 +9,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, and_, case, or_, text
 from sqlalchemy.orm import selectinload
 from pydantic import BaseModel
-from openai import AsyncOpenAI
 from app.database import get_db
 from app.models.recruitment import Candidate, Position
 from app.models.interview import InterviewQuestion, InterviewEvaluation, InterviewTranscript, InterviewSegmentEvaluation
 from app.config import get_settings
 from app.infrastructure import minio_storage
 from app.services.system.system_settings import get_system_setting
+from app.services.ai import get_llm_client
 
 router = APIRouter(tags=["面试"])
 settings = get_settings()
-
-llm_client = AsyncOpenAI(
-    api_key=settings.deepseek_api_key,
-    base_url=settings.deepseek_base_url,
-    timeout=60.0,
-    max_retries=0,
-)
 
 INTERVIEW_ELIGIBLE_STATUSES = {"passed", "first_interview", "second_interview", "pending_interview"}
 
@@ -129,7 +122,7 @@ async def generate_questions_with_llm(
 请返回纯JSON对象：{{"category": "...", "difficulty": "...", "content": "..."}}"""
 
     try:
-        response = await llm_client.chat.completions.create(
+        response = await get_llm_client().chat.completions.create(
             model=settings.deepseek_model,
             messages=[{"role": "system", "content": system_prompt}],
             temperature=0.7,
@@ -307,7 +300,7 @@ async def extract_qa_from_transcript(transcript_text: str, position_name: str) -
 {transcript_slice}"""
 
     try:
-        response = await llm_client.chat.completions.create(
+        response = await get_llm_client().chat.completions.create(
             model=settings.deepseek_model,
             messages=[{"role": "system", "content": system_prompt}],
             temperature=0.2,
@@ -355,7 +348,7 @@ async def extract_segments_from_transcript(transcript_text: str, position_name: 
 {transcript_text[:8000]}"""
 
     try:
-        response = await llm_client.chat.completions.create(
+        response = await get_llm_client().chat.completions.create(
             model=settings.deepseek_model,
             messages=[{"role": "system", "content": system_prompt}],
             temperature=0.2,

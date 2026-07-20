@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import json
 import logging
-from openai import OpenAI
 from app.config import get_settings
 from app.infrastructure.graph_store import (
     upsert_entity,
@@ -21,16 +20,10 @@ from app.infrastructure.graph_store import (
     upsert_relation,
     is_available as kuzu_available,
 )
+from app.services.ai import get_sync_llm_client
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
-
-llm_client = OpenAI(
-    api_key=settings.deepseek_api_key,
-    base_url=settings.deepseek_base_url,
-    timeout=60.0,
-    max_retries=0,
-)
 
 _EXTRACT_ENTITIES_SYSTEM = """你是一个知识图谱实体抽取专家。从给定的文本片段中提取关键实体。
 
@@ -125,7 +118,7 @@ def _extract_entities_batch(chunks: list[str], chunk_ids: list[int]) -> list[dic
     prompt = f"以下文本片段来自同一份文档，请提取其中的关键实体：\n\n{context}"
 
     try:
-        response = llm_client.chat.completions.create(
+        response = get_sync_llm_client().chat.completions.create(
             model=settings.deepseek_model,
             messages=[
                 {"role": "system", "content": _EXTRACT_ENTITIES_SYSTEM},
@@ -166,7 +159,7 @@ def _extract_relations(entities: list[dict], context_chunks: list[str]) -> list[
     prompt = f"已知实体：\n" + "\n".join(entity_list) + f"\n\n文本上下文：\n{context}"
 
     try:
-        response = llm_client.chat.completions.create(
+        response = get_sync_llm_client().chat.completions.create(
             model=settings.deepseek_model,
             messages=[
                 {"role": "system", "content": _EXTRACT_RELATIONS_SYSTEM},

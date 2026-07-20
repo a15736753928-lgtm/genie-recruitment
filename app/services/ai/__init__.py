@@ -1,108 +1,51 @@
-"""AI 服务层 —— 与 LLM 直接交互的业务 Agent。
+"""AI 服务层 —— 统一 LLM 入口。
 
-支持多个 API Key 负载均衡 + 互相兜底：一个 Key 故障时自动切换到另一个。
+所有 LLM 调用必须通过此模块的公共 API，禁止在业务代码中直接创建
+AsyncOpenAI / OpenAI / ChatOpenAI 实例。
+
+公共 API：
+- ``get_llm_client()``          → 轮询返回 AsyncOpenAI 客户端
+- ``llm_chat(messages, ...)``    → 调用 LLM 并返回 text（带兜底重试）
+- ``create_langchain_llm(...)``  → 创建 LangChain ChatModel（Agent 用）
+- ``reload_llm_config(db)``      → 重载 DB 配置（设置保存后调用）
+- ``get_router_stats()``         → Router 调试信息
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 
-from openai import AsyncOpenAI
-
-from app.config import get_settings
+from app.services.ai.router import (
+    get_llm_client,
+    get_sync_llm_client,
+    llm_chat,
+    create_langchain_llm,
+    reload_llm_config,
+    get_router_stats,
+)
 
 logger = logging.getLogger(__name__)
 
-# ── 连接池 ────────────────────────────────────────────────
+# ── 延迟加载 Router ───────────────────────────────────────
 
-_clients: list[AsyncOpenAI] = []
-_index: int = 0
+_router_initialized: bool = False
 
 
-def _init_clients() -> None:
-    global _clients
-    if _clients:
+async def _ensure_router(db=None):
+    """首次调用时 warm-up Router。"""
+    global _router_initialized
+    if _router_initialized:
         return
-    settings = get_settings()
-    keys = [k.strip() for k in settings.deepseek_api_key.split(",") if k.strip()]
-    if not keys:
-        raise RuntimeError("未配置 DeepSeek API Key（DEEPSEEK_API_KEY 为空）")
-    _clients = [
-        AsyncOpenAI(
-            api_key=key,
-            base_url=settings.deepseek_base_url,
-            timeout=60.0,
-            max_retries=1,
-        )
-        for key in keys
-    ]
-    logger.info("DeepSeek 客户端池已初始化：%d 个 API Key", len(_clients))
+    if db is not None:
+        await reload_llm_config(db)
+        _router_initialized = True
 
 
-def _all_clients() -> list[AsyncOpenAI]:
-    _init_clients()
-    return _clients
-
-
-def get_llm_client() -> AsyncOpenAI:
-    """轮询返回一个 AsyncOpenAI 客户端（多 Key 负载均衡）。"""
-    global _index
-    _init_clients()
-    client = _clients[_index % len(_clients)]
-    _index = (_index + 1) % len(_clients)
-    return client
-
-
-# ── 带兜底的 LLM 调用 ─────────────────────────────────────
-
-async def llm_call_with_retry(
-    model: str | None = None,
-    *,
-    messages: list,
-    temperature: float = 0.2,
-    max_tokens: int = 512,
-    max_retries: int = 3,
-) -> str:
-    """调用 LLM 并返回 content 文本。
-
-    - 轮询选 Key（负载均衡）
-    - 网络/服务端错误 → 换下一个 Key 重试（兜底）
-    - 所有 Key 都失败 → 退避等待后继续尝试
-    """
-    clients = _all_clients()
-    model = model or get_settings().deepseek_model
-    last_error: Exception | None = None
-
-    for attempt in range(max_retries):
-        # 每个 attempt 尝试所有 key
-        for offset, client in enumerate(_cycle_from_current(clients)):
-            try:
-                resp = await client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                )
-                return (resp.choices[0].message.content or "").strip()
-            except Exception as exc:
-                last_error = exc
-                key_idx = (_index + offset) % len(clients)
-                if offset < len(clients) - 1:
-                    logger.warning("Key #%d 调用失败，换下一个: %s", key_idx, exc)
-                else:
-                    wait = 1.5 ** attempt
-                    logger.warning(
-                        "所有 Key 本轮均失败 (attempt %d/%d)，%0.1fs 后退避重试",
-                        attempt + 1, max_retries, wait,
-                    )
-                    await asyncio.sleep(wait)
-
-    raise last_error  # type: ignore[misc]
-
-
-def _cycle_from_current(items: list) -> list:
-    """从当前轮询位开始排列 items，保证首次尝试的是当前轮询 key。"""
-    global _index
-    _init_clients()
-    start = _index % len(items)
-    return items[start:] + items[:start]
+__all__ = [
+    "get_llm_client",
+    "get_sync_llm_client",
+    "llm_chat",
+    "create_langchain_llm",
+    "reload_llm_config",
+    "get_router_stats",
+    "_ensure_router",
+]

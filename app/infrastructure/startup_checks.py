@@ -448,25 +448,27 @@ async def check_portrait_gender(settings: Settings) -> CheckResult:
 # ═══════════════════════════════════════════════════════════════════
 
 async def check_deepseek_api_key(settings: Settings) -> CheckResult:
-    """Verify DeepSeek API key is configured."""
-    key = settings.deepseek_api_key
-    if not key or key == "sk-your-api-key-here":
+    """Verify at least one LLM API key is configured (env bootstrap)."""
+    keys = [k.strip() for k in settings.deepseek_api_key.split(",") if k.strip()]
+    secrets = [k for k in keys if k and k != "sk-your-api-key-here"]
+    if not secrets:
         return CheckResult(
-            "DeepSeek API Key", "config", CheckStatus.FAIL,
+            "LLM API Key（env bootstrap）", "config", CheckStatus.FAIL,
             "Not configured; AI agent features will not work",
         )
     return CheckResult(
-        "DeepSeek API Key", "config", CheckStatus.PASS,
-        f"Configured ({key[:8]}...)",
+        "LLM API Key（env bootstrap）", "config", CheckStatus.PASS,
+        f"Configured ({len(secrets)} key(s): {secrets[0][:8]}...)",
     )
 
 
 async def check_deepseek_api_reachable(settings: Settings) -> CheckResult:
-    """Verify DeepSeek API endpoint is reachable."""
-    key = settings.deepseek_api_key
-    if not key or key == "sk-your-api-key-here":
+    """Verify LLM API endpoint is reachable (first configured key)."""
+    keys = [k.strip() for k in settings.deepseek_api_key.split(",") if k.strip()]
+    secrets = [k for k in keys if k and k != "sk-your-api-key-here"]
+    if not secrets:
         return CheckResult(
-            "DeepSeek API", "config", CheckStatus.PASS,
+            "LLM API Reachable", "config", CheckStatus.PASS,
             "Skipped (no key configured)",
         )
 
@@ -476,25 +478,62 @@ async def check_deepseek_api_reachable(settings: Settings) -> CheckResult:
         async with httpx.AsyncClient(timeout=5.0) as client:
             resp = await client.get(
                 f"{settings.deepseek_base_url}/v1/models",
-                headers={"Authorization": f"Bearer {key}"},
+                headers={"Authorization": f"Bearer {secrets[0]}"},
             )
             elapsed = (time.perf_counter() - t0) * 1000
             if resp.status_code == 200:
                 return CheckResult(
-                    "DeepSeek API", "config", CheckStatus.PASS,
+                    "LLM API Reachable", "config", CheckStatus.PASS,
                     f"Reachable ({resp.status_code})",
                     elapsed,
                 )
             else:
                 return CheckResult(
-                    "DeepSeek API", "config", CheckStatus.FAIL,
+                    "LLM API Reachable", "config", CheckStatus.FAIL,
                     f"HTTP {resp.status_code}: {resp.text[:100]}",
                     elapsed,
                 )
     except Exception as e:
         return CheckResult(
-            "DeepSeek API", "config", CheckStatus.FAIL,
+            "LLM API Reachable", "config", CheckStatus.FAIL,
             f"Unreachable: {e}",
+            (time.perf_counter() - t0) * 1000,
+        )
+
+
+async def check_llm_config_store(settings: Settings) -> CheckResult:
+    """Verify LLM config can be loaded from DB (or env bootstrap fallback)."""
+    t0 = time.perf_counter()
+    try:
+        from app.database import SyncSessionFactory
+        from app.services.ai.config_store import load_llm_config as load_llm_config_sync
+        import asyncio
+
+        async def _check():
+            from app.database import async_session_factory
+            async with async_session_factory() as db:
+                config = await load_llm_config_sync(db)
+                providers = config.get("providers", [])
+                enabled = [p for p in providers if p.get("enabled", True)]
+                if not enabled:
+                    return False, "No enabled providers (env bootstrap failed?)"
+                total_keys = sum(
+                    len([k for k in p.get("apiKeys", []) if k.get("enabled", True)])
+                    for p in enabled
+                )
+                return True, f"{len(enabled)} provider(s), {total_keys} key(s) active"
+
+        ok, detail = await _check()
+        return CheckResult(
+            "LLM Config Store", "config",
+            CheckStatus.PASS if ok else CheckStatus.FAIL,
+            detail,
+            (time.perf_counter() - t0) * 1000,
+        )
+    except Exception as e:
+        return CheckResult(
+            "LLM Config Store", "config", CheckStatus.FAIL,
+            f"Cannot load: {e}",
             (time.perf_counter() - t0) * 1000,
         )
 
@@ -656,6 +695,7 @@ async def run_startup_checks(settings: Settings) -> list[CheckResult]:
     checks_phase3: list[CheckFn] = [
         check_deepseek_api_key,
         check_deepseek_api_reachable,
+        check_llm_config_store,
         check_cors_origins,
     ]
 

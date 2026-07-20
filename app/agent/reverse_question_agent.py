@@ -133,12 +133,8 @@ async def score_reverse_question(
         # 没有反问内容，直接给 0 分（不浪费 LLM 调用）
         return _fallback_result(0)
 
-    client = AsyncOpenAI(
-        api_key=settings.deepseek_api_key,
-        base_url=settings.deepseek_base_url,
-        timeout=60.0,
-        max_retries=0,
-    )
+    from app.services.ai import get_llm_client
+    client = get_llm_client()
     system_prompt = _build_system_prompt(position_name)
     user_prompt = _build_user_prompt(reverse_text, position_name, position_requirements or "")
 

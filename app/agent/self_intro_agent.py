@@ -133,12 +133,8 @@ async def score_self_intro(
         # 没有自我介绍内容，直接给 0 分（不浪费 LLM 调用）
         return _fallback_result(0)
 
-    client = AsyncOpenAI(
-        api_key=settings.deepseek_api_key,
-        base_url=settings.deepseek_base_url,
-        timeout=60.0,
-        max_retries=0,
-    )
+    from app.services.ai import get_llm_client
+    client = get_llm_client()
     system_prompt = _build_system_prompt(position_name)
     # 简历文本可能较长，截断避免超长 prompt
     resume_excerpt = (resume_text or "")[:3000]
