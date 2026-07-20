@@ -12,11 +12,20 @@ existing collection must be dropped and documents re-ingested.
 """
 
 import logging
+import os
 import re
 import threading
 import time
 from queue import Empty, Queue
 from typing import Optional
+
+# ── 抑制 gRPC keepalive "too_many_pings" 日志噪音 ──────────
+# pymilvus 3.x 内嵌 gRPC 客户端 keepalive 间隔太短（10s），
+# Milvus Lite 服务端会主动 GOAWAY。reset_client() 已做了
+# 容错处理，这里只抑制 C-core 的日志噪音。
+# 必须在 import pymilvus 之前设置。
+if not os.environ.get("GRPC_VERBOSITY"):
+    os.environ["GRPC_VERBOSITY"] = "ERROR"
 
 from pymilvus import MilvusClient, DataType
 from app.config import get_settings
