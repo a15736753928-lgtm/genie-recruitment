@@ -72,6 +72,7 @@ class Candidate(Base):
     score = Column(Integer, default=0)
     status = Column(String(32), nullable=False, default="job_hunting")
     resume_file = Column(String(512))
+    resume_file_hash = Column(String(64), nullable=True, index=True)
     upload_time = Column(Date, default=date.today)
     # Screening dual-dimension fields
     screening_ai_score = Column(Integer, nullable=True)

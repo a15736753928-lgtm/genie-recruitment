@@ -98,6 +98,24 @@ def _add_column_if_missing(connection, table: str, column: str, ddl_type: str) -
     ))
 
 
+def _ensure_index_if_missing(connection, index_name: str, table: str, column: str) -> None:
+    """Create a btree index on a column when absent (idempotent)."""
+    from sqlalchemy import text
+
+    exists = connection.execute(text(
+        "SELECT EXISTS ("
+        "  SELECT 1 FROM pg_indexes"
+        "  WHERE schemaname = 'public' AND indexname = :index_name"
+        ")"
+    ), {"index_name": index_name}).scalar()
+    if exists:
+        return
+    connection.execute(text("SET LOCAL lock_timeout = '3s'"))
+    connection.execute(text(
+        f"CREATE INDEX {index_name} ON {table} ({column})"
+    ))
+
+
 def _drop_column_if_exists(connection, table: str, column: str) -> None:
     """幂等删除列:列不存在则跳过,避免重启时反复尝试 DROP 报错。"""
     from sqlalchemy import text
@@ -175,6 +193,14 @@ def _run_migrations(connection):
     _add_column_if_missing(connection, "positions", "salary_range", "VARCHAR(64)")
     # v9: 移除无业务含义的 chapter_number 列(仅种子数据排序用途),列表改用 created_at 排序
     _drop_column_if_exists(connection, "positions", "chapter_number")
+    # v10: 简历文件 SHA256，用于上传查重
+    _add_column_if_missing(connection, "candidates", "resume_file_hash", "VARCHAR(64)")
+    _ensure_index_if_missing(
+        connection,
+        "ix_candidates_resume_file_hash",
+        "candidates",
+        "resume_file_hash",
+    )
 
 
 def _migrate_transcript_history(connection) -> None:

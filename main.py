@@ -12,6 +12,7 @@ if sys.platform == "win32":
 
 import uvicorn
 from app.config import get_settings
+from app.log_config import UVICORN_LOG_CONFIG
 
 settings = get_settings()
 _in_pycharm = os.getenv("PYCHARM_HOSTED") == "1"
@@ -22,10 +23,12 @@ if __name__ == "__main__":
     print(f"地址: http://127.0.0.1:{settings.app_port}")
     print(f"文档: http://127.0.0.1:{settings.app_port}/docs")
     print(f"自动重载: {'开（终端模式）' if _reload else '关（PyCharm 模式，改代码后 Ctrl+F5 重跑）'}")
+
     uvicorn.run(
         "app.app:app",
         host=settings.app_host,
         port=settings.app_port,
         reload=_reload,
         reload_dirs=["app"] if _reload else None,
+        log_config=UVICORN_LOG_CONFIG,
     )

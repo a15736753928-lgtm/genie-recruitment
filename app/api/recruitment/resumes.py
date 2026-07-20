@@ -3,6 +3,7 @@ import uuid
 import json
 import logging
 import re
+import hashlib
 import asyncio
 from datetime import date
 from typing import Optional, List, Tuple
@@ -22,6 +23,15 @@ from app.models.recruitment import (
 from app.config import get_settings
 from app.infrastructure import minio_storage
 from app.services.recruitment.portrait_gender import infer_gender_from_resume_file
+from app.services.recruitment.resume_dedup import find_duplicate_candidate
+from app.services.recruitment.resume_field_verify import resolve_verified_education
+from app.services.recruitment.resume_validator import validate_is_resume
+from app.services.recruitment.education_tier_tag import (
+    resolve_school_tier_tag,
+    resolve_school_tier_tag_sync,
+    inject_school_tier_into_keywords,
+    SCHOOL_TIER_TAGS,
+)
 from app.services.system.system_settings import get_system_setting
 
 router = APIRouter(tags=["简历"])
@@ -287,7 +297,7 @@ def enrich_parsed_fields(parsed: dict, raw_text: str) -> dict:
 
     result["age"] = resolve_age(result, raw_text)
 
-    result["education"] = normalize_text_field(result.get("education"))
+    result["education"] = resolve_verified_education(result, raw_text)
     result["experience"] = normalize_experience(
         result.get("experience"),
         has_work_history=bool(result.get("workHistory")),
@@ -350,7 +360,7 @@ async def parse_resume_with_llm(text: str, position_name: str = "") -> Tuple[dic
     "projectHistory": [{{"name": "项目名", "role": "角色", "period": "时间段", "description": "项目描述"}}],
     "analysis": {{
         "overallScore": 0-100的整数,
-        "keywords": ["关键词"],
+        "keywords": ["关键词1", "关键词2", "关键词3", "关键词4", "关键词5"],
         "summary": "综合评价摘要",
         "positionMatch": "岗位匹配度分析",
         "experienceInsight": "经验洞察",
@@ -361,6 +371,12 @@ async def parse_resume_with_llm(text: str, position_name: str = "") -> Tuple[dic
 }}
 
 只返回JSON，不要任何其他文字。
+
+【严格要求】
+1. 只能提取简历原文中明确出现的信息，严禁根据岗位或常识推测学历、年限、学校等信息。
+2. education、educationHistory 仅在原文出现学校名、学历词（如本科/硕士/大专/学士）或教育时间段时填写；原文完全没有则 education 填"未知"，educationHistory 返回 []。
+3. workHistory 同样仅填写原文明确写出的公司与岗位，不得臆造。
+4. keywords 必须输出恰好 5 个，从简历技能、项目、工具栈中提取，不足 5 个时用技能字段补足。
 
 注意：age字段不要自行填写，留null即可；若识别到出生日期请填入birthDate，系统会自动计算年龄。
 注意：不要输出 analysis.dimensions 字段，维度评分由系统独立子 Agent 计算。"""
@@ -468,7 +484,18 @@ def serialize_candidate(c: Candidate) -> dict:
         "resumeFileType": resume_ext.lstrip("."),
         "parseStatus": "parsed" if is_candidate_parsed(c) else "pending",
         "aiAnalysis": None,
+        "schoolTierLabel": None,
     }
+    tier_from_keywords = None
+    if c.ai_analysis and c.ai_analysis.keywords:
+        for keyword in c.ai_analysis.keywords:
+            if keyword in SCHOOL_TIER_TAGS:
+                tier_from_keywords = keyword
+                break
+    data["schoolTierLabel"] = tier_from_keywords or resolve_school_tier_tag_sync({
+        "education": data["education"],
+        "educationHistory": data["educationHistory"],
+    })
     if c.ai_analysis:
         a = c.ai_analysis
         data["aiAnalysis"] = {
@@ -485,7 +512,43 @@ def serialize_candidate(c: Candidate) -> dict:
     return data
 
 
-async def run_resume_parse(candidate: Candidate, position_name: str = "", db: AsyncSession = None) -> Optional[str]:
+async def extract_and_parse_resume(
+    object_key: str,
+    position_name: str = "",
+    *,
+    db: AsyncSession,
+    resume_text: Optional[str] = None,
+) -> Tuple[Optional[dict], Optional[str]]:
+    """抽取简历文本并用 LLM 解析为结构化数据，供入库前查重或写入候选人。"""
+    ai_enabled = await get_system_setting(db, "aiResumeAnalysis", True)
+    if not ai_enabled:
+        return None, "AI 简历分析已关闭"
+
+    text = resume_text
+    if text is None:
+        text, extract_error = extract_text_from_file(object_key)
+        if extract_error:
+            return None, extract_error
+    if not (text or "").strip():
+        return None, "简历文件内容为空"
+
+    parsed, parse_error = await parse_resume_with_llm(text, position_name)
+    if parse_error and not parsed:
+        return None, parse_error
+    if not parsed:
+        return None, "AI 未能解析简历内容"
+
+    parsed = enrich_parsed_fields(parsed, text)
+    parsed = await asyncio.to_thread(augment_gender_from_portrait, parsed, object_key or "")
+    return parsed, parse_error
+
+
+async def run_resume_parse(
+    candidate: Candidate,
+    position_name: str = "",
+    db: AsyncSession = None,
+    pre_parsed: Optional[dict] = None,
+) -> Optional[str]:
     """Extract text, parse with LLM, and fill candidate. Returns error message if any."""
     if not candidate.resume_file:
         return "未找到简历文件"
@@ -499,20 +562,25 @@ async def run_resume_parse(candidate: Candidate, position_name: str = "", db: As
         logger.info("aiResumeAnalysis 已关闭，跳过 AI 解析 candidate=%s", candidate.id)
         return "AI 简历分析已关闭，仅保存文件"
 
+    parse_error = None
     text, extract_error = extract_text_from_file(candidate.resume_file)
     if extract_error:
         return extract_error
     if not text.strip():
         return "简历文件内容为空"
 
-    parsed, parse_error = await parse_resume_with_llm(text, position_name)
-    if parse_error and not parsed:
-        return parse_error
-    if not parsed:
-        return "AI 未能解析简历内容"
-
-    parsed = enrich_parsed_fields(parsed, text)
-    parsed = await asyncio.to_thread(augment_gender_from_portrait, parsed, candidate.resume_file or "")
+    if pre_parsed is not None:
+        parsed = pre_parsed
+    else:
+        parsed, parse_error = await extract_and_parse_resume(
+            candidate.resume_file,
+            position_name,
+            db=db,
+        )
+        if parse_error and not parsed:
+            return parse_error
+        if not parsed:
+            return "AI 未能解析简历内容"
 
     # 5 个维度各自由独立子 Agent 打分（教育背景走规则，其余 4 个走 LLM），
     # 按固定顺序组装 dimensions，覆盖主解析里可能存在的维度字段。
@@ -589,6 +657,10 @@ async def fill_candidate_from_parsed(candidate: Candidate, parsed: dict, db: Asy
 
     if candidate.ai_analysis:
         await db.delete(candidate.ai_analysis)
+
+    tier_tag = await resolve_school_tier_tag(parsed)
+    if tier_tag:
+        inject_school_tier_into_keywords(parsed, tier_tag)
 
     analysis_data = parsed.get("analysis") or {}
     if analysis_data:
@@ -779,15 +851,45 @@ async def upload_resume(
     original_name = file.filename or "resume.pdf"
     file_ext = os.path.splitext(original_name)[1].lower() or ".pdf"
 
+    content = await file.read()
+    file_hash = hashlib.sha256(content).hexdigest()
+
+    dup_result = await db.execute(
+        select(Candidate).where(Candidate.resume_file_hash == file_hash)
+    )
+    duplicate = dup_result.scalar_one_or_none()
+    if duplicate:
+        return {
+            "code": 409,
+            "message": f"该简历文件已存在，对应候选人：{duplicate.name}",
+            "data": {
+                "duplicate": True,
+                "duplicateType": "file",
+                "existingCandidateId": str(duplicate.id),
+                "existingCandidateName": duplicate.name,
+            },
+        }
+
     # 1) 保存文件到 MinIO（先存，后续无论岗位是否匹配上都能用）
     object_key = f"resumes/{uuid.uuid4()}{file_ext}"
-    content = await file.read()
     try:
         await asyncio.to_thread(
             minio_storage.upload_bytes, object_key, content, "application/octet-stream"
         )
     except Exception as e:
         return {"code": 500, "message": f"简历存储失败: {e}", "data": None}
+
+    resume_text, extract_error = extract_text_from_file(object_key)
+    if extract_error or not resume_text.strip():
+        try:
+            await asyncio.to_thread(minio_storage.delete_object, object_key)
+        except Exception:
+            pass
+        return {
+            "code": 422,
+            "message": f"无法读取文档内容，请确认文件格式正确：{extract_error or '内容为空'}",
+            "data": {"notResume": True, "documentType": "未知"},
+        }
 
     # 2) 解析应聘岗位：
     #    - 用户显式传了 positionId → 直接用（保持原行为）；
@@ -809,25 +911,20 @@ async def upload_resume(
         # 没传岗位 → 走 AI 岗位匹配 Agent
         from app.services.recruitment.position_matcher import match_position_for_resume
 
-        # 先把简历文本抽出来给 Agent 用
-        resume_text, extract_error = extract_text_from_file(object_key)
-        if not extract_error and resume_text.strip():
-            resolved_position_id, position_name, match_reason = await match_position_for_resume(
-                db, resume_text
-            )
-            if resolved_position_id:
-                position_source = "agent"
-                pos_result = await db.execute(select(Position).where(Position.id == resolved_position_id))
-                position = pos_result.scalar_one_or_none()
-                if not position:
-                    # AI 返回的 id 在在招列表里但库里查不到（极少见），清空走回退
-                    logger.warning("AI 匹配到的岗位 id=%s 在数据库中不存在", resolved_position_id)
-                    resolved_position_id = ""
-                    position = None
-        else:
-            logger.warning("未指定岗位且简历文本抽取失败，回退默认岗位: %s", extract_error)
+        resolved_position_id, position_name, match_reason = await match_position_for_resume(
+            db, resume_text
+        )
+        if resolved_position_id:
+            position_source = "agent"
+            pos_result = await db.execute(select(Position).where(Position.id == resolved_position_id))
+            position = pos_result.scalar_one_or_none()
+            if not position:
+                # AI 返回的 id 在在招列表里但库里查不到（极少见），清空走回退
+                logger.warning("AI 匹配到的岗位 id=%s 在数据库中不存在", resolved_position_id)
+                resolved_position_id = ""
+                position = None
 
-        # AI 未匹配上或文本抽取失败 → 回退到系统默认岗位
+        # AI 未匹配上 → 回退到系统默认岗位
         if not position:
             fallback_id = str(await get_system_setting(db, "defaultPositionId", "") or "")
             if fallback_id:
@@ -853,12 +950,65 @@ async def upload_resume(
                 "data": None,
             }
 
+    # 2.4) 校验是否为个人求职简历
+    ai_enabled = await get_system_setting(db, "aiResumeAnalysis", True)
+    pre_parsed: Optional[dict] = None
+    if ai_enabled:
+        pre_parsed, dedup_parse_error = await extract_and_parse_resume(
+            object_key,
+            position.name if position else "",
+            db=db,
+            resume_text=resume_text,
+        )
+
+    is_resume_doc, reject_reason, document_type = await validate_is_resume(
+        resume_text,
+        parsed=pre_parsed,
+        use_llm=ai_enabled,
+    )
+    if not is_resume_doc:
+        try:
+            await asyncio.to_thread(minio_storage.delete_object, object_key)
+        except Exception:
+            pass
+        return {
+            "code": 422,
+            "message": f"上传的文件不是简历：{reject_reason}",
+            "data": {"notResume": True, "documentType": document_type},
+        }
+
+    # 2.5) AI 解析后按姓名/年龄/性别/学历/工作经历判断是否同一人
+    if ai_enabled and pre_parsed:
+        duplicate_person = await find_duplicate_candidate(db, pre_parsed)
+        if duplicate_person:
+            try:
+                await asyncio.to_thread(minio_storage.delete_object, object_key)
+            except Exception:
+                pass
+            return {
+                "code": 409,
+                "message": (
+                    f"该候选人与已有记录为同一人"
+                    f"（姓名、年龄、性别、学历、工作经历一致），"
+                    f"对应候选人：{duplicate_person.name}"
+                ),
+                "data": {
+                    "duplicate": True,
+                    "duplicateType": "person",
+                    "existingCandidateId": str(duplicate_person.id),
+                    "existingCandidateName": duplicate_person.name,
+                },
+            }
+    elif ai_enabled and not pre_parsed:
+        logger.info("入库前身份查重跳过：未能解析简历结构化信息")
+
     # 3) 创建候选人
     candidate = Candidate(
         name=original_name,
         position_id=resolved_position_id,
         status="job_hunting",
         resume_file=object_key,
+        resume_file_hash=file_hash,
         upload_time=date.today(),
     )
     db.add(candidate)
@@ -870,7 +1020,12 @@ async def upload_resume(
     if auto_parse:
         candidate = await load_candidate(db, candidate.id)
         if candidate:
-            parse_message = await run_resume_parse(candidate, position.name, db)
+            parse_message = await run_resume_parse(
+                candidate,
+                position.name,
+                db,
+                pre_parsed=pre_parsed,
+            )
             if parse_message and is_candidate_parsed(candidate):
                 parse_message = None  # partial success is ok
 

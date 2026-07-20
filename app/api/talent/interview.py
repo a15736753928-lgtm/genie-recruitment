@@ -6,7 +6,7 @@ import asyncio
 from typing import Optional, List
 from fastapi import APIRouter, Depends, File, Form, Query, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, and_, case, or_
+from sqlalchemy import select, func, and_, case, or_, text
 from sqlalchemy.orm import selectinload
 from pydantic import BaseModel
 from openai import AsyncOpenAI
@@ -741,11 +741,42 @@ async def batch_delete_questions(body: dict, db: AsyncSession = Depends(get_db))
             deleted_count += 1
         await db.flush()
 
-    # 重新编号剩余题目(按 index_num 升序保持原顺序)
+    # 重新编号剩余题目 —— 两步走，避免唯一约束在行级校验时冲突。
+    # PostgreSQL 的 UNIQUE 约束默认 NOT DEFERRABLE，在 UPDATE 每行后即刻
+    # 校验。当旧 index_num 与新 index_num 交叉时（例如删掉第 1 题后，
+    # 旧 2→新 1、旧 3→新 2），同一语句内仍可能因处理顺序不同而冲突。
+    # 第一步：将所有 index_num 加一个大偏移量，消除交叉；
+    # 第二步：从偏移后的值重新生成连续编号。
+    REINDEX_OFFSET = 1000000
+    await db.execute(
+        text("""
+            UPDATE interview_questions
+               SET index_num = index_num + :offset
+             WHERE candidate_id = :cid
+               AND round        = :rnd
+               AND (source = 'pre_generated' OR source IS NULL)
+        """),
+        {"cid": candidate_id, "rnd": round, "offset": REINDEX_OFFSET},
+    )
+    await db.execute(
+        text("""
+            WITH ranked AS (
+                SELECT id, ROW_NUMBER() OVER (ORDER BY index_num) AS new_num
+                FROM   interview_questions
+                WHERE  candidate_id = :cid
+                  AND  round        = :rnd
+                  AND  (source = 'pre_generated' OR source IS NULL)
+            )
+            UPDATE interview_questions
+               SET index_num = ranked.new_num
+              FROM ranked
+             WHERE interview_questions.id = ranked.id
+        """),
+        {"cid": candidate_id, "rnd": round},
+    )
+    # ORM 缓存中的 index_num 已由原始 SQL 更新，需要使其失效再查询
+    db.expire_all()
     remaining = await _fetch_pre_generated_questions(candidate_id, round, db)
-    for i, q in enumerate(remaining, 1):
-        q.index_num = i
-    await db.flush()
 
     return {
         "code": 0,

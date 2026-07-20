@@ -6,6 +6,7 @@ import logging
 import time
 import sys
 import io
+import os
 from app.config import get_settings
 
 # ── Early logging setup (before uvicorn takes over) ──
@@ -18,11 +19,52 @@ try:
 except (AttributeError, io.UnsupportedOperation):
     pass
 
+
+class _ColoredFormatter(logging.Formatter):
+    """纯 ANSI 彩色日志格式器 —— 不依赖 TTY 检测，始终输出颜色。"""
+
+    _LEVEL_COLORS = {
+        logging.DEBUG:    "\033[36m",  # cyan
+        logging.INFO:     "\033[32m",  # green
+        logging.WARNING:  "\033[33m",  # yellow
+        logging.ERROR:    "\033[31m",  # red
+        logging.CRITICAL: "\033[1;31m",  # bold red
+    }
+    _RESET  = "\033[0m"
+    _DIM   = "\033[2m"
+    _WHITE = "\033[37m"
+
+    def format(self, record: logging.LogRecord) -> str:
+        # 拷贝 record，避免修改原始对象影响其他 handler
+        record = logging.LogRecord(
+            record.name, record.levelno, record.pathname, record.lineno,
+            record.msg, record.args, record.exc_info,
+            func=record.funcName, sinfo=record.stack_info,
+        )
+        color = self._LEVEL_COLORS.get(record.levelno, "")
+        record.levelname = f"{color}{record.levelname:8}{self._RESET}"
+        record.name = f"{self._DIM}{record.name}{self._RESET}"
+        record.asctime = self.formatTime(record, self.datefmt)
+        # asctime 也做 dim 处理，整体视觉更柔和
+        return f"{self._DIM}{record.asctime}{self._RESET} {record.name} {record.levelname} {record.getMessage()}"
+
+
+# 强制 Rich / uvicorn 等库启用颜色（它们依赖 FORCE_COLOR 环境变量）
+os.environ.setdefault("FORCE_COLOR", "1")
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
-    stream=sys.stdout,
+    format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
+# 替换为彩色 formatter
+for h in logging.getLogger().handlers:
+    h.setFormatter(_ColoredFormatter(
+        fmt="%(asctime)s %(name)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+
 logger = logging.getLogger("genie.startup")
 
 settings = get_settings()
