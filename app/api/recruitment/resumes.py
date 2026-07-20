@@ -1,7 +1,6 @@
 import os
 import uuid
 import json
-import shutil
 import logging
 import re
 import asyncio

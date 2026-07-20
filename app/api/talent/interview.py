@@ -29,6 +29,35 @@ llm_client = AsyncOpenAI(
 
 INTERVIEW_ELIGIBLE_STATUSES = {"passed", "first_interview", "second_interview", "pending_interview"}
 
+
+def _pre_generated_source_filter():
+    """面试出题页题目来源：AI 预生成或历史数据（source 为空）。"""
+    return or_(
+        InterviewQuestion.source == "pre_generated",
+        InterviewQuestion.source.is_(None),
+    )
+
+
+def _pre_generated_scope(candidate_id: str, round: str):
+    return and_(
+        InterviewQuestion.candidate_id == candidate_id,
+        InterviewQuestion.round == round,
+        _pre_generated_source_filter(),
+    )
+
+
+async def _fetch_pre_generated_questions(
+    candidate_id: str,
+    round: str,
+    db: AsyncSession,
+) -> List[InterviewQuestion]:
+    result = await db.execute(
+        select(InterviewQuestion)
+        .where(_pre_generated_scope(candidate_id, round))
+        .order_by(InterviewQuestion.index_num)
+    )
+    return list(result.scalars().all())
+
 # ── FunASR singleton (loaded once, reused across all transcribe calls) ──
 _funasr_pipeline = None
 
@@ -359,14 +388,7 @@ async def get_or_generate_questions(candidate_id: str, round: str, db: AsyncSess
 
     result = await db.execute(
         select(InterviewQuestion)
-        .where(and_(
-            InterviewQuestion.candidate_id == candidate_id,
-            InterviewQuestion.round == round,
-            or_(
-                InterviewQuestion.source == "pre_generated",
-                InterviewQuestion.source.is_(None),
-            ),
-        ))
+        .where(_pre_generated_scope(candidate_id, round))
         .order_by(InterviewQuestion.index_num)
     )
     questions = result.scalars().all()
@@ -397,6 +419,11 @@ async def get_or_generate_questions(candidate_id: str, round: str, db: AsyncSess
 
     if isinstance(q_data, dict):
         q_data = [q_data]
+
+    # LLM 调用期间可能有并发请求已写入题目，避免重复插入。
+    existing = await _fetch_pre_generated_questions(candidate_id, round, db)
+    if existing:
+        return existing
 
     questions = []
     for i, qd in enumerate(q_data):
@@ -548,12 +575,9 @@ async def save_questions(body: dict, db: AsyncSession = Depends(get_db)):
     round = body.get("round")
     questions = body.get("questions", [])
 
-    # Remove existing
+    # Remove existing pre-generated questions only (keep transcript-derived ones)
     existing = await db.execute(
-        select(InterviewQuestion).where(and_(
-            InterviewQuestion.candidate_id == candidate_id,
-            InterviewQuestion.round == round,
-        ))
+        select(InterviewQuestion).where(_pre_generated_scope(candidate_id, round))
     )
     for q in existing.scalars().all():
         await db.delete(q)
@@ -579,12 +603,9 @@ async def regenerate_questions(body: dict, db: AsyncSession = Depends(get_db)):
     candidate_id = body.get("candidateId")
     round = body.get("round")
 
-    # Delete existing
+    # Delete existing pre-generated questions only
     existing = await db.execute(
-        select(InterviewQuestion).where(and_(
-            InterviewQuestion.candidate_id == candidate_id,
-            InterviewQuestion.round == round,
-        ))
+        select(InterviewQuestion).where(_pre_generated_scope(candidate_id, round))
     )
     for q in existing.scalars().all():
         await db.delete(q)
@@ -657,10 +678,9 @@ async def replace_question(question_id: str, body: dict, db: AsyncSession = Depe
     else:
         # 题目不存在（前端本地自定义题或已被删除）：追加一道新题
         max_idx_result = await db.execute(
-            select(func.max(InterviewQuestion.index_num)).where(and_(
-                InterviewQuestion.candidate_id == candidate_id,
-                InterviewQuestion.round == round,
-            ))
+            select(func.max(InterviewQuestion.index_num)).where(
+                _pre_generated_scope(candidate_id, round)
+            )
         )
         max_idx = max_idx_result.scalar() or 0
         new_q = InterviewQuestion(
@@ -675,14 +695,7 @@ async def replace_question(question_id: str, body: dict, db: AsyncSession = Depe
 
     await db.flush()
 
-    # Return all questions for this round
-    all_qs = await db.execute(
-        select(InterviewQuestion).where(and_(
-            InterviewQuestion.candidate_id == candidate_id,
-            InterviewQuestion.round == round,
-        )).order_by(InterviewQuestion.index_num)
-    )
-    questions = all_qs.scalars().all()
+    questions = await _fetch_pre_generated_questions(candidate_id, round, db)
     return {
         "code": 0,
         "message": "ok",
@@ -719,8 +732,7 @@ async def batch_delete_questions(body: dict, db: AsyncSession = Depends(get_db))
     if parsed_ids:
         to_delete_result = await db.execute(
             select(InterviewQuestion).where(and_(
-                InterviewQuestion.candidate_id == candidate_id,
-                InterviewQuestion.round == round,
+                _pre_generated_scope(candidate_id, round),
                 InterviewQuestion.id.in_(parsed_ids),
             ))
         )
@@ -730,13 +742,7 @@ async def batch_delete_questions(body: dict, db: AsyncSession = Depends(get_db))
         await db.flush()
 
     # 重新编号剩余题目(按 index_num 升序保持原顺序)
-    remaining_result = await db.execute(
-        select(InterviewQuestion).where(and_(
-            InterviewQuestion.candidate_id == candidate_id,
-            InterviewQuestion.round == round,
-        )).order_by(InterviewQuestion.index_num)
-    )
-    remaining = remaining_result.scalars().all()
+    remaining = await _fetch_pre_generated_questions(candidate_id, round, db)
     for i, q in enumerate(remaining, 1):
         q.index_num = i
     await db.flush()
@@ -803,10 +809,9 @@ async def append_question(body: dict, db: AsyncSession = Depends(get_db)):
                   "content": f"请结合你的项目经验,谈谈在{candidate.position.name if candidate.position else '该岗位'}上的关键实践。"}
 
     max_idx_result = await db.execute(
-        select(func.max(InterviewQuestion.index_num)).where(and_(
-            InterviewQuestion.candidate_id == candidate_id,
-            InterviewQuestion.round == round,
-        ))
+        select(func.max(InterviewQuestion.index_num)).where(
+            _pre_generated_scope(candidate_id, round)
+        )
     )
     max_idx = max_idx_result.scalar() or 0
     new_q = InterviewQuestion(
@@ -820,13 +825,7 @@ async def append_question(body: dict, db: AsyncSession = Depends(get_db)):
     db.add(new_q)
     await db.flush()
 
-    all_qs = await db.execute(
-        select(InterviewQuestion).where(and_(
-            InterviewQuestion.candidate_id == candidate_id,
-            InterviewQuestion.round == round,
-        )).order_by(InterviewQuestion.index_num)
-    )
-    questions = all_qs.scalars().all()
+    questions = await _fetch_pre_generated_questions(candidate_id, round, db)
     return {
         "code": 0,
         "message": "ok",

@@ -1,14 +1,5 @@
 """Agent Tool Registry — all tools the AI Agent can call."""
-import json
-from typing import Optional, List
-from sqlalchemy.ext.asyncio import AsyncSession
-from app.database import async_session_factory
-
-
-async def _get_db() -> AsyncSession:
-    async with async_session_factory() as session:
-        return session
-
+from typing import List
 
 # ── Permission engine singleton ────────────────────────────
 _perm_engine = None
