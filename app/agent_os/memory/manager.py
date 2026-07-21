@@ -23,6 +23,7 @@ import re
 from datetime import datetime, timezone
 from typing import Optional
 
+from app.config import get_settings
 from app.agent_os.memory.models import Memory, _now_iso
 
 _MEMORY_FILENAME_RE = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$")
@@ -219,7 +220,7 @@ JSON:"""
 
         try:
             resp = await llm_client.chat.completions.create(
-                model=os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
+                model=get_settings().deepseek_model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.3,
                 max_tokens=1024,

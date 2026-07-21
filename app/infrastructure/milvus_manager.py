@@ -33,9 +33,51 @@ from app.config import get_settings
 logger = logging.getLogger("genie.milvus")
 settings = get_settings()
 
+
+# ── Windows 兼容补丁：milvus_lite 用 os.rename 做「原子提交」写 manifest/schema，
+# 但 os.rename 在 Windows 上当目标已存在时会抛 WinError 183，导致建索引/建集合
+# 直接失败 —— 表现为集合永远建不出来、检索/入库不可用。os.replace 语义与
+# os.rename 一致但总是覆盖（POSIX 上行为也不变），是跨平台的「原子替换」正解。
+# 只替换受影响的 milvus_lite 子模块里对 os 的引用，不动全局 os，可逆、隔离。
+def _patch_milvus_lite_atomic_rename() -> None:
+    import types
+
+    class _OsReplaceShim(types.ModuleType):
+        """代理真实 os，仅把 rename 重定向到 replace（覆盖式原子替换）。"""
+
+        def __init__(self, real_os):
+            super().__init__(real_os.__name__)
+            self.__dict__["_real_os"] = real_os
+
+        def __getattr__(self, name):
+            real = self.__dict__["_real_os"]
+            if name == "rename":
+                return real.replace
+            return getattr(real, name)
+
+    shim = _OsReplaceShim(os)
+    for mod_name in (
+        "milvus_lite.storage.manifest",
+        "milvus_lite.schema.persistence",
+        "milvus_lite.db",
+    ):
+        try:
+            import importlib
+            mod = importlib.import_module(mod_name)
+            mod.os = shim  # type: ignore[attr-defined]
+        except Exception as e:  # 子模块路径变动等，非致命
+            logger.debug("milvus_lite rename 兼容补丁跳过 %s: %s", mod_name, e)
+
+
+_patch_milvus_lite_atomic_rename()
+
 _KB_ID_PATTERN = re.compile(r'^kb_[a-f0-9]{8}$')
 
-_lock = threading.Lock()
+# 可重入锁：ensure_collection() 持锁后会再调用 _get_client()，而 _get_client()
+# 自身也要拿同一把锁。普通 Lock 不可重入 —— 同一线程二次 acquire 会永久自死锁，
+# 锁再也不释放，后续所有 Milvus 调用（入库/检索/统计）随之全部卡死，
+# 表现为文档一直「索引中」、分片恒为 0。必须用 RLock。
+_lock = threading.RLock()
 _client: Optional[MilvusClient] = None
 _collection_ready: bool = False
 
@@ -118,35 +160,44 @@ def ensure_collection() -> bool:
                 datatype=DataType.SPARSE_FLOAT_VECTOR,
             )
 
-            # Create collection
-            client.create_collection(
-                collection_name=coll_name,
-                schema=schema,
-            )
-
+            # pymilvus 3.x：索引通过 IndexParams 描述，且随 create_collection
+            # 一起建。绝不能像旧版那样先 create_collection 再 create_index —
+            # 一旦 create_index 失败，会残留一个「有集合、无索引」的半成品：
+            # 重试时 has_collection 命中直接返回就绪，可写入却搜不出来。
+            index_params = client.prepare_index_params()
             # Dense HNSW index (COSINE)
-            client.create_index(
-                collection_name=coll_name,
+            index_params.add_index(
                 field_name="dense_vector",
                 index_type="HNSW",
                 metric_type="COSINE",
                 params={"M": 16, "efConstruction": 256},
             )
-
             # Sparse inverted index (IP)
-            client.create_index(
-                collection_name=coll_name,
+            index_params.add_index(
                 field_name="sparse_vector",
                 index_type="SPARSE_INVERTED_INDEX",
                 metric_type="IP",
                 params={"drop_ratio_build": 0.2},
             )
 
+            # Create collection + indexes atomically
+            client.create_collection(
+                collection_name=coll_name,
+                schema=schema,
+                index_params=index_params,
+            )
+
             _collection_ready = True
             return True
 
         except Exception as e:
-            print(f"[Milvus] Failed to init collection: {e}")
+            # 失败时清掉可能残留的半成品集合，避免下次 has_collection 命中一个无索引的坏集合
+            try:
+                if client.has_collection(coll_name):
+                    client.drop_collection(coll_name)
+            except Exception:
+                pass
+            logger.error("Milvus 集合初始化失败: %s", e, exc_info=True)
             return False
 
 
@@ -212,11 +263,14 @@ def _insert_with_timeout(coll_name: str, data: list[dict], timeout: float) -> Op
 
     def _worker():
         try:
-            with _lock:
-                client = _get_client()
-                result = client.insert(collection_name=coll_name, data=data)
-                ids = result.get("ids", [])
-                result_q.put(ids if isinstance(ids, list) else list(ids))
+            # 只在拿客户端指针时短暂持锁（_get_client 内部自管懒加载锁），
+            # 绝不在持锁状态下执行会阻塞的 insert RPC——否则连接假死时
+            # 本线程会永久持锁挂住，reset_client() 再也拿不到锁，形成死锁，
+            # 所有入库线程随之全部卡在 indexing/85。
+            client = _get_client()
+            result = client.insert(collection_name=coll_name, data=data)
+            ids = result.get("ids", [])
+            result_q.put(ids if isinstance(ids, list) else list(ids))
         except Exception as e:
             logger.warning("Milvus insert 异常: %s", e)
             result_q.put(None)
@@ -236,9 +290,10 @@ def _call_with_timeout(fn, timeout: float = 30.0, *args, **kwargs):
 
     def _worker():
         try:
-            with _lock:
-                client = _get_client()
-                result_q.put(("ok", fn(client, *args, **kwargs)))
+            # 同 _insert_with_timeout：拿到客户端后立刻脱离锁再发 RPC，
+            # 避免连接假死时持锁挂起，拖垮 reset_client() 与其余调用。
+            client = _get_client()
+            result_q.put(("ok", fn(client, *args, **kwargs)))
         except Exception as e:
             logger.warning("Milvus 调用异常: %s", e)
             result_q.put(("err", None))

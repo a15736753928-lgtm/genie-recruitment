@@ -17,7 +17,7 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import get_settings
+from app.config import get_settings, normalize_llm_model
 from app.services.ai.config_store import load_llm_config, resolve_api_keys
 from app.services.ai.providers.registry import get_adapter
 
@@ -165,7 +165,7 @@ async def llm_chat(
     自动按 priority 尝试所有 Key → Provider，带指数退避重试。
     """
     settings = get_settings()
-    model = model or settings.deepseek_model
+    model = normalize_llm_model(model or settings.deepseek_model)
 
     # 如果 Router 还没 warm-up，先兜底
     if not _round_robin_clients:
@@ -253,7 +253,7 @@ def create_langchain_llm(
         from langchain_openai import ChatOpenAI
         settings = get_settings()
         return ChatOpenAI(
-            model=settings.deepseek_model,
+            model=normalize_llm_model(settings.deepseek_model),
             api_key=settings.deepseek_api_key.split(",")[0].strip(),
             base_url=settings.deepseek_base_url,
             temperature=temperature,
@@ -276,7 +276,7 @@ def _fallback_langchain(temperature: float, streaming: bool) -> Any:
     from langchain_openai import ChatOpenAI
     settings = get_settings()
     return ChatOpenAI(
-        model=settings.deepseek_model,
+        model=normalize_llm_model(settings.deepseek_model),
         api_key=settings.deepseek_api_key.split(",")[0].strip(),
         base_url=settings.deepseek_base_url,
         temperature=temperature,

@@ -14,6 +14,7 @@ import re
 import json
 from typing import Optional
 
+from app.config import get_settings
 from app.agent_os.memory.manager import MemoryManager
 from app.agent_os.memory.models import Memory
 
@@ -112,7 +113,7 @@ class MemoryRetriever:
 只返回 JSON 数组，不要其他文字。如果没有相关的，返回 []。"""
 
         resp = await llm_client.chat.completions.create(
-            model=os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
+            model=get_settings().deepseek_model,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.0,
             max_tokens=128,

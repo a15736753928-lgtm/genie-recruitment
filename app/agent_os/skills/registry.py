@@ -16,6 +16,7 @@ import re
 import json
 from typing import Optional
 
+from app.config import get_settings
 from app.agent_os.skills.models import Skill
 
 
@@ -133,7 +134,7 @@ class SkillRegistry:
 
         try:
             resp = await llm_client.chat.completions.create(
-                model=os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
+                model=get_settings().deepseek_model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.0,
                 max_tokens=128,

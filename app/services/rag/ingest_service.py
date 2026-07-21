@@ -312,6 +312,25 @@ def _run_ingest_sync(
                 file_hash = hashlib.sha256(f.read()).hexdigest()
 
         # 1. Create document + task records
+        existing = (
+            db.query(KnowledgeDocument.id)
+            .filter(
+                KnowledgeDocument.kb_id == kb_id,
+                KnowledgeDocument.file_name == file_name,
+            )
+            .first()
+        )
+        if existing:
+            logger.warning(
+                "跳过重复文档入库 kb=%s file=%s existing=%s",
+                kb_id, file_name, existing[0],
+            )
+            try:
+                minio_storage.delete_object(object_key)
+            except Exception as cleanup_err:
+                logger.debug("清理重复上传对象失败: %s", cleanup_err)
+            return
+
         doc = KnowledgeDocument(
             id=doc_id,
             kb_id=kb_id,
@@ -398,6 +417,14 @@ def _run_ingest_sync(
         # 6. Insert dual vectors → Milvus
         _update("indexing", 85)
         milvus_ids = insert_vectors(all_dense, all_sparse, [kb_id] * len(all_dense))
+
+        # Milvus 写入失败（连接假死/重试耗尽）→ 明确失败，不落库残缺分片。
+        # 否则会存下一堆 milvus_pk=0 的分片：能在「查看分片」里看到，却永远
+        # 检索不到，形成静默脏数据。宁可整篇失败让用户重传。
+        if all_dense and not milvus_ids:
+            doc.status = "failed"
+            _update("failed", 0, "向量写入失败（Milvus 不可用），请稍后重试上传")
+            return
 
         # 7. Store chunks → PostgreSQL
         _update("indexing", 95)

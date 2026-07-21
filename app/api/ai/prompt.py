@@ -5,6 +5,7 @@ you need to tweak rules or update status definitions — no Python changes
 required.
 
 ``prompts/system.txt``   — role, capabilities, status flow, sub-agents
+``prompts/tone.txt``    — reply style (Feishu-like: concise, friendly)
 ``prompts/recommend.txt`` — recommendation business rules
 ``prompts/rules.txt``    — working rules  (most frequently edited)
 """
@@ -30,7 +31,7 @@ _PROMPT_CACHE: str | None = None
 def _load_all() -> str:
     """Load and join all prompt sections; reload when any .txt file changes."""
     global _PROMPT_CACHE
-    filenames = ("system.txt", "recommend.txt", "rules.txt")
+    filenames = ("system.txt", "tone.txt", "recommend.txt", "rules.txt")
     mtimes = {
         name: os.path.getmtime(os.path.join(_PROMPTS_DIR, name)) for name in filenames
     }

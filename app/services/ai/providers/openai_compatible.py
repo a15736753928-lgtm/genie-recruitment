@@ -6,6 +6,7 @@ from typing import Any
 
 from openai import AsyncOpenAI
 
+from app.config import normalize_llm_model
 from app.services.ai.providers.base import LlmProviderAdapter
 
 logger = logging.getLogger(__name__)
@@ -47,7 +48,7 @@ class OpenAICompatibleAdapter:
             raise RuntimeError("langchain-openai 未安装，无法创建 LangChain LLM")
 
         return ChatOpenAI(
-            model=provider.get("model", "deepseek-v4-flash"),
+            model=normalize_llm_model(provider.get("model", "deepseek-v4-flash")),
             api_key=api_key_plain,
             base_url=provider.get("baseUrl") or provider.get("base_url", ""),
             temperature=temperature,

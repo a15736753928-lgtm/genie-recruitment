@@ -726,7 +726,8 @@ async def run_startup_checks(settings: Settings) -> list[CheckResult]:
         check_milvus_lite,
         check_embedding_model,
         check_reranker_model,
-        check_kuzu_graph,
+        # Kuzu 图谱默认关闭（config.kuzu_enabled=False），不再做启动检查。
+        # 需要 GraphRAG 时把开关打开并把 check_kuzu_graph 加回本列表。
         check_rapidocr,
     ]
     checks_phase3: list[CheckFn] = [

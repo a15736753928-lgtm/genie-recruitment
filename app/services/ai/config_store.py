@@ -15,7 +15,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.dialects.postgresql import JSONB
 
-from app.config import get_settings
+from app.config import get_settings, normalize_llm_model
 from app.models.settings import SystemSetting
 from app.services.ai.crypto import (
     encrypt_key,
@@ -114,6 +114,8 @@ def _normalize_config(raw: dict) -> dict:
         p.setdefault("enabled", True)
         p.setdefault("priority", p.get("priority") or 10)
         p.setdefault("model", "")
+        if p.get("model"):
+            p["model"] = normalize_llm_model(p["model"])
         for k in p.get("apiKeys", []):
             k.setdefault("id", str(uuid.uuid4())[:8])
             k.setdefault("enabled", True)
@@ -179,7 +181,7 @@ def _bootstrap_from_env() -> dict:
         "type": "openai_compatible",
         "enabled": True,
         "priority": 1,
-        "model": settings.deepseek_model,
+        "model": normalize_llm_model(settings.deepseek_model),
         "baseUrl": settings.deepseek_base_url,
         "apiKeys": [
             {

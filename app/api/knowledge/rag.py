@@ -229,6 +229,7 @@ async def delete_knowledge_base(
 async def upload_document(
     file: UploadFile = File(...),
     kb_id: str = Form(...),
+    db: AsyncSession = Depends(get_db),
 ):
     """Upload a file and start async ingestion.
 
@@ -248,12 +249,28 @@ async def upload_document(
             "data": None,
         }
 
+    filename = file.filename or "unknown"
+
     # Validate file extension
     if file.filename and not check_extension(file.filename):
         supported = ", ".join(sorted(SUPPORTED_EXTENSIONS))
         return {
             "code": 400,
             "message": f"不支持的文件格式。支持: {supported}",
+            "data": None,
+        }
+
+    # Reject duplicate filename within the same knowledge base
+    existing_doc = await db.execute(
+        select(KnowledgeDocument.id).where(
+            KnowledgeDocument.kb_id == kb_id,
+            KnowledgeDocument.file_name == filename,
+        ).limit(1)
+    )
+    if existing_doc.scalar_one_or_none():
+        return {
+            "code": 409,
+            "message": f"知识库中已存在同名文件「{filename}」，请先删除后再上传",
             "data": None,
         }
 

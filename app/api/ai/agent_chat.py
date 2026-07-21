@@ -1004,7 +1004,6 @@ async def agent_chat(
     message = body.get("message", "")
     session_id = body.get("sessionId")
     agent_id = body.get("agentId", "genie")
-    mentioned_agent_ids = body.get("mentionedAgentIds", [])
     material_ids = body.get("materialIds", [])
 
     # ── Fetch attached materials and build compact context ────────
@@ -1171,17 +1170,8 @@ async def agent_chat(
                 yield sse_event("meta", {"traceId": trace_id})
 
             # Send initial thinking
-            thinking_text = f"收到任务，正在作为{AGENT_CONFIGS.get(agent_id, {}).get('name', 'AI Agent')}分析您的指令..."
+            thinking_text = "好的，我先看看你的需求…"
             yield sse_event("thinking", {"text": thinking_text, "append": False})
-
-            # Sub-agent handoffs
-            for mid in mentioned_agent_ids:
-                agent_info = AGENT_CONFIGS.get(mid, {})
-                yield sse_event("agent_handoff", {
-                    "from": AGENT_CONFIGS.get(agent_id, {}).get("name", "主Agent"),
-                    "to": agent_info.get("name", mid),
-                    "reason": f"需要{agent_info.get('description', '协作处理')}",
-                })
 
             # Create task for tracking (short-lived session)
             async with async_session_factory() as db:

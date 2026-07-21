@@ -1,8 +1,25 @@
+from pydantic import field_validator
 from pydantic_settings import BaseSettings
 from functools import lru_cache
 import os
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# 旧模型名 / Pro 统一映射到 Flash（用户要求不用 Pro）
+_LLM_MODEL_ALIASES: dict[str, str] = {
+    "deepseek-chat": "deepseek-v4-flash",
+    "deepseek-reasoner": "deepseek-v4-flash",
+    "deepseek-v4-pro": "deepseek-v4-flash",
+    "deepseek-pro": "deepseek-v4-flash",
+}
+
+
+def normalize_llm_model(model: str | None) -> str:
+    """Normalize legacy or Pro model ids to deepseek-v4-flash."""
+    name = (model or "").strip()
+    if not name:
+        return "deepseek-v4-flash"
+    return _LLM_MODEL_ALIASES.get(name.lower(), name)
 
 
 class Settings(BaseSettings):
@@ -71,12 +88,16 @@ class Settings(BaseSettings):
     rrf_graph_weight: float = 0.25    # graph structure weight
 
     # RAG — Kuzu Graph Database
+    # 图谱检索为三路混合召回的第三路（dense+sparse+graph）。默认关闭：
+    # 检索由 dense+sparse+rerank 承担，图谱那路对结果无必需贡献，且新版 Kuzu
+    # 路径/API 兼容问题会在启动刷错。需要 GraphRAG 时把下面三个开关置 True 即可，
+    # 代码路径仍完整保留。
     kuzu_data_dir: str = "storage/kuzu_data"
-    kuzu_enabled: bool = True
-    graph_index_enabled: bool = True  # background graph indexing after ingestion
+    kuzu_enabled: bool = False
+    graph_index_enabled: bool = False  # background graph indexing after ingestion
 
     # RAG — Community Detection
-    community_enabled: bool = True
+    community_enabled: bool = False
 
     # RAG — Ingestion
     ingest_batch_size: int = 64     # embedding batch size
@@ -96,6 +117,11 @@ class Settings(BaseSettings):
     enable_parallel_subagents: bool = False   # Phase 4
     max_subagents: int = 10                    # Phase 4
     plan_confirm_timeout: int = 300            # Phase 3 (5 minutes)
+
+    @field_validator("deepseek_model", "vision_model", mode="before")
+    @classmethod
+    def _normalize_model_fields(cls, v):
+        return normalize_llm_model(v if v else "deepseek-v4-flash")
 
     class Config:
         env_file = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
