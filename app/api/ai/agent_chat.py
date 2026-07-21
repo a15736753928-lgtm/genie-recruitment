@@ -40,18 +40,10 @@ import tempfile
 router = APIRouter(tags=["AI Agent"])
 settings = get_settings()
 
-# ── Agent OS singletons (memory / skills / quality) ───────────
-# These are the genuinely useful pieces merged in from the former v2/v3
-# "Agent OS" stack. Everything else (query_loop, streaming_executor,
-# context engine, cache builder, orchestration, hooks, retry) was dead
-# code and has been removed — this v1 endpoint is now the ONLY agent path.
-from app.agent_os.memory.manager import MemoryManager
-from app.agent_os.memory.retriever import MemoryRetriever
+# ── Agent OS singletons (skills / quality) ───────────
 from app.agent_os.skills.registry import SkillRegistry
 from app.agent_os.quality.guard import QualityGuard
 
-_memory_manager = MemoryManager(memory_dir=settings.memory_dir)
-_memory_retriever = MemoryRetriever(_memory_manager)
 _skill_registry = SkillRegistry(skills_dir=settings.skills_dir)
 _quality_guard = QualityGuard()
 
@@ -588,11 +580,321 @@ async def get_session_messages(
                 "sessionId": str(m.session_id),
                 "role": m.role,
                 "content": m.content,
+                "meta": m.handoffs if m.role == "user" and isinstance(m.handoffs, dict) else None,
                 "createdAt": iso_utc(m.created_at),
             }
             for m in messages
         ],
     }
+
+
+@router.post("/ai-agent/sessions/{session_id}/messages")
+async def append_session_message(
+    session_id: str,
+    body: dict,
+    db: AsyncSession = Depends(get_db),
+):
+    """Append a lightweight user/assistant notice (e.g. file-ingest progress) to a session."""
+    role = (body.get("role") or "assistant").strip()
+    content = (body.get("content") or "").strip()
+    if role not in ("user", "assistant") or not content:
+        return {"code": 400, "message": "请提供 role 与 content", "data": None}
+
+    try:
+        sid = uuid.UUID(session_id)
+    except ValueError:
+        return {"code": 400, "message": "sessionId 无效", "data": None}
+
+    session = await db.get(AgentSession, sid)
+    if not session:
+        session = AgentSession(id=sid, title="新对话", agent_id="genie")
+        db.add(session)
+        await db.flush()
+
+    msg = AgentMessage(session_id=sid, role=role, content=content)
+    db.add(msg)
+    session.updated_at = datetime.utcnow()
+    await db.commit()
+    await db.refresh(msg)
+
+    return {
+        "code": 0,
+        "message": "ok",
+        "data": {
+            "id": str(msg.id),
+            "sessionId": str(msg.session_id),
+            "role": msg.role,
+            "content": msg.content,
+            "meta": None,
+            "createdAt": iso_utc(msg.created_at),
+        },
+    }
+
+
+@router.post("/ai-agent/materials/from-candidates")
+async def materials_from_candidates(body: dict, db: AsyncSession = Depends(get_db)):
+    """Attach already-ingested candidates as AgentMaterial for the active session."""
+    candidate_ids = body.get("candidateIds") or []
+    if not candidate_ids:
+        return {"code": 400, "message": "请提供 candidateIds", "data": None}
+
+    session_result = await db.execute(
+        select(AgentSession).order_by(desc(AgentSession.updated_at)).limit(1)
+    )
+    session = session_result.scalar_one_or_none()
+    if not session:
+        session = AgentSession(title="新对话", agent_id="recruit")
+        db.add(session)
+        await db.flush()
+
+    from app.api.recruitment.resumes import CANDIDATE_LOAD_OPTIONS
+
+    result = await db.execute(
+        select(Candidate)
+        .options(*CANDIDATE_LOAD_OPTIONS)
+        .where(Candidate.id.in_(candidate_ids))
+    )
+    by_id = {str(c.id): c for c in result.scalars().all()}
+
+    out: list[dict] = []
+    for cid in candidate_ids:
+        candidate = by_id.get(str(cid))
+        if not candidate:
+            continue
+        filename = (
+            os.path.basename(candidate.resume_file)
+            if candidate.resume_file
+            else (candidate.name or "resume")
+        )
+        material = AgentMaterial(
+            session_id=session.id,
+            name=filename,
+            type="resume",
+            file_path=candidate.resume_file or "",
+        )
+        db.add(material)
+        await db.flush()
+        await db.refresh(material)
+        out.append({
+            "id": str(material.id),
+            "name": material.name,
+            "type": "resume",
+            "uploadedAt": material.uploaded_at.isoformat() if material.uploaded_at else "",
+            "ingested": True,
+            "candidateId": str(candidate.id),
+            "position": candidate.position.name if candidate.position else "",
+            "positionId": str(candidate.position_id) if candidate.position_id else "",
+            "score": candidate.score or 0,
+            "status": candidate.status or "job_hunting",
+            "skills": [s.skill for s in (candidate.skills or [])],
+        })
+
+    return {"code": 0, "message": "ok", "data": out}
+
+
+@router.post("/ai-agent/materials/ingest-batch")
+async def ingest_materials_batch(body: dict, db: AsyncSession = Depends(get_db)):
+    """Ingest previously staged session attachments (agent/* keys) into resume DB.
+
+    并发度 3：每个待入库文件走独立 DB session 并行处理，互不阻塞。
+    已在库中的文件（resumes/ 前缀）和非法类型走快速路径，串行完成。
+    """
+    material_ids = body.get("materialIds") or []
+    if not material_ids:
+        return {"code": 400, "message": "请提供 materialIds", "data": None}
+
+    from app.api.recruitment.resume_upload import _upload_one_resume, _load_candidate
+    import os
+
+    result = await db.execute(
+        select(AgentMaterial).where(AgentMaterial.id.in_(material_ids))
+    )
+    by_id = {str(m.id): m for m in result.scalars().all()}
+
+    # ── Phase 1: classify — fast-path vs need-processing ──────────
+    # mid → pre-built item for fast-path cases (already ingested / wrong type /
+    # download failure); these get placed directly in the output stream.
+    fast_items: dict[str, dict] = {}
+    # Items that need full _upload_one_resume: (mid, name, file_ext, content, fp)
+    to_process: list[tuple] = []
+
+    for mid in material_ids:
+        mat = by_id.get(str(mid))
+        if not mat:
+            continue
+
+        fp = (mat.file_path or "").strip()
+        if not fp:
+            continue
+
+        # ── Already ingested (resumes/ prefix) ──
+        if fp.startswith("resumes/"):
+            try:
+                cand_result = await db.execute(
+                    select(Candidate).where(Candidate.resume_file == fp).limit(1)
+                )
+                candidate = cand_result.scalar_one_or_none()
+            except Exception:
+                candidate = None
+            if candidate:
+                fast_items[mid] = {
+                    "id": str(mat.id), "name": mat.name, "type": mat.type,
+                    "uploadedAt": mat.uploaded_at.isoformat() if mat.uploaded_at else "",
+                    "ingested": True,
+                    "candidateId": str(candidate.id),
+                    "position": candidate.position.name if candidate.position else "",
+                    "positionId": str(candidate.position_id) if candidate.position_id else "",
+                    "score": candidate.score or 0,
+                    "status": candidate.status or "job_hunting",
+                    "skills": [s.skill for s in (candidate.skills or [])],
+                }
+                continue
+
+        # ── Wrong type ──
+        if mat.type not in ("resume", "file", "jd", "material"):
+            fast_items[mid] = {
+                "id": str(mat.id), "name": mat.name, "type": mat.type,
+                "uploadedAt": mat.uploaded_at.isoformat() if mat.uploaded_at else "",
+                "ingested": False,
+            }
+            continue
+
+        # ── Download from MinIO (must be serial — filesystem I/O) ──
+        try:
+            tmp_path = await asyncio.to_thread(minio_storage.download_to_temp, fp)
+            try:
+                with open(tmp_path, "rb") as f:
+                    content = f.read()
+            finally:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+        except Exception as e:
+            fast_items[mid] = {
+                "id": str(mat.id), "name": mat.name, "type": mat.type,
+                "uploadedAt": mat.uploaded_at.isoformat() if mat.uploaded_at else "",
+                "ingested": False,
+                "analysis": {"summary": f"读取文件失败: {e}"},
+            }
+            continue
+
+        file_ext = os.path.splitext(mat.name)[1].lower() or os.path.splitext(fp)[1].lower() or ".pdf"
+        to_process.append((mid, mat.name, file_ext, content, fp))
+
+    # ── Phase 2: parallel ingest (Semaphore=3, own DB session per task) ──
+    sem = asyncio.Semaphore(3)
+
+    async def _process_one(mid, name, file_ext, content, fp):
+        """Process ONE material in its own DB session + transaction."""
+        async with sem:
+            async with async_session_factory() as task_db:
+                try:
+                    upload_result = await _upload_one_resume(
+                        task_db,
+                        original_name=name,
+                        content=content,
+                        file_ext=file_ext,
+                    )
+                    status = upload_result.get("status")
+
+                    # ── Build item & collect side-effect info ──
+                    if status == "success":
+                        data = upload_result.get("data") or {}
+                        candidate_id = data.get("id")
+                        candidate = await _load_candidate(task_db, candidate_id) if candidate_id else None
+                        item: dict = {
+                            "id": str(mid), "name": name, "type": "resume",
+                            "ingested": True,
+                        }
+                        if candidate:
+                            item.update({
+                                "candidateId": str(candidate.id),
+                                "position": candidate.position.name if candidate.position else "",
+                                "positionId": str(candidate.position_id) if candidate.position_id else "",
+                                "score": candidate.score or 0,
+                                "status": candidate.status or "job_hunting",
+                                "skills": [s.skill for s in (candidate.skills or [])],
+                            })
+                        await task_db.commit()
+                        return {"mid": mid, "item": item,
+                                "resume_file": candidate.resume_file if candidate else None,
+                                "original_fp": fp}
+
+                    elif status == "duplicate":
+                        existing_id = upload_result.get("existingCandidateId")
+                        candidate = await _load_candidate(task_db, existing_id) if existing_id else None
+                        item = {
+                            "id": str(mid), "name": name, "type": "resume",
+                            "ingested": True,
+                        }
+                        if candidate:
+                            item.update({
+                                "candidateId": str(candidate.id),
+                                "position": candidate.position.name if candidate.position else "",
+                                "positionId": str(candidate.position_id) if candidate.position_id else "",
+                                "score": candidate.score or 0,
+                                "status": candidate.status or "job_hunting",
+                                "skills": [s.skill for s in (candidate.skills or [])],
+                            })
+                        await task_db.commit()
+                        return {"mid": mid, "item": item,
+                                "resume_file": candidate.resume_file if candidate else None,
+                                "original_fp": fp}
+
+                    else:
+                        return {"mid": mid, "item": {
+                            "id": str(mid), "name": name, "type": "resume",
+                            "ingested": False,
+                            "analysis": {"summary": upload_result.get("message") or "入库失败"},
+                        }}
+
+                except Exception as exc:
+                    return {"mid": mid, "item": {
+                        "id": str(mid), "name": name, "type": "resume",
+                        "ingested": False,
+                        "analysis": {"summary": f"入库异常: {exc}"},
+                    }}
+
+    # Run all processable items in parallel; keep order via result map
+    if to_process:
+        results = await asyncio.gather(*[
+            _process_one(mid, name, file_ext, content, fp)
+            for mid, name, file_ext, content, fp in to_process
+        ])
+        result_by_mid: dict[str, dict] = {r["mid"]: r for r in results}
+    else:
+        result_by_mid = {}
+
+    # ── Phase 3: assemble output (preserve material_ids order) ─────
+    out: list[dict] = []
+    for mid in material_ids:
+        if mid in fast_items:
+            out.append(fast_items[mid])
+            continue
+
+        r = result_by_mid.get(mid)
+        if not r:
+            continue
+
+        # Update AgentMaterial in the request session to reflect new state
+        mat = by_id.get(mid)
+        if mat:
+            resume_file = r.get("resume_file")
+            original_fp = r.get("original_fp")
+            if resume_file:
+                mat.file_path = resume_file
+                mat.type = "resume"
+            if original_fp and original_fp.startswith("agent/"):
+                try:
+                    await asyncio.to_thread(minio_storage.delete_object, original_fp)
+                except Exception:
+                    pass
+
+        out.append(r["item"])
+
+    await db.commit()
+    return {"code": 0, "message": "ok", "data": out}
 
 
 @router.post("/ai-agent/materials")
@@ -601,6 +903,7 @@ async def upload_material(
     file: UploadFile = File(None),
     knowledgeId: str = Form(None),
     knowledgeName: str = Form(None),
+  autoIngest: str = Form("true"),
     db: AsyncSession = Depends(get_db),
 ):
     """Upload a material (resume/document/knowledge) for the current session.
@@ -608,9 +911,11 @@ async def upload_material(
     Resumes (type="resume" or "file") are auto-detected: if the content parses
     as a real resume the file goes through the same full ingestion pipeline as
     the dedicated POST /api/resumes/upload endpoint — MinIO storage, position
-    matching, Candidate creation, parsing, scoring, RAG ingest.  Non-resume
-    files are stored as session attachments with a plain AI analysis preview.
+    matching, Candidate creation, parsing, scoring, RAG ingest.  Set
+    ``autoIngest=false`` to store as session attachment only (analyze later).
+    Non-resume files are stored as session attachments with a plain AI analysis preview.
     """
+    should_ingest = autoIngest.strip().lower() not in ("false", "0", "no")
     # Get or create session
     session_result = await db.execute(
         select(AgentSession).order_by(desc(AgentSession.updated_at)).limit(1)
@@ -688,7 +993,7 @@ async def upload_material(
         except Exception:
             pass
 
-    if is_resume and type in ("resume", "file"):
+    if is_resume and type in ("resume", "file") and should_ingest:
         # ── Full DB ingestion (same as dedicated endpoint) ──
 
         # 1) Store to MinIO with proper resumes/ prefix
@@ -763,19 +1068,9 @@ async def upload_material(
 
         # 4) Full parse + scoring
         from app.api.recruitment.resumes import load_candidate, run_resume_parse
-        from app.services.resume_scoring import score_all
         candidate = await load_candidate(db, candidate.id)
         if candidate:
             parse_msg = await run_resume_parse(candidate, position_name, db)
-            # Score (may already be done by run_resume_parse; score_all is
-            # idempotent — calls the same sub-agents but won't overwrite if
-            # dimensions already populated)
-            try:
-                dims = await score_all(text, parsed, position_name)
-                if dims and candidate.ai_analysis:
-                    candidate.ai_analysis.dimensions = dims
-            except Exception:
-                pass
 
         # 5) RAG knowledge-base ingest
         try:
@@ -1002,9 +1297,14 @@ async def agent_chat(
     no connection is held while the SSE stream is open.
     """
     message = body.get("message", "")
+    display_message = (body.get("displayMessage") or message or "").strip()
+    message_meta = body.get("messageMeta")
+    finalize_materials = body.get("finalizeMaterials")
     session_id = body.get("sessionId")
     agent_id = body.get("agentId", "genie")
     material_ids = body.get("materialIds", [])
+    ingestion_completed = bool(body.get("ingestionCompleted"))
+    user_message_persisted = bool(body.get("userMessagePersisted"))
 
     # ── Fetch attached materials and build compact context ────────
     # Ingested resumes (file_path starts with "resumes/") are already in the
@@ -1023,9 +1323,10 @@ async def agent_chat(
                 lines = ["\n\n--- 附件资料 ---"]
                 for mat in attached_materials:
                     fp = (mat.file_path or "")
+                    id_line = f"materialId: {mat.id}" + (f", fileKey: {fp}" if fp else "")
                     # ── Ingested resume → compact candidate reference ──
                     if mat.type in ("resume", "file") and fp.startswith("resumes/"):
-                        lines.append(f"\n[已入库简历] {mat.name}")
+                        lines.append(f"\n[已入库简历] {mat.name} ({id_line})")
                         try:
                             async with async_session_factory() as db2:
                                 cand_result = await db2.execute(
@@ -1045,17 +1346,20 @@ async def agent_chat(
                                     f"（已入库，请用 get_resume / update_resume 操作，勿当作文本重复解析）"
                                 )
                             else:
-                                lines.append("（已入库，但未找到候选人记录）")
+                                lines.append(
+                                    "（文件路径为 resumes/ 但未找到候选人，可能已被清空删除，"
+                                    "不可当作已入库，勿重复 upload_resume）"
+                                )
                         except Exception:
                             lines.append("（已入库，查找候选人信息失败）")
                     # ── Knowledge picker ──
                     elif mat.type == "knowledge":
-                        lines.append(f"\n[知识库素材] {mat.name}")
+                        lines.append(f"\n[知识库素材] {mat.name} ({id_line})")
                         if mat.knowledge_id:
                             lines.append(f"（knowledgeId: {mat.knowledge_id}）")
                     # ── Other file → extract text (clipped) ──
                     elif fp:
-                        lines.append(f"\n[{mat.type}] {mat.name}")
+                        lines.append(f"\n[{mat.type}] {mat.name} ({id_line})")
                         try:
                             file_text, _ = extract_text_from_file(fp)
                             if file_text.strip():
@@ -1083,7 +1387,14 @@ async def agent_chat(
 
         if not session:
             is_new_session = True
+            client_sid = None
+            if session_id:
+                try:
+                    client_sid = uuid.UUID(session_id)
+                except ValueError:
+                    client_sid = None
             session = AgentSession(
+                id=client_sid or uuid.uuid4(),
                 title="新对话",
                 agent_id="genie",
             )
@@ -1091,18 +1402,40 @@ async def agent_chat(
             await db.flush()
             session_id = str(session.id)
 
-        # Save user message
-        user_msg = AgentMessage(
-            session_id=session.id,
-            role="user",
-            content=message,
-        )
-        db.add(user_msg)
-        await db.flush()
+        # Save user message (display text for UI; model prompt may differ)
+        if not user_message_persisted:
+            user_msg = AgentMessage(
+                session_id=session.id,
+                role="user",
+                content=display_message,
+                handoffs=message_meta if isinstance(message_meta, dict) else None,
+            )
+            db.add(user_msg)
+            await db.flush()
+
+        if finalize_materials and isinstance(finalize_materials, list):
+            pending_result = await db.execute(
+                select(AgentMessage)
+                .where(
+                    AgentMessage.session_id == session.id,
+                    AgentMessage.role == "user",
+                )
+                .order_by(desc(AgentMessage.created_at))
+                .limit(8)
+            )
+            for prior in pending_result.scalars().all():
+                meta = prior.handoffs if isinstance(prior.handoffs, dict) else {}
+                if meta.get("pendingAttachments"):
+                    prior.handoffs = {
+                        **meta,
+                        "pendingAttachments": None,
+                        "materials": finalize_materials,
+                    }
+                    break
 
         # Update session title
         if session.title in ("新对话", None, ""):
-            session.title = message[:50] if message else "新对话"
+            session.title = display_message[:50] if display_message else "新对话"
         session_title = session.title or "新对话"
 
         # Fetch conversation history (last 20)
@@ -1167,7 +1500,7 @@ async def agent_chat(
             # Send trace ID so the frontend can correlate logs
             trace_id = get_trace_id()
             if trace_id:
-                yield sse_event("meta", {"traceId": trace_id})
+                yield sse_event("meta", {"traceId": trace_id, "sessionId": str(session_id)})
 
             # Send initial thinking
             thinking_text = "好的，我先看看你的需求…"
@@ -1200,6 +1533,16 @@ async def agent_chat(
                 restricted_defs = get_tool_defs_for_intent(intent)
                 langchain_tools = create_langchain_tools_from_defs(restricted_defs)
 
+            _INGEST_UPLOAD_TOOLS = frozenset({
+                "upload_resume", "batch_parse_resumes",
+                "upload_knowledge_file", "create_knowledge_item",
+            })
+            if ingestion_completed:
+                langchain_tools = [
+                    t for t in langchain_tools
+                    if getattr(t, "name", None) not in _INGEST_UPLOAD_TOOLS
+                ]
+
             system_prompt = build_system_prompt(agent_id)
             if intent != "general":
                 INTENT_LABELS = {
@@ -1214,35 +1557,21 @@ async def agent_chat(
                     f"本轮仅可使用与该意图匹配的工具，禁止调用无关工具。"
                 )
 
-            # ── Memory retrieval + Skill matching (Agent OS merge) ──
-            memories = []
-            matched_skills = []
-            try:
-                memories = await _memory_retriever.retrieve(
-                    query=message, llm_client=get_llm_client(), limit=5
+            if ingestion_completed:
+                system_prompt += (
+                    "\n\n[系统] 附件已由前端自动完成批量入库，候选人记录已写入数据库。"
+                    "请仅根据附件资料向用户汇总入库结果，禁止再调用 upload_resume、"
+                    "batch_parse_resumes、upload_knowledge_file 等上传/入库工具。"
                 )
-            except Exception:
-                memories = []
+
+            # ── Skill matching ──
+            matched_skills = []
             try:
                 matched_skills = await _skill_registry.match(
                     message, llm_client=get_llm_client(), limit=3
                 )
             except Exception:
                 matched_skills = []
-
-            if memories:
-                yield sse_event("memory_loaded", {
-                    "count": len(memories),
-                    "memories": [
-                        {"name": m.name, "description": m.description,
-                         "type": m.memory_type, "scope": m.scope}
-                        for m in memories
-                    ],
-                })
-                mem_lines = ["## 相关记忆（供参考，不要照搬）\n"]
-                for m in memories:
-                    mem_lines.append(f"- **{m.description}**: {m.content[:300]}")
-                system_prompt += "\n\n" + "\n".join(mem_lines)
 
             if matched_skills:
                 system_prompt = _skill_registry.inject_skills(system_prompt, matched_skills)
@@ -1347,20 +1676,6 @@ async def agent_chat(
                         task_obj.finished_at = datetime.utcnow()
 
                 await db.commit()
-
-            # ── Fire-and-forget: capture session learnings into memory ──
-            # Runs in the background so it never blocks the response. Degrades
-            # to a no-op if the LLM client or extraction fails.
-            async def _auto_capture():
-                try:
-                    captured = await _memory_manager.auto_capture(
-                        session_messages=lc_messages + [AIMessage(content=result.full_content)],
-                        session_id=str(session_obj_id),
-                        llm_client=get_llm_client(),
-                    )
-                except Exception:
-                    captured = []
-            asyncio.create_task(_auto_capture())
 
             yield sse_event("phase_result", {
                 "id": f"phase_{uuid.uuid4().hex[:6]}",

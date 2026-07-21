@@ -20,6 +20,13 @@ async def get_settings(db: AsyncSession = Depends(get_db)):
     return {"code": 0, "message": "ok", "data": data}
 
 
+@router.get("/settings/kb-engine")
+async def get_kb_engine_info():
+    from app.services.system.kb_settings import get_kb_engine_info
+
+    return {"code": 0, "message": "ok", "data": get_kb_engine_info()}
+
+
 @router.put("/settings")
 async def update_settings(
     body: dict,

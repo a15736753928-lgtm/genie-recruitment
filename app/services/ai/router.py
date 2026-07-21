@@ -158,11 +158,13 @@ async def llm_chat(
     model: str | None = None,
     temperature: float = 0.2,
     max_tokens: int = 512,
-    max_retries: int = 3,
+    max_retries: int = 1,
 ) -> str:
     """调用 LLM 并返回 content 文本。
 
     自动按 priority 尝试所有 Key → Provider，带指数退避重试。
+    默认 max_retries=1（只尝试一轮所有 Key），避免与 SDK 层
+    max_retries=2 叠加导致 60+ 秒重试风暴。
     """
     settings = get_settings()
     model = normalize_llm_model(model or settings.deepseek_model)

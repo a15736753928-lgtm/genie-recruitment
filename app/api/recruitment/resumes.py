@@ -80,6 +80,8 @@ async def list_resumes(
     positionId: str = Query("all"),
     statuses: str = Query(""),
     keyword: str = Query(""),
+    gender: str = Query(""),
+    education: str = Query(""),
     sortBy: str = Query("uploadTime"),
     sortOrder: str = Query("desc"),
     page: int = Query(1),
@@ -122,6 +124,33 @@ async def list_resumes(
                 Position.name.ilike(kw),
             )
         )
+
+    # Gender filter
+    if gender:
+        if gender == "未知":
+            query = query.where(
+                or_(
+                    Candidate.gender.is_(None),
+                    Candidate.gender == "",
+                    Candidate.gender == "未知",
+                    Candidate.gender.notin_(["男", "女"]),
+                )
+            )
+        else:
+            query = query.where(Candidate.gender == gender)
+
+    # Education filter
+    if education:
+        if education == "未知":
+            query = query.where(
+                or_(
+                    Candidate.education.is_(None),
+                    Candidate.education == "",
+                    Candidate.education == "未知",
+                )
+            )
+        else:
+            query = query.where(Candidate.education == education)
 
     # Count total
     count_query = select(func.count()).select_from(query.subquery())

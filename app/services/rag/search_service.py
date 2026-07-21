@@ -39,6 +39,7 @@ async def search(
     kb_ids: Optional[list[str]] = None,
     top_k: Optional[int] = None,
     min_similarity: float = 0.0,
+    rerank_enabled: Optional[bool] = None,
 ) -> list[dict]:
     """Main three-way hybrid search pipeline.
 
@@ -47,6 +48,7 @@ async def search(
         kb_ids: Optional list of KB IDs (None = all).
         top_k: Max results (default from settings).
         min_similarity: Minimum similarity threshold.
+        rerank_enabled: Override config rerank toggle (None = use config default).
 
     Returns:
         List of result dicts with id, content, file_name, kb_id, kb_name,
@@ -54,6 +56,7 @@ async def search(
     """
     top_k = top_k or settings.default_top_k
     rerank_top_k = settings.rerank_top_k
+    use_rerank = settings.rerank_enabled if rerank_enabled is None else rerank_enabled
 
     # 1. Normalize query
     query_normalized = normalize_query(clean_text(query))
@@ -134,7 +137,7 @@ async def search(
     enriched = await _enrich_results(fused)
 
     # 8. Rerank
-    if settings.rerank_enabled and len(enriched) > 1:
+    if use_rerank and len(enriched) > 1:
         texts = [r["content"] for r in enriched]
         ranked = await asyncio.to_thread(rerank, query_normalized, texts, top_k)
         reranked = []

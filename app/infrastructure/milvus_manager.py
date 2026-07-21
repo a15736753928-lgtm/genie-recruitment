@@ -81,8 +81,27 @@ _lock = threading.RLock()
 _client: Optional[MilvusClient] = None
 _collection_ready: bool = False
 
+# 写操作互斥锁：多线程并发 insert/delete 会通过同一个 gRPC channel
+# 密集发送请求，压垮 Milvus Lite 内嵌服务端。串行化写入确保同一时刻
+# 只有一个线程在做 Milvus 变更操作，配合 gRPC keepalive 参数彻底消除
+# GOAWAY 风险。读操作（search）不加锁，允许并发。
+_write_lock = threading.Lock()
+
 # 单次 insert 最长等待；超时即判定连接已死，重置客户端后重试一次
 _INSERT_TIMEOUT = 60.0
+
+
+# ── gRPC keepalive 参数：pymilvus 默认 10s 发一次 ping，
+# Milvus Lite 服务端会因 "too_many_pings" 主动 GOAWAY 踢断连接。
+# 把 keepalive 间隔拉长到 60s，配合不限次数的无数据 ping，
+# 既保持连接活性又不超过服务端容忍上限。
+_MILVUS_GRPC_OPTIONS = {
+    "grpc.keepalive_time_ms": 60000,          # ping 间隔 60s（默认 10s 太短）
+    "grpc.keepalive_timeout_ms": 10000,       # ping ack 等待 10s
+    "grpc.keepalive_permit_without_calls": True,  # 空闲时也发 keepalive
+    "grpc.http2.max_pings_without_data": 0,   # 无限制（避免 ENHANCE_YOUR_CALM）
+    "grpc.http2.min_time_between_pings_ms": 30000,  # 两次 ping 至少间隔 30s
+}
 
 
 def _get_client() -> MilvusClient:
@@ -90,7 +109,10 @@ def _get_client() -> MilvusClient:
     if _client is None:
         with _lock:
             if _client is None:
-                _client = MilvusClient(settings.milvus_db_path)
+                _client = MilvusClient(
+                    settings.milvus_db_path,
+                    grpc_options=_MILVUS_GRPC_OPTIONS,
+                )
     return _client
 
 
@@ -236,20 +258,22 @@ def insert_vectors(
             "kb_id": kb_id,
         })
 
-    # 最多尝试 2 次：第一次超时/异常 → 重置客户端 → 第二次用全新连接
-    for attempt in range(2):
-        if not ensure_collection():
+    # 串行化写入：防止多线程并发 insert 压垮 Milvus Lite gRPC 服务端
+    with _write_lock:
+        # 最多尝试 2 次：第一次超时/异常 → 重置客户端 → 第二次用全新连接
+        for attempt in range(2):
+            if not ensure_collection():
+                reset_client()
+                continue
+            ids = _insert_with_timeout(coll_name, data, _INSERT_TIMEOUT)
+            if ids is not None:
+                return ids
+            # 超时或异常：连接已死，重置后重试
+            logger.warning("Milvus insert 超时/失败，重置客户端后重试 (attempt=%d)", attempt + 1)
             reset_client()
-            continue
-        ids = _insert_with_timeout(coll_name, data, _INSERT_TIMEOUT)
-        if ids is not None:
-            return ids
-        # 超时或异常：连接已死，重置后重试
-        logger.warning("Milvus insert 超时/失败，重置客户端后重试 (attempt=%d)", attempt + 1)
-        reset_client()
 
-    logger.error("Milvus insert 两次均失败，放弃")
-    return []
+        logger.error("Milvus insert 两次均失败，放弃")
+        return []
 
 
 def _insert_with_timeout(coll_name: str, data: list[dict], timeout: float) -> Optional[list[int]]:
@@ -410,12 +434,13 @@ def delete_by_ids(ids: list[int]) -> bool:
 
     coll_name = settings.milvus_collection_name
 
-    def _do(client):
-        id_list = ", ".join(str(i) for i in ids)
-        client.delete(collection_name=coll_name, filter=f"id in [{id_list}]")
-        return True
+    with _write_lock:
+        def _do(client):
+            id_list = ", ".join(str(i) for i in ids)
+            client.delete(collection_name=coll_name, filter=f"id in [{id_list}]")
+            return True
 
-    return bool(_call_with_timeout(_do, 30.0) or False)
+        return bool(_call_with_timeout(_do, 30.0) or False)
 
 
 def get_collection_stats() -> dict:

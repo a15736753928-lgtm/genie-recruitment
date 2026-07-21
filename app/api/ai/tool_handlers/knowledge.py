@@ -14,14 +14,16 @@ from app.infrastructure import minio_storage
 async def _rag_search(params: dict, db: AsyncSession) -> str:
     try:
         from app.services.rag.search_service import search as rag_search_fn
-        from app.services.system.system_settings import get_system_setting
-        top_k = params.get("topK", 5)
-        recall_threshold = float(await get_system_setting(db, "recallThreshold", 0.75) or 0.75)
+        from app.services.system.kb_settings import get_kb_runtime_settings
+
+        kb_cfg = await get_kb_runtime_settings(db)
+        top_k = params.get("topK") or kb_cfg["default_top_k"]
         results = await rag_search_fn(
             query=params["query"],
             kb_ids=None,
             top_k=top_k,
-            min_similarity=recall_threshold,
+            min_similarity=kb_cfg["recall_threshold"],
+            rerank_enabled=kb_cfg["rerank_enabled"],
         )
         if results:
             summaries = []

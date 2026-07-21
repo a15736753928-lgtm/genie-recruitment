@@ -667,7 +667,15 @@ async def search_query(
         return {"code": 400, "message": "请提供查询文本", "data": []}
 
     kb_ids = body.get("kb_ids")
-    top_k = body.get("top_k", settings.default_top_k)
+    from app.services.system.kb_settings import get_kb_runtime_settings
+
+    kb_cfg = await get_kb_runtime_settings(db)
+
+    if "top_k" in body:
+        top_k = body.get("top_k", settings.default_top_k)
+    else:
+        top_k = kb_cfg["default_top_k"]
+
     if top_k == 0 or top_k is None:
         top_k = min(settings.max_search_recall, 50)
 
@@ -675,8 +683,7 @@ async def search_query(
     if "min_similarity" in body:
         min_sim = float(body.get("min_similarity") or 0.0)
     else:
-        from app.services.system.system_settings import get_system_setting
-        min_sim = float(await get_system_setting(db, "recallThreshold", 0.75) or 0.75)
+        min_sim = kb_cfg["recall_threshold"]
 
     try:
         results = await search(
@@ -684,6 +691,7 @@ async def search_query(
             kb_ids=kb_ids,
             top_k=top_k,
             min_similarity=min_sim,
+            rerank_enabled=kb_cfg["rerank_enabled"],
         )
     except Exception as e:
         print(f"[Search] Error: {e}")

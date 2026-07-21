@@ -208,7 +208,11 @@ async def check_milvus_lite(settings: Settings) -> CheckResult:
     t0 = time.perf_counter()
     try:
         from pymilvus import MilvusClient
-        client = MilvusClient(settings.milvus_db_path)
+        from app.infrastructure.milvus_manager import _MILVUS_GRPC_OPTIONS
+        client = MilvusClient(
+            settings.milvus_db_path,
+            grpc_options=_MILVUS_GRPC_OPTIONS,
+        )
         collections = client.list_collections()
         return CheckResult(
             "Milvus Lite", "optional", CheckStatus.PASS,

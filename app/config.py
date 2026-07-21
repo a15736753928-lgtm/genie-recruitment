@@ -109,7 +109,6 @@ class Settings(BaseSettings):
 
     # Agent OS — intelligent agent layer
     agent_os_enabled: bool = True
-    memory_dir: str = "memory/"
     skills_dir: str = "skills/"
     max_context_tokens: int = 8000
     enable_reflection: bool = True

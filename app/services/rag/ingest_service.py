@@ -40,11 +40,18 @@ from app.infrastructure.milvus_manager import insert_vectors
 settings = get_settings()
 logger = logging.getLogger(__name__)
 
+# Per-thread ingest overrides (loaded from system_settings in worker)
+_ingest_runtime = threading.local()
+
 # OCR fallback threshold: trigger OCR when fast extraction yields fewer chars
 _OCR_FALLBACK_THRESHOLD = settings.ocr_fallback_threshold
 
 # RapidOCR singleton
 _ocr = None
+
+
+def _ocr_enabled() -> bool:
+    return getattr(_ingest_runtime, "ocr_enabled", settings.ocr_enabled)
 
 
 # ── File Parsing (3-layer pipeline) ─────────────────────────
@@ -144,7 +151,7 @@ def _ocr_document(path: str, ext: str) -> str:
 
 def _ocr_pdf(path: str) -> str:
     """Render PDF pages to images, then OCR each page."""
-    if not settings.ocr_enabled:
+    if not _ocr_enabled():
         return ""
 
     try:
@@ -185,7 +192,7 @@ def _ocr_pdf(path: str) -> str:
 
 def _ocr_docx_images(path: str) -> str:
     """Extract embedded images from DOCX and OCR them."""
-    if not settings.ocr_enabled:
+    if not _ocr_enabled():
         return ""
 
     try:
@@ -212,7 +219,7 @@ def _ocr_docx_images(path: str) -> str:
 
 def _ocr_image(img_data: bytes) -> str:
     """OCR a single image using RapidOCR (PP-OCR v4)."""
-    if not settings.ocr_enabled:
+    if not _ocr_enabled():
         return ""
 
     ocr = _get_ocr()
@@ -296,6 +303,11 @@ def _run_ingest_sync(
     local_path = ""
 
     try:
+        from app.services.system.kb_settings import get_kb_ingest_settings_sync
+
+        ingest_cfg = get_kb_ingest_settings_sync(db)
+        _ingest_runtime.ocr_enabled = ingest_cfg["ocr_enabled"]
+
         # Download the original file from MinIO to a temp file for parsing.
         ext = os.path.splitext(file_name)[1] or ".txt"
         from app.infrastructure import minio_storage
@@ -524,6 +536,7 @@ def ingest_file_async(
             file_size = stat.size or 0
         except Exception:
             file_size = 0
+
     if file_size > settings.max_file_size:
         raise ValueError(f"文件过大: {file_size} > {settings.max_file_size}")
 

@@ -112,6 +112,9 @@ SETTINGS_FIELDS: dict[str, str] = {
     "aiQuestionGeneration": "AI出题开关",
     "aiInterviewScoring": "AI面试评分开关",
     "recallThreshold": "知识库召回阈值",
+    "kbDefaultTopK": "知识库默认返回条数",
+    "kbRerankEnabled": "知识库重排序开关",
+    "kbOcrEnabled": "知识库OCR开关",
     "notifyNewResume": "新简历通知",
     "notifyInterviewReminder": "面试提醒通知",
     "notifyOfferPending": "Offer待审通知",
@@ -195,7 +198,10 @@ SETTINGS_VIEWS: dict[str, list[str]] = {
         "probationDays", "aiResumeAnalysis", "aiQuestionGeneration", "aiInterviewScoring",
     ],
     "scoring": ["minMatchScore", "passScoreThreshold", "defaultScoringMode", "defaultQuestionCount"],
-    "ai": ["aiResumeAnalysis", "aiQuestionGeneration", "aiInterviewScoring", "autoParseResume", "recallThreshold"],
+    "ai": ["aiResumeAnalysis", "aiQuestionGeneration", "aiInterviewScoring", "autoParseResume"],
+    "knowledge": [
+        "recallThreshold", "kbDefaultTopK", "kbRerankEnabled", "kbOcrEnabled",
+    ],
     "notify": [
         "notifyNewResume", "notifyInterviewReminder", "notifyOfferPending",
         "notifyProbationRisk", "notifyPerformanceDue",
