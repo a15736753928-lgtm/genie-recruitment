@@ -462,8 +462,26 @@ async def check_deepseek_api_key(settings: Settings) -> CheckResult:
     )
 
 
+def _format_exc_chain(exc: BaseException) -> str:
+    """Format exception + cause chain; httpx ConnectError often has empty str()."""
+    parts: list[str] = []
+    cur: BaseException | None = exc
+    seen: set[int] = set()
+    while cur is not None and id(cur) not in seen and len(parts) < 6:
+        seen.add(id(cur))
+        text = str(cur).strip() or repr(cur)
+        parts.append(f"{type(cur).__name__}: {text}")
+        cur = cur.__cause__ or cur.__context__
+    return " <- ".join(parts)
+
+
 async def check_deepseek_api_reachable(settings: Settings) -> CheckResult:
-    """Verify LLM API endpoint is reachable (first configured key)."""
+    """Verify LLM API endpoint is reachable (first configured key).
+
+    DeepSeek 的 TLS 握手在本机偶发 ``SSLEOFError: UNEXPECTED_EOF_WHILE_READING``，
+    被 httpx 包成空消息的 ``ConnectError('')``。这是瞬时网络/TLS 抖动，不是 key
+    失效——所以对连接类错误做有限重试；HTTP 4xx/5xx 不重试（那是真实配置问题）。
+    """
     keys = [k.strip() for k in settings.deepseek_api_key.split(",") if k.strip()]
     secrets = [k for k in keys if k and k != "sk-your-api-key-here"]
     if not secrets:
@@ -472,33 +490,52 @@ async def check_deepseek_api_reachable(settings: Settings) -> CheckResult:
             "Skipped (no key configured)",
         )
 
+    import httpx
+
+    url = f"{settings.deepseek_base_url.rstrip('/')}/v1/models"
+    headers = {"Authorization": f"Bearer {secrets[0]}"}
     t0 = time.perf_counter()
-    try:
-        import httpx
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(
-                f"{settings.deepseek_base_url}/v1/models",
-                headers={"Authorization": f"Bearer {secrets[0]}"},
-            )
+    last_error = ""
+    attempts = 3
+
+    for attempt in range(1, attempts + 1):
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get(url, headers=headers)
             elapsed = (time.perf_counter() - t0) * 1000
             if resp.status_code == 200:
+                detail = f"Reachable ({resp.status_code})"
+                if attempt > 1:
+                    detail += f" after {attempt} attempts"
                 return CheckResult(
                     "LLM API Reachable", "config", CheckStatus.PASS,
-                    f"Reachable ({resp.status_code})",
+                    detail,
                     elapsed,
                 )
-            else:
-                return CheckResult(
-                    "LLM API Reachable", "config", CheckStatus.FAIL,
-                    f"HTTP {resp.status_code}: {resp.text[:100]}",
-                    elapsed,
-                )
-    except Exception as e:
-        return CheckResult(
-            "LLM API Reachable", "config", CheckStatus.FAIL,
-            f"Unreachable: {e}",
-            (time.perf_counter() - t0) * 1000,
-        )
+            # 非 200：key/权限/网关问题，重试无意义
+            return CheckResult(
+                "LLM API Reachable", "config", CheckStatus.FAIL,
+                f"HTTP {resp.status_code}: {resp.text[:100]}",
+                elapsed,
+            )
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.RemoteProtocolError) as e:
+            last_error = _format_exc_chain(e)
+            logger.warning(
+                "LLM API probe attempt %d/%d failed: %s",
+                attempt, attempts, last_error,
+            )
+            if attempt < attempts:
+                await asyncio.sleep(0.4 * attempt)
+                continue
+        except Exception as e:
+            last_error = _format_exc_chain(e)
+            break
+
+    return CheckResult(
+        "LLM API Reachable", "config", CheckStatus.FAIL,
+        f"Unreachable after {attempts} attempts: {last_error}",
+        (time.perf_counter() - t0) * 1000,
+    )
 
 
 async def check_llm_config_store(settings: Settings) -> CheckResult:

@@ -8,3 +8,4 @@
 - [创建岗位时服务端出现数据库ID字段未自动生成错误](position-creation-id-generation-bug.md) — business_rule
 - [Java 后端开发岗位薪资参考范围](salary-range-java.md) — reference
 - [吴佳熙的AI重新分析后匹配分从86提升至90](wu-jia-xi-ai-analysis-update.md) — candidate_note
+- [Agent工程师候选人吴佳熙匹配分90分，需安排一面](wu-jiaxi-candidate-detail.md) — candidate_note

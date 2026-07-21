@@ -306,52 +306,60 @@ async def batch_upload_resumes(
         invalid = 0
         done = 0
 
+        # 用 task→payload 映射 + asyncio.wait(FIRST_COMPLETED)。
+        # 不能用 asyncio.as_completed()：它 yield 的是新的包装协程(_wait_for_one)，
+        # 不是原始 task，拿去查 pending 字典会 KeyError。
         pending = {
             asyncio.ensure_future(_process_one(p)): p
             for p in file_payloads
         }
+        outstanding = set(pending.keys())
 
-        for coro in asyncio.as_completed(pending):
-            payload = pending[coro]
-            done += 1
-            try:
-                r = await coro
-            except Exception as e:
-                failed += 1
-                r = {
-                    "fileName": payload["original_name"],
-                    "status": "failed",
-                    "message": str(e),
+        while outstanding:
+            finished, outstanding = await asyncio.wait(
+                outstanding, return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in finished:
+                payload = pending[task]
+                done += 1
+                try:
+                    r = task.result()
+                except Exception as e:
+                    failed += 1
+                    r = {
+                        "fileName": payload["original_name"],
+                        "status": "failed",
+                        "message": str(e),
+                    }
+
+                s = r.get("status", "failed")
+                if s == "success":
+                    success += 1
+                elif s == "duplicate":
+                    skipped += 1
+                elif s == "invalid":
+                    invalid += 1
+                else:
+                    failed += 1
+
+                items.append(r)
+
+                progress_event = {
+                    "type": "progress",
+                    "fileName": r["fileName"],
+                    "status": r["status"],
+                    "position": r.get("position"),
+                    "score": r.get("score"),
+                    "message": r.get("message", ""),
+                    "existingCandidateName": r.get("existingCandidateName"),
+                    "done": done,
+                    "total": total,
+                    "success": success,
+                    "failed": failed,
+                    "skipped": skipped,
+                    "invalid": invalid,
                 }
-
-            s = r.get("status", "failed")
-            if s == "success":
-                success += 1
-            elif s == "duplicate":
-                skipped += 1
-            elif s == "invalid":
-                invalid += 1
-            else:
-                failed += 1
-
-            items.append(r)
-
-            progress_event = {
-                "type": "progress",
-                "fileName": r["fileName"],
-                "status": r["status"],
-                "position": r.get("position"),
-                "score": r.get("score"),
-                "message": r.get("message", ""),
-                "existingCandidateName": r.get("existingCandidateName"),
-                "done": done,
-                "total": total,
-                "success": success,
-                "failed": failed,
-                "skipped": skipped,
-                "invalid": invalid,
-            }
-            yield f"data: {json.dumps(progress_event, ensure_ascii=False)}\n\n"
+                yield f"data: {json.dumps(progress_event, ensure_ascii=False)}\n\n"
 
         summary_event = {
             "type": "summary",

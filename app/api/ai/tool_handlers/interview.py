@@ -8,7 +8,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 async def _get_questions(params: dict, db: AsyncSession) -> str:
     from app.api.talent.interview import get_questions as fn
     result = await fn(candidateId=params["candidateId"], round=params["round"], db=db)
-    questions = result.get("data", [])
+    data = result.get("data", {}) or {}
+    questions = data.get("questions", [])  # 修复：data 现在是 {"questions": [...], "stats": {...}} 嵌套结构
     if not questions:
         return f"暂无{params['round']}面试题，请先生成"
     lines = [f"候选人 {params['candidateId']} 的{params['round']}面试题（共 {len(questions)} 道）："]
@@ -23,7 +24,8 @@ async def _get_questions(params: dict, db: AsyncSession) -> str:
 async def _generate_questions(params: dict, db: AsyncSession) -> str:
     from app.api.talent.interview import regenerate_questions as fn
     result = await fn(body=params, db=db)
-    questions = result.get("data", [])
+    data = result.get("data", {}) or {}
+    questions = data.get("questions", [])  # 修复：data 现在是 {"questions": [...], "stats": {...}} 嵌套结构
     if not questions:
         return f"题目生成失败：{result.get('message', '未知错误')}"
     lines = [f"已生成 {len(questions)} 道{params.get('round','')}面试题："]
@@ -38,7 +40,8 @@ async def _generate_questions(params: dict, db: AsyncSession) -> str:
 async def _get_evaluation(params: dict, db: AsyncSession) -> str:
     from app.api.talent.interview import get_evaluation as fn
     result = await fn(candidate_id=params["candidateId"], round=params.get("round", "first"), db=db)
-    scores = result.get("data", [])
+    data = result.get("data", {}) or {}
+    scores = data.get("questions", [])  # 修复：data 现在是 {"questions": [...], "segments": [...], ...} 嵌套结构
     if not scores:
         return "暂无面试评分数据"
     scored = [s for s in scores if s.get("primaryScore") is not None]
@@ -87,7 +90,8 @@ async def _save_questions(params: dict, db: AsyncSession) -> str:
 async def _replace_question(params: dict, db: AsyncSession) -> str:
     from app.api.talent.interview import replace_question as fn
     result = await fn(question_id=params["questionId"], body=params, db=db)
-    qs = result.get("data", [])
+    data = result.get("data", {}) or {}
+    qs = data.get("questions", [])  # 修复：data 现在是 {"questions": [...], "stats": {...}} 嵌套结构
     return f"已替换题目，当前题单共 {len(qs)} 道" if result["code"] == 0 else f"替换失败：{result.get('message', '')}"
 
 

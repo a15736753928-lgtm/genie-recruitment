@@ -1068,10 +1068,17 @@ async def get_leaderboard(
         .options(
             selectinload(Candidate.position),
             selectinload(Candidate.evaluations),
+            selectinload(Candidate.educations),
+            selectinload(Candidate.work_experiences),
+            selectinload(Candidate.project_experiences),
+            selectinload(Candidate.skills),
+            selectinload(Candidate.ai_analysis),
         )
         .where(status_filter)
     )
     candidates = result.scalars().all()
+
+    from app.api.recruitment.resume_serializer import serialize_candidate
 
     leaderboard = []
     for c in candidates:
@@ -1097,6 +1104,7 @@ async def get_leaderboard(
         else:
             eval_status = "in_progress"
 
+        profile = serialize_candidate(c)
         leaderboard.append({
             "rank": 0,
             "candidateId": str(c.id),
@@ -1109,6 +1117,13 @@ async def get_leaderboard(
             "evalStatus": eval_status,
             "interviewRound": round,
             "audioUploaded": audio_uploaded,
+            "resumeScore": int(c.score or 0),
+            "gender": profile.get("gender"),
+            "age": profile.get("age"),
+            "education": profile.get("education"),
+            "experience": profile.get("experience"),
+            "educationHistory": profile.get("educationHistory") or [],
+            "workHistory": profile.get("workHistory") or [],
         })
 
     status_priority = {"completed": 0, "in_progress": 1, "pending": 2}
