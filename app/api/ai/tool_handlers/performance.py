@@ -43,7 +43,16 @@ async def _get_department_performance(params: dict, db: AsyncSession) -> str:
     from app.api.talent.performance import get_department_performance as fn
     result = await fn(quarter=params["quarter"], db=db)
     data = result.get("data", [])
-    return f"部门绩效共 {len(data)} 个部门"
+    if not data:
+        return f"部门绩效（{params.get('quarter','')}）：无数据"
+    lines = [f"部门绩效（{params.get('quarter','')}）：共 {len(data)} 个部门："]
+    for d in data:
+        lines.append(
+            f"  {d.get('department') or d.get('name','—')} | "
+            f"平均分:{d.get('avgScore') or d.get('average','—')} | "
+            f"人数:{d.get('count') or d.get('headcount','—')}"
+        )
+    return "\n".join(lines)
 
 
 async def _get_grade_distribution(params: dict, db: AsyncSession) -> str:
@@ -65,7 +74,16 @@ async def _get_quarter_trends(params: dict, db: AsyncSession) -> str:
     from app.api.talent.performance import get_quarter_trends as fn
     result = await fn(db=db)
     data = result.get("data", [])
-    return f"近 {len(data)} 个季度趋势"
+    if not data:
+        return "季度趋势：无数据"
+    lines = [f"近 {len(data)} 个季度趋势："]
+    for d in data:
+        lines.append(
+            f"  {d.get('quarter','—')} | "
+            f"平均分:{d.get('avgScore') or d.get('average','—')} | "
+            f"参与:{d.get('participants') or d.get('count','—')}"
+        )
+    return "\n".join(lines)
 
 
 async def _initiate_appraisal(params: dict, db: AsyncSession) -> str:

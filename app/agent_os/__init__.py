@@ -1,17 +1,13 @@
 """
-Agent OS — the intelligence layer merged into the single LangGraph agent.
+Agent OS — the two remaining support pieces for the single LangGraph agent.
 
-The genuinely useful pieces of the former standalone "Agent OS" stack, now
-imported directly by the one and only agent endpoint (app/api/ai/agent_chat.py):
-- SkillRegistry: on-demand domain expertise loading
-- QualityGuard: post-execution write verification + self-reflection
-- PermissionEngine: deny-first tool authorization
+What's left after the over-engineering cleanup, imported directly by the one
+and only agent endpoint (app/api/ai/agent_chat.py):
+- QualityGuard (quality/): post-execution read-after-write verification
 - ToolResultAdapter (output/): display-hint mapping for the frontend
 
-The memory subsystem (MemoryManager / MemoryRetriever) was removed because
-its file-based memories degraded into noise — per-candidate notes became
-stale after interviews, and stale business-rule fragments confused the agent.
-The dead subsystems (query_loop, streaming_executor, context engine, cache
-prompt builder, orchestration, hooks, retry, compaction pipeline, the AgentOS
-facade) were also removed during the v1/v3 consolidation.
+Removed during the cleanup: SkillRegistry (skills/), the deny-first
+PermissionEngine (permissions/), the keyword Reflector, the intent
+classifier + tool gating, the supervisor graph, and the plan generator.
+The ReAct loop now sees the full tool set and self-corrects instead.
 """

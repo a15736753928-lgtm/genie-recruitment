@@ -186,6 +186,7 @@ async def stream_agent_response(
     async for event in graph.astream_events(
         {"messages": messages},
         version="v2",
+        config={"recursion_limit": 40},
     ):
         kind = event.get("event", "")
 

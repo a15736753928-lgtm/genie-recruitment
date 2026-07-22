@@ -124,17 +124,32 @@ class ToolResult:
             display_hint="text",
         )
 
+    # Markers that indicate a legacy string result represents a failure.
+    # Handlers signal errors via these conventions (see tool_handlers/*.py).
+    _FAILURE_MARKERS = (
+        "❌", "失败", "错误", "不存在", "无权限", "无法", "未找到",
+    )
+
     @classmethod
     def from_legacy_string(cls, tool_name: str, result_text: str) -> "ToolResult":
-        """Wrap a legacy plain-text result for backward compatibility.
+        """Wrap a legacy plain-text result, inferring success from its text.
 
-        Used while gradually migrating individual tool branches to ToolResult.
+        Handlers return plain strings; failures are conventionally prefixed
+        with markers like ``❌`` / ``失败：`` / ``错误``. We detect those so the
+        frontend and verification badge get a real success/failure signal
+        instead of a hardcoded ``True``.
         """
+        text = result_text or ""
+        # Only treat as failure when a marker appears near the start — avoids
+        # false positives when a successful result merely mentions the word
+        # (e.g. a list that contains "查询失败的记录: 0").
+        head = text[:40]
+        is_failure = any(m in head for m in cls._FAILURE_MARKERS)
         return cls(
-            success=True,
+            success=not is_failure,
             tool_name=tool_name,
-            summary=result_text[:80].replace("\n", " "),
-            details=result_text,
+            summary=text[:80].replace("\n", " "),
+            details=text,
             display_hint="text",
         )
 

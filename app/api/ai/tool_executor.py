@@ -15,33 +15,6 @@ from app.middleware.trace import get_trace_id
 logger = logging.getLogger(__name__)
 
 
-def _camel_to_snake(name: str) -> str:
-    """Convert camelCase or PascalCase to snake_case.
-
-    >>> _camel_to_snake("jdRequirements")
-    'jd_requirements'
-    >>> _camel_to_snake("interviewCriteriaR1")
-    'interview_criteria_r1'
-    >>> _camel_to_snake("weeks24Plan")
-    'weeks_2_4_plan'
-    """
-    # Insert underscore before capital letters that follow lowercase or digits
-    s = re.sub(r"([a-z\d])([A-Z])", r"\1_\2", name)
-    # Insert underscore between digit sequences and letters
-    s = re.sub(r"(\d+)([A-Za-z])", r"\1_\2", s)
-    s = re.sub(r"([A-Za-z])(\d+)", r"\1_\2", s)
-    return s.lower()
-
-
-def _convert_keys(obj: dict, converter=_camel_to_snake) -> dict:
-    """Recursively convert dict keys using *converter*."""
-    result = {}
-    for k, v in obj.items():
-        new_key = converter(k)
-        result[new_key] = _convert_keys(v, converter) if isinstance(v, dict) else v
-    return result
-
-
 def sse_event(event_type: str, data: dict) -> str:
     """Format a single SSE event string for streaming responses."""
     return f"event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"

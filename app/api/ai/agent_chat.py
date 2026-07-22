@@ -23,15 +23,9 @@ from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from app.database import get_db, async_session_factory
 from app.models.agent_session import AgentProject, AgentSession, AgentMessage, AgentMaterial, AgentTask
 from app.models.recruitment import Candidate, Position
-from app.agent.tools import create_langchain_tools, create_langchain_tools_from_defs
-from app.agent.intent_classifier import (
-    classify_intent,
-    get_tool_defs_for_intent,
-    INTENT_GATE_HINTS,
-    filter_skills_for_intent,
-)
-from app.agent.supervisor_graph import classify_complexity_sync, ExecutionPlan, PlanStep
+from app.agent.tools import create_langchain_tools
 from app.agent.graph import build_agent_graph, stream_agent_response, AgentResult
+from langgraph.errors import GraphRecursionError
 from app.config import get_settings
 from app.middleware.trace import get_trace_id
 from app.infrastructure import minio_storage
@@ -45,11 +39,9 @@ import tempfile
 router = APIRouter(tags=["AI Agent"])
 settings = get_settings()
 
-# ── Agent OS singletons (skills / quality) ───────────
-from app.agent_os.skills.registry import SkillRegistry
+# ── Write-verification guard (read-after-write only) ───────────
 from app.agent_os.quality.guard import QualityGuard
 
-_skill_registry = SkillRegistry(skills_dir=settings.skills_dir)
 _quality_guard = QualityGuard()
 
 
@@ -1188,91 +1180,10 @@ async def upload_material(
     }
 
 
-# ── Plan Generation Helper ────────────────────────────────
-
-PLAN_SYSTEM_PROMPT = """你是一个任务规划器。将用户的请求分解为有序的执行步骤。
-只返回一个 JSON 对象（不要 markdown 代码块，不要解释）：
-
-{
-  "title": "简短的任务标题（≤15字）",
-  "steps": [
-    {
-      "index": 1,
-      "title": "步骤名称（≤10字）",
-      "description": "这个步骤要做什么（一句话）",
-      "expected_tools": ["工具名"],
-      "expected_outcome": "成功标准"
-    }
-  ]
-}
-
-规则：
-- 每个步骤只调用 1-2 个工具
-- 步骤总数 1-5 个，越少越好
-- 步骤顺序要合理（先查询再操作）
-- 简单查询只返回 1 个步骤
-- expected_tools 使用英文工具名"""
-
-
-async def _generate_plan(
-    lc_messages: list,
-    system_prompt: str,
-    client: AsyncOpenAI,
-) -> Optional[ExecutionPlan]:
-    """Generate an execution plan for complex user requests.
-
-    Uses a focused LLM call. Falls back to None on any error so the agent
-    can still proceed without a plan.
-    """
-    try:
-        # Get user message content
-        user_content = ""
-        for msg in reversed(lc_messages):
-            if hasattr(msg, "content") and not isinstance(msg, SystemMessage):
-                user_content = str(msg.content)[:500]
-                break
-
-        if not user_content:
-            return None
-
-        resp = await client.chat.completions.create(
-            model=settings.deepseek_model,
-            messages=[
-                {"role": "system", "content": PLAN_SYSTEM_PROMPT},
-                {"role": "user", "content": user_content},
-            ],
-            temperature=0.3,
-            max_tokens=512,
-        )
-        raw = resp.choices[0].message.content.strip()
-
-        # Use shared JSON extraction (handles markdown fences + trailing commas)
-        from app.utils.json_utils import extract_json_from_text
-        clean = extract_json_from_text(raw)
-        plan_data = json.loads(clean)
-
-        if "steps" not in plan_data or not plan_data["steps"]:
-            return None
-
-        steps = [
-            PlanStep(
-                index=s.get("index", i + 1),
-                title=s.get("title", f"步骤{i+1}"),
-                description=s.get("description", ""),
-                expected_tools=s.get("expected_tools", []),
-                expected_outcome=s.get("expected_outcome", ""),
-            )
-            for i, s in enumerate(plan_data["steps"])
-        ]
-
-        return ExecutionPlan(
-            plan_id=f"plan_{uuid.uuid4().hex[:8]}",
-            title=plan_data.get("title", "执行计划"),
-            steps=steps,
-            total_estimated_tools=sum(len(s.expected_tools) for s in steps),
-        )
-    except Exception:
-        return None
+# ── Plan Generation Helper (removed) ──────────────────────
+# Multi-step execution is handled natively by the ReAct loop; the separate
+# plan-generation LLM call and complexity classifier were removed during the
+# over-engineering cleanup.
 
 
 @router.post("/ai-agent/suggestions/{suggestion_id}/trigger")
@@ -1529,17 +1440,11 @@ async def agent_chat(
                 task_id = task.id
                 await db.commit()
 
-            # ── Intent Pre-Classification ──
-            # Classify user intent to restrict available tools (hard constraint).
-            # Uses keyword matching — fast, deterministic, no API call.
-            intent = classify_intent(message)
-
-            # Build LangGraph agent with intent-gated tools
-            if intent == "general":
-                langchain_tools = create_langchain_tools(agent_id)
-            else:
-                restricted_defs = get_tool_defs_for_intent(intent)
-                langchain_tools = create_langchain_tools_from_defs(restricted_defs)
+            # ── Tools: the model always sees the full tool set ──
+            # No intent gating. The ReAct loop picks the right tool and can
+            # self-correct across turns; tool descriptions carry the
+            # disambiguation that keyword gating used to enforce.
+            langchain_tools = create_langchain_tools(agent_id)
 
             _INGEST_UPLOAD_TOOLS = frozenset({
                 "upload_resume", "batch_parse_resumes",
@@ -1552,26 +1457,6 @@ async def agent_chat(
                 ]
 
             system_prompt = build_system_prompt(agent_id)
-            gate_hint = INTENT_GATE_HINTS.get(intent)
-            if gate_hint:
-                INTENT_LABELS = {
-                    "position_query": "岗位JD查询",
-                    "candidate_query": "候选人查询",
-                    "candidate_action": "候选人状态变更",
-                    "interview": "面试管理",
-                    "probation": "试用期考核",
-                    "performance": "绩效管理",
-                    "knowledge": "知识库",
-                    "dashboard": "数据看板",
-                    "settings": "系统设置",
-                    "database": "数据库直查",
-                }
-                hint = INTENT_LABELS.get(intent, intent)
-                system_prompt += (
-                    f"\n\n[Intent Gate] 当前意图: {hint}。"
-                    f"本轮仅可使用与该意图匹配的工具，禁止调用无关工具。"
-                    f" {gate_hint}"
-                )
 
             if ingestion_completed:
                 system_prompt += (
@@ -1580,44 +1465,8 @@ async def agent_chat(
                     "batch_parse_resumes、upload_knowledge_file 等上传/入库工具。"
                 )
 
-            # ── Skill matching ──
-            matched_skills = []
-            try:
-                matched_skills = await _skill_registry.match(
-                    message, llm_client=get_llm_client(), limit=3
-                )
-            except Exception:
-                matched_skills = []
-
-            if matched_skills:
-                matched_skills = filter_skills_for_intent(intent, matched_skills)
-            if matched_skills:
-                system_prompt = _skill_registry.inject_skills(system_prompt, matched_skills)
-
-            # ── Plan Generation (complex queries only) ──
-            complexity = classify_complexity_sync(message)
-            if complexity == "complex":
-                plan = await _generate_plan(lc_messages, system_prompt, get_llm_client())
-                if plan and plan.steps:
-                    yield sse_event("plan_proposal", plan.to_sse_dict())
-                    # Inject plan into system prompt for worker agent
-                    steps_text = "\n".join(
-                        f"  {s.index}. {s.title}: {s.description}"
-                        for s in plan.steps
-                    )
-                    system_prompt += (
-                        f"\n\n[执行计划] {plan.title}\n{steps_text}\n"
-                        f"按步骤顺序执行。每完成一步，检查结果后再进行下一步。"
-                    )
-
             # ── Context compaction: keep history within token budget ──
-            compacted, dropped = _compact_messages(lc_messages, max_tokens=6000)
-            if dropped > 0:
-                yield sse_event("context_compressed", {
-                    "layer": 1,
-                    "tokenEstimate": _estimate_tokens_msgs(compacted),
-                    "message": f"上下文较长，已省略最早的 {dropped} 条历史消息",
-                })
+            compacted, _dropped = _compact_messages(lc_messages, max_tokens=6000)
 
             graph = build_agent_graph(langchain_tools, system_prompt)
 
@@ -1628,19 +1477,44 @@ async def agent_chat(
                 yield sse_str
 
             # ── Quality Guard: verify writes actually took effect ──
+            # Read-after-write confirmation. If a write can't be confirmed, we
+            # inject the issue back into the agent for ONE correction pass
+            # instead of just reporting it and marking the task done.
             try:
                 if result.tool_blocks:
                     guard_result = await _quality_guard.guard(
-                        user_message=message,
-                        agent_response=result.full_content,
                         tool_calls=result.tool_blocks,
-                        tool_results=[tb.get("result", "") for tb in result.tool_blocks],
                         tool_executor=_verify_executor,
                     )
                     if not guard_result.passed:
+                        # Feed the verification failures back to the model and
+                        # let it try to fix them (single retry).
+                        issues_text = "\n".join(f"- {i}" for i in guard_result.issues[:5])
+                        correction_msgs = compacted + [
+                            AIMessage(content=result.full_content or ""),
+                            HumanMessage(content=(
+                                "[系统校验] 以下写操作未能确认生效，请重新检查并在必要时"
+                                f"重新调用对应写工具，确保真正落库：\n{issues_text}"
+                            )),
+                        ]
+                        retry_result = AgentResult()
+                        retry_graph = build_agent_graph(langchain_tools, system_prompt)
+                        async for sse_str in stream_agent_response(retry_graph, correction_msgs, retry_result):
+                            if await request.is_disconnected():
+                                break
+                            yield sse_str
+                        if retry_result.full_content:
+                            result.full_content = retry_result.full_content
+                        if retry_result.tool_blocks:
+                            result.tool_blocks.extend(retry_result.tool_blocks)
+                        # Re-verify after the correction pass.
+                        recheck = await _quality_guard.guard(
+                            tool_calls=retry_result.tool_blocks,
+                            tool_executor=_verify_executor,
+                        )
                         yield sse_event("verification", {
-                            "verified": False,
-                            "issues": guard_result.issues[:5],
+                            "verified": recheck.passed,
+                            "issues": recheck.issues[:5],
                         })
                     else:
                         yield sse_event("verification", {"verified": True, "issues": []})
@@ -1728,6 +1602,15 @@ async def agent_chat(
             except Exception:
                 pass
             raise
+        except GraphRecursionError:
+            # Task needed more tool-calling rounds than the recursion budget.
+            # Any prior writes already committed; give the user a readable note
+            # instead of a raw stack-trace-style error.
+            yield sse_event("content", {"delta": (
+                "\n\n（这个任务步骤较多，我已尽力执行到当前进度。"
+                "如果还没完成，请把剩下的部分再说一次，我接着做。）"
+            )})
+            yield sse_event("done", {})
         except Exception as e:
             yield sse_event("error", {"message": str(e)})
 

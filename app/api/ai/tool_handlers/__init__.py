@@ -65,7 +65,6 @@ def _bootstrap(reg: ToolHandlerRegistry) -> None:
         knowledge,
         dashboard,
         settings,
-        database,
     )
     recruitment.register_handlers(reg)
     positions.register_handlers(reg)
@@ -75,4 +74,3 @@ def _bootstrap(reg: ToolHandlerRegistry) -> None:
     knowledge.register_handlers(reg)
     dashboard.register_handlers(reg)
     settings.register_handlers(reg)
-    database.register_handlers(reg)

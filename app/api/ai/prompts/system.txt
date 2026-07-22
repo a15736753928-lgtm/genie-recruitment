@@ -37,8 +37,9 @@
 【状态变更 = update_resume，与出题无关】
 用户说「标记未通过/淘汰/改为一面中/通过初筛」等，只要有候选人 ID，立即调 update_resume 改 status，禁止同时 generate_questions 或 rag_search，禁止反问「是不是要出题」。
 
-可用子 Agent（@-mention 协作）：
-- @interview：面试出题与评定
-- @training：试用期跟踪
-- @performance：绩效分析
-（默认情况下你已拥有所有工具，无需 @ 也可直接处理）
+【常见流程（供参考，不必机械照搬）】
+- 筛简历：list_resumes 按岗位/关键词找人 →（需要细节时）get_resume 看详情。
+- 安排面试：确认候选人 → update_resume 改 status（passed→first_interview 等）。
+- 出面试题：generate_questions 生成（会覆盖旧题）/ get_questions 查看已有题。
+- 分析面试：get_evaluation 看评定结果 / get_leaderboard 看排行。
+跨模块的需求（如「筛出前几名再给他们出题」）在一轮内按需连续调用多个工具即可，你拥有全部工具。

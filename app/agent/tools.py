@@ -3,31 +3,15 @@ from typing import List
 
 from app.agent.tool_desc import tool_desc
 
-# ── Permission engine singleton ────────────────────────────
-_perm_engine = None
-
-def _get_permission_engine():
-    """Lazy singleton for the PermissionEngine (Agent OS merge)."""
-    global _perm_engine
-    if _perm_engine is None:
-        from app.agent_os.permissions.engine import PermissionEngine
-        from app.agent_os.permissions.safety import (
-            safety_check_destructive_operations,
-            safety_check_protected_paths,
-        )
-        _perm_engine = PermissionEngine()
-        # Register safety checks that are currently never called by default
-        _perm_engine.add_safety_check(safety_check_destructive_operations)
-        _perm_engine.add_safety_check(safety_check_protected_paths)
-    return _perm_engine
-
-
-DB_TOOL_NAMES = (
-    "db_list_tables",
-    "db_describe_table",
-    "db_query",
-    "db_update",
-)
+# ── Destructive tools ──────────────────────────────────────
+# Irreversible / overwriting operations. The full deny-first PermissionEngine
+# was removed as over-engineering; a recruitment assistant only needs the model
+# to confirm before these run (enforced conversationally via rules.txt).
+DESTRUCTIVE_TOOLS = frozenset({
+    "delete_resume", "delete_position", "delete_knowledge_item",
+    "delete_document", "delete_knowledge_base",
+    "batch_parse_resumes",  # can overwrite parsed data
+})
 
 
 TOOL_REGISTRY = {
@@ -863,11 +847,6 @@ TOOL_REGISTRY = {
         ),
         "parameters": {"type": "object", "properties": {}},
     },
-    "get_dashboard_overview": {
-        "name": "get_dashboard_overview",
-        "description": "获取数据看板概览（简历总数、岗位数、面试中人数等汇总）。",
-        "parameters": {"type": "object", "properties": {}},
-    },
 
     # System
     "get_settings": {
@@ -897,50 +876,12 @@ TOOL_REGISTRY = {
             "required": ["fields"],
         },
     },
-
-    # ── Database direct-access tools (natural-language CRUD) ──
-    "db_list_tables": {
-        "name": "db_list_tables",
-        "description": "列出数据库中所有表名。修改数据库前先用此工具了解有哪些表。",
-        "parameters": {"type": "object", "properties": {}},
-    },
-    "db_describe_table": {
-        "name": "db_describe_table",
-        "description": "查看某张表的列名、类型、是否可空。修改数据前先了解表结构。",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "table": {"type": "string", "description": "表名，如 positions/candidates/employees"},
-            },
-            "required": ["table"],
-        },
-    },
-    "db_query": {
-        "name": "db_query",
-        "description": "执行只读 SQL 查询（仅支持 SELECT）。用于查看表中数据、按条件筛选、验证修改结果。",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "sql": {"type": "string", "description": "SELECT 查询语句"},
-                "limit": {"type": "integer", "description": "返回行数上限，默认20"},
-            },
-            "required": ["sql"],
-        },
-    },
-    "db_update": {
-        "name": "db_update",
-        "description": "直接修改数据库中任意表的任意字段。支持 UPDATE/INSERT/DELETE。用户说「改数据库」时用此工具。",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "sql": {"type": "string", "description": "要执行的 SQL（UPDATE/INSERT/DELETE）。UPDATE 和 DELETE 必须包含 WHERE 条件。执行后会自动 COMMIT。"},
-            },
-            "required": ["sql"],
-        },
-    },
 }
 
-GENERAL_TOOL_NAMES = tuple(k for k in TOOL_REGISTRY if k not in DB_TOOL_NAMES)
+# Direct-database tools were removed: raw SQL writes bypass business logic
+# (status transitions, downstream list updates) and leave the system in an
+# inconsistent state. Ad-hoc needs should get a dedicated, curated tool.
+GENERAL_TOOL_NAMES = tuple(TOOL_REGISTRY.keys())
 
 
 def get_tools_for_agent(agent_id: str = "recruit") -> List[dict]:
@@ -988,7 +929,7 @@ def get_tools_for_agent(agent_id: str = "recruit") -> List[dict]:
 
     # All agents get some common tools
     common = [
-        "get_operations_dashboard", "get_dashboard_overview",
+        "get_operations_dashboard",
         "get_settings", "update_settings",
         "list_knowledge", "get_knowledge_stats", "get_knowledge_categories",
         "create_knowledge_item", "update_knowledge_item", "delete_knowledge_item",
@@ -1058,20 +999,9 @@ async def _execute_tool_sync(tool_name: str, **kwargs) -> str:
     # Remove the dummy field if present
     params.pop("dummy", None)
 
-    # ── Permission gate (Agent OS merge) ──────────────────────
-    # Only a hard DENY blocks execution here (e.g. delete_knowledge_base
-    # needs admin rights). ASK/ALLOW proceed — the model handles any
-    # confirmation conversationally, and destructive SQL is already guarded
-    # by the WHERE-clause check in execute_tool_call's db_update branch.
-    try:
-        engine = _get_permission_engine()
-        from app.agent_os.permissions.engine import PermissionDecision, PermissionMode
-        perm = engine.evaluate(tool_name, params, PermissionMode.DEFAULT)
-        if perm.decision == PermissionDecision.DENY:
-            return f"❌ 权限拒绝：{perm.reason}"
-    except Exception:
-        # Permission engine must never break tool execution.
-        pass
+    # Destructive-operation confirmation is handled conversationally via the
+    # system prompt (rules.txt) — the model confirms with the user before
+    # calling a delete_* tool. No runtime permission engine.
 
     db = async_session_factory()
     try:
@@ -1124,41 +1054,3 @@ def create_langchain_tools(agent_id: str = "recruit") -> list:
     return lc_tools
 
 
-def create_langchain_tools_from_defs(tool_defs: list[dict]) -> list:
-    """Convert a list of tool definition dicts into LangChain StructuredTool objects.
-
-    Unlike ``create_langchain_tools``, this bypasses ``get_tools_for_agent``
-    and accepts pre-filtered tool definitions directly — used by the intent
-    classifier to inject a restricted tool set into the ReAct agent.
-
-    Args:
-        tool_defs: Tool definitions from ``TOOL_REGISTRY`` (already filtered).
-
-    Returns:
-        List of ``StructuredTool`` instances ready for ``build_agent_graph``.
-    """
-    from langchain_core.tools import StructuredTool
-
-    lc_tools = []
-    for td in tool_defs:
-        tool_name = td["name"]
-        description = td["description"]
-        params_schema = td.get("parameters", {})
-
-        args_model = _build_pydantic_model(tool_name, params_schema)
-
-        async def tool_func(tool_name=tool_name, **kwargs) -> str:
-            return await _execute_tool_sync(tool_name, **kwargs)
-
-        tool_func.__name__ = tool_name
-        tool_func.__doc__ = description
-
-        structured_tool = StructuredTool.from_function(
-            name=tool_name,
-            description=description,
-            args_schema=args_model,
-            coroutine=tool_func,
-        )
-        lc_tools.append(structured_tool)
-
-    return lc_tools

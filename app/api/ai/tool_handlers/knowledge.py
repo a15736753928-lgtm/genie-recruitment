@@ -169,7 +169,18 @@ async def _list_documents(params: dict, db: AsyncSession) -> str:
         db=db,
     )
     d = result.get("data", {})
-    return f"文档列表共 {d.get('total', 0)} 个"
+    total = d.get("total", 0)
+    items = d.get("list") or d.get("records") or d.get("items") or []
+    if not items:
+        return f"文档列表：共 {total} 个（无明细）"
+    limit = int(params.get("limit", 20) or 20)
+    lines = [f"文档列表：共 {total} 个，前 {min(limit, len(items))} 个："]
+    for r in items[:limit]:
+        lines.append(
+            f"  [{r.get('id','')}] {r.get('name') or r.get('title') or r.get('fileName','')} | "
+            f"状态:{r.get('status','—')}"
+        )
+    return "\n".join(lines)
 
 
 async def _delete_document(params: dict, db: AsyncSession) -> str:
