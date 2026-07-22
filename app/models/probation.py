@@ -23,7 +23,8 @@ class Employee(Base):
     ai_result = Column(String(32))
     # Mentor
     mentor_name = Column(String(64), nullable=True)
-    mentor_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
+    # Plain UUID — no FK: users table is not modeled in this service yet.
+    mentor_id = Column(UUID(as_uuid=True), nullable=True)
     # Week 1 assessment
     week1_score = Column(Integer, nullable=True)
     week1_passed = Column(Boolean, nullable=True)

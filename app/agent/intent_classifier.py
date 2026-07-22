@@ -115,7 +115,6 @@ INTENT_PATTERNS: list[tuple[str, list[str]]] = [
         r"(上传|导入|添加|新增).*简历",
         r"(删除|移除|重新解析|批量解析).*(简历|候选人)",
         r"(标记|归档|淘汰).*(候选人|简历)",
-        r"update_resume",
     ]),
     # ── Count / stats (before broad「候选人」matches) ──
     ("dashboard", [
@@ -138,6 +137,8 @@ INTENT_PATTERNS: list[tuple[str, list[str]]] = [
     ]),
     # ── Candidate reads (before interview — avoid dragging in 出题/题单) ──
     ("candidate_query", [
+        r"\[系统·已读库\]",
+        r"\[系统·已写库\].*get_resume",
         r"\[查简历\]",
         r"(完整|详细).*(简历|画像|分析)",
         r"(查看|看看|获取).*(完整|详细).*(简历|画像|分析)",

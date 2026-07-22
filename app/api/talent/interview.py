@@ -1259,16 +1259,29 @@ async def get_leaderboard(
         })
 
     status_priority = {"completed": 0, "in_progress": 1, "pending": 2}
-    leaderboard.sort(key=lambda x: (
-        status_priority.get(x["evalStatus"], 3),
-        -x["totalScore"],
-        x["name"],
-    ))
 
-    for i, item in enumerate(leaderboard):
-        item["rank"] = i + 1
+    def _sort_key(item: dict) -> tuple:
+        return (
+            status_priority.get(item["evalStatus"], 3),
+            -item["totalScore"],
+            item["name"],
+        )
 
-    return {"code": 0, "message": "ok", "data": leaderboard}
+    # Rank within each position (not global across all positions).
+    from collections import defaultdict
+
+    by_position: dict[str, list] = defaultdict(list)
+    for item in leaderboard:
+        by_position[item["position"] or ""].append(item)
+
+    ranked_leaderboard: list[dict] = []
+    for position in sorted(by_position.keys(), key=lambda p: p or ""):
+        group = sorted(by_position[position], key=_sort_key)
+        for i, item in enumerate(group, 1):
+            item["rank"] = i
+            ranked_leaderboard.append(item)
+
+    return {"code": 0, "message": "ok", "data": ranked_leaderboard}
 
 
 @router.get("/interview/evaluation/{candidate_id}")
