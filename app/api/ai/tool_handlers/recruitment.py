@@ -8,6 +8,7 @@ import io
 import asyncio
 
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 
 from app.infrastructure import minio_storage
 from app.agent.field_profiles import (
@@ -18,24 +19,64 @@ from app.agent.field_profiles import (
 )
 
 
+async def _resolve_position_id(db: AsyncSession, position_id: str | None, position_name: str | None) -> str:
+    """Resolve positionName to UUID; prefer explicit positionId."""
+    if position_id and position_id != "all":
+        return position_id
+    if not position_name or not position_name.strip():
+        return "all"
+    from app.models.recruitment import Position
+
+    name = position_name.strip()
+    result = await db.execute(
+        select(Position).where(Position.name.ilike(name)).limit(1)
+    )
+    pos = result.scalar_one_or_none()
+    if pos:
+        return str(pos.id)
+    result = await db.execute(
+        select(Position).where(Position.name.ilike(f"%{name}%")).limit(1)
+    )
+    pos = result.scalar_one_or_none()
+    return str(pos.id) if pos else "all"
+
+
 async def _list_resumes(params: dict, db: AsyncSession) -> str:
-    from app.api.recruitment.resumes import list_resumes as fn
-    pos_id = params.get("positionId", "all")
-    statuses = params.get("statuses", "")
-    keyword = params.get("keyword", "")
+    from app.api.recruitment.resumes import query_candidate_list
+
+    pos_id = await _resolve_position_id(
+        db,
+        params.get("positionId"),
+        params.get("positionName"),
+    )
+    pos_name = (params.get("positionName") or "").strip()
+    if pos_name and pos_id == "all":
+        return f"未找到岗位「{pos_name}」，请先调用 list_positions 确认岗位名称。"
+    statuses = params.get("statuses") or ""
+    keyword = params.get("keyword") or ""
     limit = params.get("limit", 10)
-    result = await fn(
-        positionId=pos_id, statuses=statuses, keyword=keyword,
-        sortBy="uploadTime", sortOrder="desc",
-        page=1, pageSize=limit, minScore=None, db=db,
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = 10
+    result = await query_candidate_list(
+        db,
+        position_id=pos_id,
+        statuses=statuses,
+        keyword=keyword,
+        sort_by=params.get("sortBy") or "uploadTime",
+        sort_order="desc",
+        page=1,
+        page_size=limit,
     )
     data = result["data"]
     if isinstance(data, dict) and "list" in data:
         candidates = data["list"]
         total = data["total"]
-        if not candidates:
-            return f"未找到符合条件的候选人（共 {total} 位候选人）"
-        lines = [f"共 {total} 位候选人，以下是前 {len(candidates)} 位："]
+        if not candidates and not keyword and not statuses and (not pos_id or pos_id == "all"):
+            return f"当前共有 {total} 位候选人。"
+        scope = f"（岗位: {pos_name}）" if pos_name else ""
+        lines = [f"共 {total} 位候选人{scope}，以下是前 {len(candidates)} 位："]
         for c in candidates:
             skills = ", ".join(c.get("skills", [])[:5]) or "无"
             lines.append(
@@ -66,11 +107,41 @@ async def _get_resume(params: dict, db: AsyncSession) -> str:
 
 async def _update_resume(params: dict, db: AsyncSession) -> str:
     from app.api.recruitment.resumes import update_resume as fn
-    fields = params.get("fields", {})
+
+    STATUS_ALIASES = {
+        "rejected": "failed",
+        "淘汰": "failed",
+        "未通过": "failed",
+        "一面未通过": "failed",
+        "二面未通过": "failed",
+        "初筛不通过": "failed",
+        "求职中": "job_hunting",
+        "初筛通过": "passed",
+        "一面中": "first_interview",
+        "二面中": "second_interview",
+        "已入职": "passed",
+        "已通过": "passed",
+        "入职": "passed",
+    }
+
+    fields = dict(params.get("fields") or {})
     if "status" in params:
-        fields["status"] = params["status"]
+        raw_status = str(params["status"]).strip()
+        fields["status"] = STATUS_ALIASES.get(raw_status, raw_status)
+    if "status" in fields:
+        raw_status = str(fields["status"]).strip()
+        fields["status"] = STATUS_ALIASES.get(raw_status, raw_status)
+
     result = await fn(resume_id=params["id"], body=fields, db=db)
     if result["code"] == 0:
+        data = result.get("data") or {}
+        name = data.get("name") or params["id"]
+        new_status = fields.get("status") or data.get("status") or ""
+        if new_status:
+            msg = f"已成功更新候选人「{name}」(ID: {params['id']})，状态 → {new_status}"
+            if new_status == "passed":
+                msg += "（已进入试用期考核列表）"
+            return msg
         return f"已成功更新候选人 {params['id']} 的信息"
     return f"更新失败：{result['message']}"
 

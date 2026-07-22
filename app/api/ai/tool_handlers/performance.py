@@ -7,7 +7,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 async def _list_performance(params: dict, db: AsyncSession) -> str:
     from app.api.talent.performance import list_performance as fn
-    result = await fn(quarter=params["quarter"], db=db)
+    result = await fn(
+        quarter=params.get("quarter"),
+        page=1,
+        pageSize=int(params.get("limit", 10) or 10),
+        db=db,
+    )
     data = result.get("data", {})
     if not isinstance(data, dict):
         return "查询完成"

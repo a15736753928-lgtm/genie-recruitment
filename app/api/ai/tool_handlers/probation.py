@@ -14,7 +14,13 @@ from app.agent.field_profiles import (
 
 async def _list_probation(params: dict, db: AsyncSession) -> str:
     from app.api.talent.probation import list_probation as fn
-    result = await fn(department=params.get("department", "all"), status=params.get("status", "all"), db=db)
+    result = await fn(
+        department=params.get("department") or "all",
+        status=params.get("status") or "all",
+        page=1,
+        pageSize=int(params.get("limit", 10) or 10),
+        db=db,
+    )
     data = result.get("data", {})
     if not isinstance(data, dict):
         return "查询完成"

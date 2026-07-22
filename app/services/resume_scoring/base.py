@@ -119,19 +119,34 @@ async def _llm_score_batched(
 
     prompt = "\n".join(parts)
 
-    try:
-        client = get_llm_client()
-        resp = await client.chat.completions.create(
-            model=settings.deepseek_model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
-            max_tokens=300,
-        )
-        content = (resp.choices[0].message.content or "").strip()
-        return _parse_batched_scores(content, rubrics)
-    except Exception as exc:
-        logger.warning("batched dimension LLM call failed: %s", exc)
-        return {name: None for name in rubrics}
+    # ── Two attempts: first call may occasionally return empty on overload ──
+    for attempt in range(2):
+        try:
+            client = get_llm_client()
+            resp = await client.chat.completions.create(
+                model=settings.deepseek_model,
+                messages=[
+                    {"role": "system", "content": "You must output a valid JSON object. 只输出 JSON，无其他文字。"},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.2,
+                max_tokens=500,
+                response_format={"type": "json_object"},
+            )
+            content = (resp.choices[0].message.content or "").strip()
+            if content:
+                result = _parse_batched_scores(content, rubrics)
+                if any(v is not None for v in result.values()):
+                    return result
+            logger.warning(
+                "batched scoring attempt %d returned empty or unparseable: %r",
+                attempt + 1, content[:100],
+            )
+        except Exception as exc:
+            logger.warning("batched dimension LLM call attempt %d failed: %s", attempt + 1, exc)
+
+    logger.error("batched scoring both attempts failed, all dimensions fallback to 70")
+    return {name: None for name in rubrics}
 
 
 def _parse_batched_scores(raw: str, rubrics: dict[str, str]) -> dict[str, Optional[int]]:

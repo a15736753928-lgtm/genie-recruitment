@@ -24,7 +24,12 @@ from app.database import get_db, async_session_factory
 from app.models.agent_session import AgentProject, AgentSession, AgentMessage, AgentMaterial, AgentTask
 from app.models.recruitment import Candidate, Position
 from app.agent.tools import create_langchain_tools, create_langchain_tools_from_defs
-from app.agent.intent_classifier import classify_intent, get_tool_defs_for_intent
+from app.agent.intent_classifier import (
+    classify_intent,
+    get_tool_defs_for_intent,
+    INTENT_GATE_HINTS,
+    filter_skills_for_intent,
+)
 from app.agent.supervisor_graph import classify_complexity_sync, ExecutionPlan, PlanStep
 from app.agent.graph import build_agent_graph, stream_agent_response, AgentResult
 from app.config import get_settings
@@ -1100,7 +1105,7 @@ async def upload_material(
         resp_data = {}
         if candidate:
             resp_data = {
-                "id": str(candidate.id),
+                "candidateId": str(candidate.id),
                 "name": candidate.name or filename,
                 "position": position_name,
                 "positionId": resolved_position_id,
@@ -1328,11 +1333,14 @@ async def agent_chat(
                     if mat.type in ("resume", "file") and fp.startswith("resumes/"):
                         lines.append(f"\n[已入库简历] {mat.name} ({id_line})")
                         try:
+                            from sqlalchemy.orm import selectinload
+
                             async with async_session_factory() as db2:
                                 cand_result = await db2.execute(
-                                    select(Candidate).where(
-                                        Candidate.resume_file == fp
-                                    ).limit(1)
+                                    select(Candidate)
+                                    .options(selectinload(Candidate.skills))
+                                    .where(Candidate.resume_file == fp)
+                                    .limit(1)
                                 )
                                 c = cand_result.scalar_one_or_none()
                             if c:
@@ -1544,17 +1552,25 @@ async def agent_chat(
                 ]
 
             system_prompt = build_system_prompt(agent_id)
-            if intent != "general":
+            gate_hint = INTENT_GATE_HINTS.get(intent)
+            if gate_hint:
                 INTENT_LABELS = {
-                    "position_query": "岗位JD查询", "candidate_query": "候选人查询",
-                    "candidate_action": "候选人操作", "interview": "面试管理",
-                    "probation": "试用期考核", "performance": "绩效管理",
-                    "knowledge": "知识库", "dashboard": "数据看板", "settings": "系统设置",
+                    "position_query": "岗位JD查询",
+                    "candidate_query": "候选人查询",
+                    "candidate_action": "候选人状态变更",
+                    "interview": "面试管理",
+                    "probation": "试用期考核",
+                    "performance": "绩效管理",
+                    "knowledge": "知识库",
+                    "dashboard": "数据看板",
+                    "settings": "系统设置",
+                    "database": "数据库直查",
                 }
                 hint = INTENT_LABELS.get(intent, intent)
                 system_prompt += (
                     f"\n\n[Intent Gate] 当前意图: {hint}。"
                     f"本轮仅可使用与该意图匹配的工具，禁止调用无关工具。"
+                    f" {gate_hint}"
                 )
 
             if ingestion_completed:
@@ -1573,6 +1589,8 @@ async def agent_chat(
             except Exception:
                 matched_skills = []
 
+            if matched_skills:
+                matched_skills = filter_skills_for_intent(intent, matched_skills)
             if matched_skills:
                 system_prompt = _skill_registry.inject_skills(system_prompt, matched_skills)
 

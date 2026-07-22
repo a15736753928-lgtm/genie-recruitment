@@ -26,6 +26,11 @@ from app.models.recruitment import (
 from app.config import get_settings
 from app.infrastructure import minio_storage
 from app.services.system.system_settings import get_system_setting
+from app.services.talent.probation_sync import (
+    ensure_employee_for_candidate,
+    sync_onboarding_candidates,
+    PROBATION_CANDIDATE_STATUSES,
+)
 
 # Re-exported from split modules for backward compatibility
 from app.api.recruitment.resume_parser import (
@@ -73,6 +78,109 @@ async def get_auto_parse_setting(db: AsyncSession) -> bool:
     return bool(await get_system_setting(db, "autoParseResume", True))
 
 
+# ── Shared query logic (HTTP routes + agent tools) ───────
+
+async def query_candidate_list(
+    db: AsyncSession,
+    *,
+    position_id: str = "all",
+    statuses: str = "",
+    keyword: str = "",
+    gender: str = "",
+    education: str = "",
+    sort_by: str = "uploadTime",
+    sort_order: str = "desc",
+    page: int = 1,
+    page_size: int = 10,
+    min_score: Optional[int] = None,
+) -> dict:
+    """List candidates with filters. Use plain Python defaults — safe for direct calls."""
+    query = select(Candidate).options(*CANDIDATE_LOAD_OPTIONS)
+
+    if position_id and position_id != "all":
+        query = query.where(Candidate.position_id == position_id)
+
+    score_threshold = min_score
+    if score_threshold is None:
+        score_threshold = int(await get_system_setting(db, "minMatchScore", 70) or 70)
+    if min_score is not None:
+        query = query.where(Candidate.score >= score_threshold)
+
+    if statuses:
+        status_list = [s.strip() for s in statuses.split(",") if s.strip()]
+        if status_list:
+            expanded: list[str] = []
+            for status in status_list:
+                expanded.append(status)
+                if status == "passed":
+                    expanded.extend(["pending_interview"])
+            query = query.where(Candidate.status.in_(expanded))
+
+    if keyword:
+        kw = f"%{keyword}%"
+        query = query.outerjoin(Position, Candidate.position_id == Position.id).where(
+            or_(
+                Candidate.name.ilike(kw),
+                Candidate.skills.any(CandidateSkill.skill.ilike(kw)),
+                Position.name.ilike(kw),
+            )
+        )
+
+    if gender:
+        if gender == "未知":
+            query = query.where(
+                or_(
+                    Candidate.gender.is_(None),
+                    Candidate.gender == "",
+                    Candidate.gender == "未知",
+                    Candidate.gender.notin_(["男", "女"]),
+                )
+            )
+        else:
+            query = query.where(Candidate.gender == gender)
+
+    if education:
+        if education == "未知":
+            query = query.where(
+                or_(
+                    Candidate.education.is_(None),
+                    Candidate.education == "",
+                    Candidate.education == "未知",
+                )
+            )
+        else:
+            query = query.where(Candidate.education == education)
+
+    count_query = select(func.count()).select_from(
+        query.with_only_columns(Candidate.id).order_by(None).distinct().subquery()
+    )
+    total = (await db.execute(count_query)).scalar() or 0
+
+    sort_col = Candidate.upload_time if sort_by == "uploadTime" else Candidate.score
+    if sort_order == "asc":
+        query = query.order_by(asc(sort_col))
+    else:
+        query = query.order_by(desc(sort_col))
+
+    page = max(1, int(page))
+    page_size = max(1, min(int(page_size), 100))
+    offset = (page - 1) * page_size
+    query = query.offset(offset).limit(page_size)
+    result = await db.execute(query)
+    candidates = result.unique().scalars().all()
+
+    return {
+        "code": 0,
+        "message": "ok",
+        "data": {
+            "list": [serialize_candidate(c) for c in candidates],
+            "total": total,
+            "page": page,
+            "pageSize": page_size,
+        },
+    }
+
+
 # ── Endpoints ───────────────────────────────────────────
 
 @router.get("/resumes")
@@ -89,96 +197,19 @@ async def list_resumes(
     minScore: Optional[int] = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
-    query = select(Candidate).options(*CANDIDATE_LOAD_OPTIONS)
-
-    # Filter by position
-    if positionId and positionId != "all":
-        query = query.where(Candidate.position_id == positionId)
-
-    # 最低匹配分过滤：未传 minScore 时读系统设置
-    score_threshold = minScore
-    if score_threshold is None:
-        score_threshold = int(await get_system_setting(db, "minMatchScore", 70) or 70)
-    # 仅当显式传入 minScore 时强制过滤；默认阈值用于「低匹配」标记，列表仍展示全部
-    if minScore is not None:
-        query = query.where(Candidate.score >= score_threshold)
-
-    # Filter by statuses
-    if statuses:
-        status_list = [s.strip() for s in statuses.split(",") if s.strip()]
-        if status_list:
-            expanded: list[str] = []
-            for status in status_list:
-                expanded.append(status)
-                if status == "passed":
-                    expanded.extend(["pending_interview"])
-            query = query.where(Candidate.status.in_(expanded))
-
-    # Keyword search
-    if keyword:
-        kw = f"%{keyword}%"
-        query = query.outerjoin(Position, Candidate.position_id == Position.id).where(
-            or_(
-                Candidate.name.ilike(kw),
-                Candidate.skills.any(CandidateSkill.skill.ilike(kw)),
-                Position.name.ilike(kw),
-            )
-        )
-
-    # Gender filter
-    if gender:
-        if gender == "未知":
-            query = query.where(
-                or_(
-                    Candidate.gender.is_(None),
-                    Candidate.gender == "",
-                    Candidate.gender == "未知",
-                    Candidate.gender.notin_(["男", "女"]),
-                )
-            )
-        else:
-            query = query.where(Candidate.gender == gender)
-
-    # Education filter
-    if education:
-        if education == "未知":
-            query = query.where(
-                or_(
-                    Candidate.education.is_(None),
-                    Candidate.education == "",
-                    Candidate.education == "未知",
-                )
-            )
-        else:
-            query = query.where(Candidate.education == education)
-
-    # Count total
-    count_query = select(func.count()).select_from(query.subquery())
-    total = (await db.execute(count_query)).scalar() or 0
-
-    # Sort
-    sort_col = Candidate.upload_time if sortBy == "uploadTime" else Candidate.score
-    if sortOrder == "asc":
-        query = query.order_by(asc(sort_col))
-    else:
-        query = query.order_by(desc(sort_col))
-
-    # Paginate
-    offset = (page - 1) * pageSize
-    query = query.offset(offset).limit(pageSize)
-    result = await db.execute(query)
-    candidates = result.unique().scalars().all()
-
-    return {
-        "code": 0,
-        "message": "ok",
-        "data": {
-            "list": [serialize_candidate(c) for c in candidates],
-            "total": total,
-            "page": page,
-            "pageSize": pageSize,
-        },
-    }
+    return await query_candidate_list(
+        db,
+        position_id=positionId,
+        statuses=statuses,
+        keyword=keyword,
+        gender=gender,
+        education=education,
+        sort_by=sortBy,
+        sort_order=sortOrder,
+        page=page,
+        page_size=pageSize,
+        min_score=minScore,
+    )
 
 
 @router.get("/resumes/{resume_id}/file")
@@ -511,6 +542,11 @@ async def update_resume(
 
     await db.flush()
     await db.refresh(candidate)
+
+    new_status = body.get("status")
+    if new_status in PROBATION_CANDIDATE_STATUSES:
+        await ensure_employee_for_candidate(db, candidate)
+
     return {"code": 0, "message": "ok", "data": serialize_candidate(candidate)}
 
 

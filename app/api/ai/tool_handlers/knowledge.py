@@ -39,7 +39,14 @@ async def _rag_search(params: dict, db: AsyncSession) -> str:
 
 async def _list_knowledge(params: dict, db: AsyncSession) -> str:
     from app.api.knowledge.knowledge_base import list_knowledge as fn
-    result = await fn(categoryKey=params.get("categoryKey", "all"), keyword=params.get("keyword", ""), db=db)
+    result = await fn(
+        categoryKey=params.get("categoryKey") or "all",
+        keyword=params.get("keyword") or "",
+        sortBy="updateTime",
+        page=1,
+        pageSize=int(params.get("limit", 10) or 10),
+        db=db,
+    )
     data = result.get("data", {})
     if not isinstance(data, dict):
         return "查询完成"
@@ -107,7 +114,7 @@ async def _recall_test(params: dict, db: AsyncSession) -> str:
 
 async def _list_knowledge_bases(params: dict, db: AsyncSession) -> str:
     from app.api.knowledge.rag import list_knowledge_bases as fn
-    result = await fn(keyword=params.get("keyword", ""), db=db)
+    result = await fn(keyword=params.get("keyword") or "", page=1, page_size=20, db=db)
     d = result.get("data", {})
     return f"RAG知识库共 {d.get('total', 0)} 个"
 
@@ -155,7 +162,12 @@ async def _upload_document(params: dict, db: AsyncSession) -> str:
 
 async def _list_documents(params: dict, db: AsyncSession) -> str:
     from app.api.knowledge.rag import list_documents as fn
-    result = await fn(kb_id=params.get("kbId", ""), db=db)
+    result = await fn(
+        kb_id=params.get("kbId") or "",
+        page=1,
+        page_size=int(params.get("limit", 20) or 20),
+        db=db,
+    )
     d = result.get("data", {})
     return f"文档列表共 {d.get('total', 0)} 个"
 

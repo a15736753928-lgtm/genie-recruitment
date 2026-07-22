@@ -25,6 +25,16 @@ settings = get_settings()
 INTERVIEW_ELIGIBLE_STATUSES = {"passed", "first_interview", "second_interview", "pending_interview"}
 
 
+def normalize_interview_round(round: str) -> str:
+    """统一轮次标识：一面/first → first，二面/second → second。"""
+    r = (round or "first").strip().lower()
+    if r in ("first", "1", "r1", "一面", "第一轮", "first_interview"):
+        return "first"
+    if r in ("second", "2", "r2", "二面", "第二轮", "second_interview"):
+        return "second"
+    return (round or "first").strip()
+
+
 def _pre_generated_source_filter():
     """面试出题页题目来源：AI 预生成或历史数据（source 为空）。"""
     return or_(
@@ -488,6 +498,138 @@ async def get_or_generate_questions(candidate_id: str, round: str, db: AsyncSess
     return questions
 
 
+# ── Shared query logic (HTTP routes + agent tools) ───────
+
+async def query_interview_questions(
+    db: AsyncSession,
+    *,
+    candidate_id: str,
+    round: str,
+    category: Optional[str] = None,
+    difficulty: Optional[str] = None,
+) -> dict:
+    """获取候选人某轮面试题（可筛选），供路由与 Agent 工具直接调用。"""
+    round = normalize_interview_round(round)
+    all_questions = await get_or_generate_questions(candidate_id, round, db)
+
+    filtered = all_questions
+    if category:
+        filtered = [q for q in filtered if (q.category or "") == category]
+    if difficulty:
+        filtered = [q for q in filtered if (q.difficulty or "") == difficulty]
+
+    return {
+        "code": 0,
+        "message": "ok",
+        "data": {
+            "questions": [_question_to_dict(q) for q in filtered],
+            "stats": _build_question_stats(all_questions),
+            "filteredCount": len(filtered),
+        },
+    }
+
+
+async def query_interview_evaluation(
+    db: AsyncSession,
+    *,
+    candidate_id: str,
+    round: str = "first",
+    transcript_id: Optional[str] = None,
+) -> dict:
+    """获取面试评定数据（转写抽取题 + 评分），供路由与 Agent 工具直接调用。"""
+    round = normalize_interview_round(round)
+    scoring_mode = await get_setting(db, "defaultScoringMode", "ai")
+
+    if transcript_id:
+        target_tid = transcript_id
+        transcript_filter = InterviewQuestion.transcript_id == transcript_id
+    else:
+        latest_t_result = await db.execute(
+            select(InterviewTranscript.id).where(and_(
+                InterviewTranscript.candidate_id == candidate_id,
+                InterviewTranscript.round == round,
+            )).order_by(InterviewTranscript.created_at.desc()).limit(1)
+        )
+        target_tid = latest_t_result.scalar_one_or_none()
+        transcript_filter = InterviewQuestion.transcript_id == target_tid if target_tid else None
+
+    base_filters = [
+        InterviewQuestion.candidate_id == candidate_id,
+        InterviewQuestion.round == round,
+        InterviewQuestion.source == "transcript",
+    ]
+    if transcript_filter is not None:
+        base_filters.append(transcript_filter)
+
+    questions = await db.execute(
+        select(InterviewQuestion).where(and_(*base_filters)).order_by(InterviewQuestion.index_num)
+    )
+    questions = questions.scalars().all()
+
+    eval_result = await db.execute(
+        select(InterviewEvaluation).where(and_(
+            InterviewEvaluation.candidate_id == candidate_id,
+            InterviewEvaluation.round == round,
+        ))
+    )
+    evals = {str(e.question_id): e for e in eval_result.scalars().all()}
+
+    data = []
+    for q in questions:
+        e = evals.get(str(q.id))
+        primary_score = None
+        if e:
+            if scoring_mode == "manual":
+                primary_score = e.hr_score if e.hr_score is not None else e.ai_score
+            else:
+                primary_score = e.ai_score if e.ai_score is not None else e.hr_score
+        data.append({
+            "questionId": str(q.id),
+            "index": q.index_num,
+            "content": q.content,
+            "category": q.category,
+            "answer": e.answer if e else None,
+            "aiScore": e.ai_score if e else None,
+            "aiDimensions": e.ai_dimensions if e else None,
+            "hrScore": e.hr_score if e else None,
+            "primaryScore": primary_score,
+            "scoringMode": scoring_mode,
+            "status": e.status if e else "pending",
+            "dimensions": e.hr_dimensions if e else None,
+        })
+
+    segment_filters = [
+        InterviewSegmentEvaluation.candidate_id == candidate_id,
+        InterviewSegmentEvaluation.round == round,
+    ]
+    if target_tid is not None:
+        segment_filters.append(InterviewSegmentEvaluation.transcript_id == target_tid)
+    seg_result = await db.execute(
+        select(InterviewSegmentEvaluation).where(and_(*segment_filters))
+    )
+    segments = [_segment_to_dict(s) for s in seg_result.scalars().all()]
+
+    assessment_report = None
+    if target_tid is not None:
+        t_result = await db.execute(
+            select(InterviewTranscript).where(InterviewTranscript.id == target_tid)
+        )
+        transcript_row = t_result.scalar_one_or_none()
+        if transcript_row and transcript_row.assessment_report:
+            assessment_report = transcript_row.assessment_report
+
+    return {
+        "code": 0,
+        "message": "ok",
+        "data": {
+            "questions": data,
+            "segments": segments,
+            "assessmentReport": assessment_report,
+            "transcriptId": str(target_tid) if target_tid else None,
+        },
+    }
+
+
 # ── Endpoints ───────────────────────────────────────────
 
 async def _upsert_segment_evaluation(
@@ -728,23 +870,13 @@ async def get_questions(
     `data` 为筛选后的题目列表;`stats` 始终基于本轮全量题目(忽略筛选),
     供前端工具条展示「共 N 题 · 简单 a · 中等 b · 较难 c」。
     """
-    all_questions = await get_or_generate_questions(candidateId, round, db)
-
-    filtered = all_questions
-    if category:
-        filtered = [q for q in filtered if (q.category or "") == category]
-    if difficulty:
-        filtered = [q for q in filtered if (q.difficulty or "") == difficulty]
-
-    return {
-        "code": 0,
-        "message": "ok",
-        "data": {
-            "questions": [_question_to_dict(q) for q in filtered],
-            "stats": _build_question_stats(all_questions),
-            "filteredCount": len(filtered),
-        },
-    }
+    return await query_interview_questions(
+        db,
+        candidate_id=candidateId,
+        round=round,
+        category=category,
+        difficulty=difficulty,
+    )
 
 
 @router.put("/interview/questions")
@@ -1146,101 +1278,12 @@ async def get_evaluation(
     transcriptId: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
-    scoring_mode = await get_setting(db, "defaultScoringMode", "ai")
-
-    # 面试评定页完全由上传的面试对话驱动，只展示从转写文本抽取的题目
-    # （source='transcript'），与「面试出题」环节生成的题目完全独立。
-    # 若指定 transcriptId，只返回该次上传记录的题目；否则取最近一次上传记录。
-    if transcriptId:
-        target_tid = transcriptId
-        transcript_filter = InterviewQuestion.transcript_id == transcriptId
-    else:
-        latest_t_result = await db.execute(
-            select(InterviewTranscript.id).where(and_(
-                InterviewTranscript.candidate_id == candidate_id,
-                InterviewTranscript.round == round,
-            )).order_by(InterviewTranscript.created_at.desc()).limit(1)
-        )
-        target_tid = latest_t_result.scalar_one_or_none()
-        transcript_filter = InterviewQuestion.transcript_id == target_tid if target_tid else None
-
-    base_filters = [
-        InterviewQuestion.candidate_id == candidate_id,
-        InterviewQuestion.round == round,
-        InterviewQuestion.source == "transcript",
-    ]
-    if transcript_filter is not None:
-        base_filters.append(transcript_filter)
-
-    questions = await db.execute(
-        select(InterviewQuestion).where(and_(*base_filters)).order_by(InterviewQuestion.index_num)
+    return await query_interview_evaluation(
+        db,
+        candidate_id=candidate_id,
+        round=round,
+        transcript_id=transcriptId,
     )
-    questions = questions.scalars().all()
-
-    # Get evaluations for these questions
-    eval_result = await db.execute(
-        select(InterviewEvaluation).where(and_(
-            InterviewEvaluation.candidate_id == candidate_id,
-            InterviewEvaluation.round == round,
-        ))
-    )
-    evals = {str(e.question_id): e for e in eval_result.scalars().all()}
-
-    data = []
-    for q in questions:
-        e = evals.get(str(q.id))
-        # 按评分模式决定默认展示分数：ai 优先 aiScore，manual 优先 hrScore
-        primary_score = None
-        if e:
-            if scoring_mode == "manual":
-                primary_score = e.hr_score if e.hr_score is not None else e.ai_score
-            else:
-                primary_score = e.ai_score if e.ai_score is not None else e.hr_score
-        data.append({
-            "questionId": str(q.id),
-            "index": q.index_num,
-            "content": q.content,
-            "category": q.category,
-            "answer": e.answer if e else None,
-            "aiScore": e.ai_score if e else None,
-            "aiDimensions": e.ai_dimensions if e else None,
-            "hrScore": e.hr_score if e else None,
-            "primaryScore": primary_score,
-            "scoringMode": scoring_mode,
-            "status": e.status if e else "pending",
-            "dimensions": e.hr_dimensions if e else None,
-        })
-
-    # 取当前 transcript 范围下的「自我介绍 / 反问环节」片段评分
-    segment_filters = [
-        InterviewSegmentEvaluation.candidate_id == candidate_id,
-        InterviewSegmentEvaluation.round == round,
-    ]
-    if target_tid is not None:
-        segment_filters.append(InterviewSegmentEvaluation.transcript_id == target_tid)
-    seg_result = await db.execute(
-        select(InterviewSegmentEvaluation).where(and_(*segment_filters))
-    )
-    segments = [_segment_to_dict(s) for s in seg_result.scalars().all()]
-
-    assessment_report = None
-    if target_tid is not None:
-        t_result = await db.execute(
-            select(InterviewTranscript).where(InterviewTranscript.id == target_tid)
-        )
-        transcript_row = t_result.scalar_one_or_none()
-        if transcript_row and transcript_row.assessment_report:
-            assessment_report = transcript_row.assessment_report
-
-    return {
-        "code": 0,
-        "message": "ok",
-        "data": {
-            "questions": data,
-            "segments": segments,
-            "assessmentReport": assessment_report,
-        },
-    }
 
 
 @router.put("/interview/evaluation/{candidate_id}")
@@ -1954,28 +1997,41 @@ async def submit_evaluation(
     if candidate:
         if passed:
             if round == "second":
-                candidate.status = "offer_pending"
+                candidate.status = "passed"
                 try:
                     from app.services.system.notification import notify_if
                     from app.services.system.webhook import dispatch_webhook
                     await notify_if(
                         db,
                         "notifyOfferPending",
-                        "offer_pending",
-                        f"二面通过，待发 Offer：{candidate.name}",
+                        "passed",
+                        f"二面通过（已通过）：{candidate.name}",
                         {"candidateId": candidate_id},
                     )
                     await dispatch_webhook(
                         db,
-                        "candidate.offer_pending",
+                        "candidate.passed",
                         {"candidateId": candidate_id, "name": candidate.name, "avgScore": final_score},
                     )
+                except Exception:
+                    pass
+                try:
+                    from app.services.talent.probation_sync import ensure_employee_for_candidate
+                    from sqlalchemy.orm import selectinload
+                    cand_full = await db.execute(
+                        select(Candidate)
+                        .options(selectinload(Candidate.position))
+                        .where(Candidate.id == candidate_id)
+                    )
+                    c = cand_full.scalar_one_or_none()
+                    if c:
+                        await ensure_employee_for_candidate(db, c)
                 except Exception:
                     pass
             else:
                 candidate.status = "second_interview"
         else:
-            candidate.status = "rejected"
+            candidate.status = "failed"
 
     await db.flush()
     return {

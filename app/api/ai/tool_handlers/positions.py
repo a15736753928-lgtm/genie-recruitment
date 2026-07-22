@@ -148,11 +148,14 @@ async def _delete_position(params: dict, db: AsyncSession) -> str:
 
 async def _get_position_questions(params: dict, db: AsyncSession) -> str:
     from app.api.recruitment.positions import get_position_questions as fn
-    result = await fn(position_id=params["positionId"], round=params["round"], db=db)
+    from app.api.talent.interview import normalize_interview_round
+
+    round_val = normalize_interview_round(params.get("round") or "first")
+    result = await fn(position_id=params["positionId"], round=round_val, db=db)
     qs = result.get("data", [])
     if not qs:
-        return f"岗位题库（{params['round']}）暂无题目"
-    lines = [f"岗位题库（{params['round']}）共 {len(qs)} 道题："]
+        return f"岗位题库（{round_val}）暂无题目"
+    lines = [f"岗位题库（{round_val}）共 {len(qs)} 道题："]
     for q in qs:
         lines.append(f"  [{q.get('index','?')}] {q.get('content','')} | 分类:{q.get('category','')} | 难度:{q.get('difficulty','')}")
     return "\n".join(lines)
@@ -160,7 +163,14 @@ async def _get_position_questions(params: dict, db: AsyncSession) -> str:
 
 async def _save_position_questions(params: dict, db: AsyncSession) -> str:
     from app.api.recruitment.positions import save_position_questions as fn
-    result = await fn(position_id=params["positionId"], body={"round": params["round"], "questions": params["questions"]}, db=db)
+    from app.api.talent.interview import normalize_interview_round
+
+    round_val = normalize_interview_round(params.get("round") or "first")
+    result = await fn(
+        position_id=params["positionId"],
+        body={"round": round_val, "questions": params["questions"]},
+        db=db,
+    )
     return f"已保存岗位题库 {len(params['questions'])} 道题" if result["code"] == 0 else f"保存失败：{result.get('message', '')}"
 
 

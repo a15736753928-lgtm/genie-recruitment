@@ -14,6 +14,7 @@ from app.models.recruitment import Candidate, Position
 from app.config import get_settings
 from app.services.system.system_settings import get_system_setting
 from app.services.ai import get_llm_client
+from app.services.talent.probation_sync import ensure_employee_for_candidate, sync_onboarding_candidates
 
 router = APIRouter(tags=["试用期"])
 settings = get_settings()
@@ -122,6 +123,8 @@ def serialize_employee(emp: Employee) -> dict:
 
 @router.get("/probation/stats")
 async def get_probation_stats(db: AsyncSession = Depends(get_db)):
+    await sync_onboarding_candidates(db)
+
     total_query = select(func.count()).select_from(Employee)
     assessing_query = select(func.count()).select_from(Employee).where(Employee.status == "assessing")
     passed_query = select(func.count()).select_from(Employee).where(Employee.status == "passed")
@@ -146,6 +149,8 @@ async def list_probation(
     pageSize: int = Query(10),
     db: AsyncSession = Depends(get_db),
 ):
+    await sync_onboarding_candidates(db)
+
     query = select(Employee).options(
         selectinload(Employee.tasks),
         selectinload(Employee.position),
@@ -153,7 +158,7 @@ async def list_probation(
         selectinload(Employee.conversion),
     )
 
-    if department and department != "all":
+    if department and department not in ("all", "全部部门"):
         query = query.where(Employee.department == department)
     if status and status != "all":
         query = query.where(Employee.status == status)
@@ -161,7 +166,7 @@ async def list_probation(
     count_query = select(func.count()).select_from(query.subquery())
     total = (await db.execute(count_query)).scalar() or 0
 
-    query = query.offset((page - 1) * pageSize).limit(pageSize).order_by(Employee.created_at.desc())
+    query = query.order_by(Employee.created_at.desc()).offset((page - 1) * pageSize).limit(pageSize)
     result = await db.execute(query)
     employees = result.unique().scalars().all()
 
@@ -210,6 +215,27 @@ async def create_employee(
     req: CreateEmployeeRequest,
     db: AsyncSession = Depends(get_db),
 ):
+    if req.candidateId:
+        cand_result = await db.execute(
+            select(Candidate)
+            .options(selectinload(Candidate.position))
+            .where(Candidate.id == req.candidateId)
+        )
+        candidate = cand_result.scalar_one_or_none()
+        if candidate:
+            join_date = date.fromisoformat(req.joinDate) if req.joinDate else date.today()
+            emp = await ensure_employee_for_candidate(db, candidate, join_date=join_date)
+            if emp:
+                if req.department:
+                    emp.department = req.department
+                if req.mentorName:
+                    emp.mentor_name = req.mentorName
+                if req.mentorId:
+                    emp.mentor_id = req.mentorId
+                await db.flush()
+                await db.refresh(emp, attribute_names=["tasks", "position"])
+                return {"code": 0, "message": "ok", "data": serialize_employee(emp)}
+
     join_date = date.fromisoformat(req.joinDate) if req.joinDate else date.today()
     if req.probationEnd:
         probation_end = date.fromisoformat(req.probationEnd)

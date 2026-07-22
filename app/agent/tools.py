@@ -1,6 +1,8 @@
 """Agent Tool Registry — all tools the AI Agent can call."""
 from typing import List
 
+from app.agent.tool_desc import tool_desc
+
 # ── Permission engine singleton ────────────────────────────
 _perm_engine = None
 
@@ -20,17 +22,31 @@ def _get_permission_engine():
     return _perm_engine
 
 
+DB_TOOL_NAMES = (
+    "db_list_tables",
+    "db_describe_table",
+    "db_query",
+    "db_update",
+)
+
+
 TOOL_REGISTRY = {
     # Recruitment tools
     "list_resumes": {
         "name": "list_resumes",
-        "description": "查询候选人列表（按岗位/状态/关键词筛选）。仅当用户要查候选人、推荐人选时调用；查岗位 JD 时禁止调用。",
+        "description": tool_desc(
+            "分页查询候选人列表",
+            "按姓名/岗位/状态筛选、列出人选；查某岗位其他人选时用 positionName",
+            "查总数(用get_operations_dashboard)、查JD、改状态、出题",
+            "「看看Agent工程师岗位的其他候选人」→ list_resumes(positionName=Agent工程师)",
+        ),
         "parameters": {
             "type": "object",
             "properties": {
                 "positionId": {"type": "string", "description": "岗位ID，不传表示全部"},
+                "positionName": {"type": "string", "description": "岗位名称（如 Agent工程师），会自动解析为 positionId"},
                 "statuses": {"type": "string", "description": "状态列表，逗号分隔"},
-                "keyword": {"type": "string", "description": "搜索关键词"},
+                "keyword": {"type": "string", "description": "搜索关键词（姓名/技能/岗位名）"},
                 "sortBy": {"type": "string", "enum": ["score", "uploadTime"], "description": "排序字段"},
                 "limit": {"type": "integer", "description": "返回数量限制，默认10"},
             },
@@ -38,10 +54,11 @@ TOOL_REGISTRY = {
     },
     "get_resume": {
         "name": "get_resume",
-        "description": (
-            "获取候选人信息。按意图选字段，不要默认拉全量。"
-            "view: summary|core|detail|contact|screening|interview|full；"
-            "或 fields 指定字段列表。改状态/联系方式前先用合适 view 确认 id。"
+        "description": tool_desc(
+            "读取单个候选人详情",
+            "看完整简历/匹配分/技能/经历；view=full 看全量",
+            "岗位题库(get_position_questions)、候选人题单(get_questions)、改状态",
+            "「查看吴佳熙完整简历」→ get_resume(id, view=full)",
         ),
         "parameters": {
             "type": "object",
@@ -68,13 +85,22 @@ TOOL_REGISTRY = {
     },
     "update_resume": {
         "name": "update_resume",
-        "description": "更新候选人信息或状态。可更新基本信息、技能、工作经历等。",
+        "description": tool_desc(
+            "更新候选人状态或字段（写操作）",
+            "通过初筛/安排一面/一面未通过/淘汰/改电话等",
+            "查详情(get_resume)、出题(generate_questions)、搜知识库(rag_search)",
+            "「一面未通过」→ update_resume(id, status=failed)",
+        ),
         "parameters": {
             "type": "object",
             "properties": {
                 "id": {"type": "string", "description": "候选人ID"},
-                "status": {"type": "string", "description": "新状态：job_hunting/passed/first_interview/..."},
-                "fields": {"type": "object", "description": "要更新的字段"},
+                "status": {
+                    "type": "string",
+                    "enum": ["job_hunting", "passed", "first_interview", "second_interview", "failed", "expired"],
+                    "description": "passed=已通过(进入试用期考核), first_interview=一面, second_interview=二面, failed=未通过, job_hunting=求职中",
+                },
+                "fields": {"type": "object", "description": "要更新的其他字段"},
             },
             "required": ["id"],
         },
@@ -206,7 +232,12 @@ TOOL_REGISTRY = {
     },
     "get_position_questions": {
         "name": "get_position_questions",
-        "description": "获取岗位题库中某轮次的题目列表。",
+        "description": tool_desc(
+            "读取岗位通用题库（非某个候选人的题）",
+            "用户明确要看「岗位题库/岗位标准题」",
+            "查候选人简历(get_resume)、查某人题单(get_questions)、完整简历",
+            "参数 positionId+round；勿在用户要看简历时调用",
+        ),
         "parameters": {
             "type": "object",
             "properties": {
@@ -223,7 +254,11 @@ TOOL_REGISTRY = {
             "type": "object",
             "properties": {
                 "positionId": {"type": "string"},
-                "round": {"type": "string", "enum": ["first", "second"]},
+                "round": {
+                    "type": "string",
+                    "description": "面试轮次：first/second 或 一面/二面",
+                    "enum": ["first", "second", "一面", "二面"],
+                },
                 "questions": {"type": "array", "items": {"type": "object"}, "description": "题目数组，每项含 index/content/category/difficulty"},
             },
             "required": ["positionId", "round", "questions"],
@@ -233,36 +268,64 @@ TOOL_REGISTRY = {
     # Interview tools
     "get_questions": {
         "name": "get_questions",
-        "description": "获取或自动生成面试题单。若题单不存在会自动调用AI生成。",
+        "description": tool_desc(
+            "读取候选人预生成面试题（出题环节）",
+            "查看/展示某候选人的题单；参数 candidateId+round",
+            "岗位通用题库(get_position_questions)、查简历(get_resume)、改状态",
+            "「看吴佳熙一面题目」→ get_questions(candidateId, round=一面)",
+        ),
         "parameters": {
             "type": "object",
             "properties": {
                 "candidateId": {"type": "string"},
-                "round": {"type": "string", "enum": ["first", "second"]},
+                "round": {
+                    "type": "string",
+                    "description": "面试轮次：first/second 或 一面/二面",
+                    "enum": ["first", "second", "一面", "二面"],
+                },
             },
             "required": ["candidateId", "round"],
         },
     },
     "generate_questions": {
         "name": "generate_questions",
-        "description": "为候选人重新生成面试题目。",
+        "description": tool_desc(
+            "重新生成候选人面试题（覆盖旧题）",
+            "用户明确要求「生成/换一批/重新出题」",
+            "改状态、面试评定、仅查看题目(get_questions)",
+            "「给张三重新出一面题」",
+        ),
         "parameters": {
             "type": "object",
             "properties": {
                 "candidateId": {"type": "string"},
-                "round": {"type": "string", "enum": ["first", "second"]},
+                "round": {
+                    "type": "string",
+                    "description": "面试轮次：first/second 或 一面/二面",
+                    "enum": ["first", "second", "一面", "二面"],
+                },
             },
             "required": ["candidateId", "round"],
         },
     },
     "get_evaluation": {
         "name": "get_evaluation",
-        "description": "获取候选人的面试评分详情。",
+        "description": tool_desc(
+            "读取面试评定结果（从上传录音/转写抽取）",
+            "开始面试评定、看评分/问答/报告",
+            "预生成面试题(get_questions/generate_questions)、改状态",
+            "「开始一面评定」→ get_evaluation",
+        ),
         "parameters": {
             "type": "object",
             "properties": {
                 "candidateId": {"type": "string"},
-                "round": {"type": "string"},
+                "round": {
+                    "type": "string",
+                    "description": "first/second 或 一面/二面，默认 first",
+                    "enum": ["first", "second", "一面", "二面"],
+                },
+                "transcriptId": {"type": "string", "description": "可选，指定某次上传记录 ID"},
             },
             "required": ["candidateId"],
         },
@@ -297,7 +360,11 @@ TOOL_REGISTRY = {
             "type": "object",
             "properties": {
                 "candidateId": {"type": "string"},
-                "round": {"type": "string", "enum": ["first", "second"]},
+                "round": {
+                    "type": "string",
+                    "description": "面试轮次：first/second 或 一面/二面",
+                    "enum": ["first", "second", "一面", "二面"],
+                },
                 "questions": {"type": "array", "items": {"type": "object"}, "description": "题目数组，每项含 index/content/category/difficulty"},
             },
             "required": ["candidateId", "round", "questions"],
@@ -311,7 +378,11 @@ TOOL_REGISTRY = {
             "properties": {
                 "questionId": {"type": "string", "description": "要替换的题目ID"},
                 "candidateId": {"type": "string"},
-                "round": {"type": "string", "enum": ["first", "second"]},
+                "round": {
+                    "type": "string",
+                    "description": "面试轮次：first/second 或 一面/二面",
+                    "enum": ["first", "second", "一面", "二面"],
+                },
                 "prompt": {"type": "string", "description": "额外要求（可选）"},
                 "category": {"type": "string", "description": "指定分类（可选）"},
                 "difficulty": {"type": "string", "enum": ["easy", "medium", "hard"], "description": "指定难度（可选）"},
@@ -326,7 +397,11 @@ TOOL_REGISTRY = {
             "type": "object",
             "properties": {
                 "candidateId": {"type": "string"},
-                "round": {"type": "string", "enum": ["first", "second"]},
+                "round": {
+                    "type": "string",
+                    "description": "面试轮次：first/second 或 一面/二面",
+                    "enum": ["first", "second", "一面", "二面"],
+                },
                 "scores": {"type": "array", "items": {"type": "object"}, "description": "每项含 questionId/hrScore/answer/dimensions"},
             },
             "required": ["candidateId", "round", "scores"],
@@ -597,7 +672,12 @@ TOOL_REGISTRY = {
     # Knowledge / RAG
     "rag_search": {
         "name": "rag_search",
-        "description": "在知识库中检索相关内容（RAG）。用于查面试题、公司制度、技术规范等。",
+        "description": tool_desc(
+            "语义检索知识库",
+            "查制度/规范/技术文档/公司政策",
+            "改候选人状态、查简历列表、统计人数",
+            "「公司加班制度是什么」",
+        ),
         "parameters": {
             "type": "object",
             "properties": {
@@ -775,12 +855,17 @@ TOOL_REGISTRY = {
     # Dashboard
     "get_operations_dashboard": {
         "name": "get_operations_dashboard",
-        "description": "获取运营看板数据。包含概览统计、风险、漏斗等。",
+        "description": tool_desc(
+            "招聘运营统计汇总",
+            "有多少候选人/简历、状态分布、平均匹配分",
+            "查单个简历详情、列出每人人选",
+            "「现在有多少候选人」",
+        ),
         "parameters": {"type": "object", "properties": {}},
     },
     "get_dashboard_overview": {
         "name": "get_dashboard_overview",
-        "description": "获取数据看板概览（各模块统计汇总）。",
+        "description": "获取数据看板概览（简历总数、岗位数、面试中人数等汇总）。",
         "parameters": {"type": "object", "properties": {}},
     },
 
@@ -855,6 +940,8 @@ TOOL_REGISTRY = {
     },
 }
 
+GENERAL_TOOL_NAMES = tuple(k for k in TOOL_REGISTRY if k not in DB_TOOL_NAMES)
+
 
 def get_tools_for_agent(agent_id: str = "recruit") -> List[dict]:
     """Get the list of tool definitions for a specific agent type.
@@ -864,9 +951,9 @@ def get_tools_for_agent(agent_id: str = "recruit") -> List[dict]:
     performance) are kept for backward compatibility and still return a
     scoped subset, but the frontend is expected to use the "genie" agent.
     """
-    # The omnipotent agent gets every tool in the registry.
+    # The omnipotent agent gets general-safe tools (excludes db_* unless database intent).
     if agent_id in ("genie", "all", "omnipotent"):
-        return list(TOOL_REGISTRY.values())
+        return [TOOL_REGISTRY[name] for name in GENERAL_TOOL_NAMES]
 
     # Legacy scoped subsets (kept for backward compat / @-mention routing).
     recruit_tools = [

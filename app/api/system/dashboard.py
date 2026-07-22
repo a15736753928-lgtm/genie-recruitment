@@ -10,22 +10,71 @@ from app.models.performance import PerformanceRecord
 router = APIRouter(tags=["看板"])
 
 
-@router.get("/dashboard/overview")
-async def get_overview(db: AsyncSession = Depends(get_db)):
-    # Stats
+async def query_recruitment_summary(db: AsyncSession) -> dict:
+    """汇总候选人/岗位等核心计数，供 HTTP 路由与 Agent 工具直接调用。"""
     total_resumes = (await db.execute(select(func.count()).select_from(Candidate))).scalar() or 0
     total_positions = (await db.execute(select(func.count()).select_from(Position))).scalar() or 0
-    total_interviews = (await db.execute(
+    total_employees = (await db.execute(select(func.count()).select_from(Employee))).scalar() or 0
+
+    job_hunting = (await db.execute(
+        select(func.count()).select_from(Candidate).where(Candidate.status == "job_hunting")
+    )).scalar() or 0
+    passed_count = (await db.execute(
+        select(func.count()).select_from(Candidate).where(Candidate.status == "passed")
+    )).scalar() or 0
+    first_interview = (await db.execute(
+        select(func.count()).select_from(Candidate).where(Candidate.status == "first_interview")
+    )).scalar() or 0
+    second_interview = (await db.execute(
+        select(func.count()).select_from(Candidate).where(Candidate.status == "second_interview")
+    )).scalar() or 0
+    legacy_passed = (await db.execute(
         select(func.count()).select_from(Candidate).where(
-            Candidate.status.in_(["passed", "first_interview", "second_interview"])
+            Candidate.status.in_(["pending_interview", "probation", "onboarded"])
         )
     )).scalar() or 0
-    total_employees = (await db.execute(select(func.count()).select_from(Employee))).scalar() or 0
+    failed = (await db.execute(
+        select(func.count()).select_from(Candidate).where(Candidate.status == "failed")
+    )).scalar() or 0
+
+    passed = passed_count + legacy_passed
+    total_interviews = passed_count + first_interview + second_interview + legacy_passed
+
+    avg_score_result = (await db.execute(select(func.avg(Candidate.score)).select_from(Candidate)))
+    avg_score = round(float(avg_score_result.scalar() or 0), 1)
+
+    return {
+        "totalCandidates": int(total_resumes),
+        "totalPositions": int(total_positions),
+        "totalEmployees": int(total_employees),
+        "totalInterviews": int(total_interviews),
+        "jobHunting": int(job_hunting),
+        "passed": int(passed),
+        "firstInterview": int(first_interview),
+        "secondInterview": int(second_interview),
+        "failed": int(failed),
+        "avgScore": avg_score,
+    }
+
+
+@router.get("/dashboard/overview")
+async def get_overview(db: AsyncSession = Depends(get_db)):
+    summary = await query_recruitment_summary(db)
+    total_resumes = summary["totalCandidates"]
+    total_positions = summary["totalPositions"]
+    total_interviews = summary["totalInterviews"]
+    total_employees = summary["totalEmployees"]
 
     return {
         "code": 0,
         "message": "ok",
         "data": {
+            "stats": {
+                "totalResumes": total_resumes,
+                "totalPositions": total_positions,
+                "totalInterviews": total_interviews,
+                "totalEmployees": total_employees,
+            },
             "kpis": [
                 {"key": "resumes", "label": "简历总量", "value": total_resumes, "hint": "累计接收", "hintTone": "up"},
                 {"key": "positions", "label": "在招岗位", "value": total_positions, "hint": "持续招聘中", "hintTone": "default"},
@@ -46,36 +95,15 @@ async def get_overview(db: AsyncSession = Depends(get_db)):
 
 @router.get("/dashboard/operations")
 async def get_operations(db: AsyncSession = Depends(get_db)):
-    # Build operations dashboard from real data
-    total_resumes = (await db.execute(select(func.count()).select_from(Candidate))).scalar() or 0
-    total_employees = (await db.execute(select(func.count()).select_from(Employee))).scalar() or 0
-
-    # Status counts
-    job_hunting = (await db.execute(
-        select(func.count()).select_from(Candidate).where(Candidate.status == "job_hunting")
-    )).scalar() or 0
-    passed_count = (await db.execute(
-        select(func.count()).select_from(Candidate).where(Candidate.status == "passed")
-    )).scalar() or 0
-    first_interview = (await db.execute(
-        select(func.count()).select_from(Candidate).where(Candidate.status == "first_interview")
-    )).scalar() or 0
-    second = (await db.execute(
-        select(func.count()).select_from(Candidate).where(Candidate.status == "second_interview")
-    )).scalar() or 0
-    # 兼容历史状态
-    legacy_passed = (await db.execute(
-        select(func.count()).select_from(Candidate).where(
-            Candidate.status.in_(["pending_interview", "probation", "onboarded"])
-        )
-    )).scalar() or 0
-    passed = passed_count + legacy_passed
-    failed = (await db.execute(
-        select(func.count()).select_from(Candidate).where(Candidate.status == "failed")
-    )).scalar() or 0
-
-    avg_score_result = (await db.execute(select(func.avg(Candidate.score)).select_from(Candidate)))
-    avg_score = round(float(avg_score_result.scalar() or 0), 1)
+    summary = await query_recruitment_summary(db)
+    total_resumes = summary["totalCandidates"]
+    total_employees = summary["totalEmployees"]
+    job_hunting = summary["jobHunting"]
+    passed = summary["passed"]
+    first_interview = summary["firstInterview"]
+    second = summary["secondInterview"]
+    failed = summary["failed"]
+    avg_score = summary["avgScore"]
 
     return {
         "code": 0,
