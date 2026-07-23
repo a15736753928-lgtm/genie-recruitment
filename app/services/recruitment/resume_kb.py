@@ -1,21 +1,21 @@
 """简历 → RAG「简历」知识库自动入库。
 
-上传简历时：若尚无名为「简历」的知识库则创建，再把文件复制到 rag/ 前缀并触发
+上传简历时：若尚无名为「简历」的知识库则创建，再复用简历原件的 MinIO 对象触发
 分片 / 向量化 / Milvus 入库（ingest_file_async 后台线程）。
+
+注意：本文档的 object_key 与 Candidate.resume_file 指向同一个 MinIO 对象，
+不再单独复制一份到 rag/ 前缀，避免两份文件各自失踪、不同步。
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
-import uuid
 from typing import Optional, Tuple
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.infrastructure import minio_storage
 from app.models.knowledge import KnowledgeBase, _now_ms, _short_uuid
 from app.services.rag.ingest_service import ingest_file_async
 from app.services.rag.utils import SUPPORTED_EXTENSIONS, check_extension
@@ -61,7 +61,7 @@ async def ingest_resume_to_kb(
     candidate_id: str = "",
 ) -> Optional[Tuple[str, str]]:
     """
-    确保「简历」知识库存在，将简历文件写入 rag/ 前缀并启动 ingest。
+    确保「简历」知识库存在，复用简历原件的 MinIO 对象启动 ingest。
 
     Args:
         candidate_id: 关联的候选人 ID。会写入 KnowledgeDocument.source_id，
@@ -83,12 +83,16 @@ async def ingest_resume_to_kb(
 
         kb = await ensure_resume_knowledge_base(db)
 
-        # 独立存一份到 rag/，避免删简历时连带破坏知识库文档
-        file_ext = os.path.splitext(file_name)[1].lower() or ".pdf"
-        rag_key = f"rag/{uuid.uuid4()}{file_ext}"
-        await asyncio.to_thread(
-            minio_storage.upload_bytes, rag_key, content, "application/octet-stream"
-        )
+        # 复用简历原件的 MinIO 对象：Candidate.resume_file 与本文档的 object_key
+        # 指向同一个对象，避免两份文件各自失踪、不同步。删除时由 cascade_delete
+        # 统一清理；入库去重分支已对 source_type='resume' 跳过删除，不会误删原件。
+        if not source_object_key:
+            logger.warning(
+                "简历入库缺少 source_object_key，跳过（candidate=%s file=%s）",
+                candidate_id or "-", file_name,
+            )
+            return None
+        rag_key = source_object_key
 
         doc_id, task_id = ingest_file_async(
             file_path=rag_key,

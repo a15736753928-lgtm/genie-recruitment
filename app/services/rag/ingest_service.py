@@ -337,10 +337,13 @@ def _run_ingest_sync(
                 "跳过重复文档入库 kb=%s file=%s existing=%s",
                 kb_id, file_name, existing[0],
             )
-            try:
-                minio_storage.delete_object(object_key)
-            except Exception as cleanup_err:
-                logger.debug("清理重复上传对象失败: %s", cleanup_err)
+            # 简历入库时 object_key 与 Candidate.resume_file 是同一个共享对象，
+            # 删掉会连带毁掉简历原件，这里跳过清理（非简历来源才清理临时上传对象）。
+            if source_type != "resume":
+                try:
+                    minio_storage.delete_object(object_key)
+                except Exception as cleanup_err:
+                    logger.debug("清理重复上传对象失败: %s", cleanup_err)
             return
 
         doc = KnowledgeDocument(
