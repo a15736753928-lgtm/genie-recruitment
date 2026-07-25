@@ -243,6 +243,56 @@ def _run_migrations(connection):
     _add_column_if_missing(connection, "interview_transcripts", "process_progress", "INTEGER NOT NULL DEFAULT 100")
     _add_column_if_missing(connection, "interview_transcripts", "process_stage", "VARCHAR(64)")
     _add_column_if_missing(connection, "interview_transcripts", "process_message", "TEXT")
+    # v14: 招聘需求表单改造 — departments 表 + 字段增减
+    _migrate_v14_recruitment_form(connection)
+    # v15: 直属负责人支持姓名填写（UUID 可选）
+    _migrate_v15_direct_manager_name(connection)
+
+
+def _migrate_v15_direct_manager_name(connection) -> None:
+    """v15: 招聘需求直属负责人支持手填姓名；direct_manager_id 改为可空。"""
+    from sqlalchemy import text
+    _add_column_if_missing(connection, "recruitment_requests", "direct_manager_name", "VARCHAR(64)")
+    try:
+        connection.execute(text(
+            "ALTER TABLE recruitment_requests ALTER COLUMN direct_manager_id DROP NOT NULL"
+        ))
+    except Exception:
+        pass
+
+
+def _migrate_v14_recruitment_form(connection) -> None:
+    """v14: 招聘需求表单改造 — 创建 departments 表, 增删列."""
+    from sqlalchemy import text
+    # 1. Create departments table if absent
+    connection.execute(text(
+        "CREATE TABLE IF NOT EXISTS departments ("
+        "  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),"
+        "  name VARCHAR(64) UNIQUE NOT NULL,"
+        "  description TEXT,"
+        "  created_at TIMESTAMP DEFAULT now()"
+        ")"
+    ))
+    # 2. Add new columns to recruitment_requests
+    _add_column_if_missing(connection, "recruitment_requests", "department_id", "UUID")
+    _add_column_if_missing(connection, "recruitment_requests", "work_experience", "TEXT NOT NULL DEFAULT ''")
+    _add_column_if_missing(connection, "recruitment_requests", "education_requirement", "TEXT NOT NULL DEFAULT ''")
+    _add_column_if_missing(connection, "recruitment_requests", "job_responsibilities", "TEXT NOT NULL DEFAULT ''")
+    _add_column_if_missing(connection, "recruitment_requests", "job_description", "TEXT NOT NULL DEFAULT ''")
+    _add_column_if_missing(connection, "recruitment_requests", "job_requirements", "TEXT NOT NULL DEFAULT ''")
+    _add_column_if_missing(connection, "recruitment_requests", "bonus_items", "TEXT")
+    # 3. Drop old columns
+    _drop_column_if_exists(connection, "recruitment_requests", "position_goal")
+    _drop_column_if_exists(connection, "recruitment_requests", "project_experience_req")
+    # 4. FK constraint (skip if already exists)
+    connection.execute(text(
+        "DO $$ BEGIN"
+        "  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_recruitment_requests_department') THEN"
+        "    ALTER TABLE recruitment_requests ADD CONSTRAINT fk_recruitment_requests_department"
+        "      FOREIGN KEY (department_id) REFERENCES departments(id) ON DELETE SET NULL;"
+        "  END IF;"
+        " END $$"
+    ))
 
 
 def _migrate_transcript_history(connection) -> None:

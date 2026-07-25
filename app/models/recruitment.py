@@ -162,3 +162,13 @@ class CandidateAIAnalysis(Base):
 
     candidate = relationship("Candidate", back_populates="ai_analysis")
 
+
+class Department(Base):
+    """部门参考表 —— 用于招聘需求、岗位等统一引用。"""
+    __tablename__ = "departments"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name = Column(String(64), unique=True, nullable=False)
+    description = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+

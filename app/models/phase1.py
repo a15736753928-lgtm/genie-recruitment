@@ -23,20 +23,26 @@ class RecruitmentRequest(Base):
     __tablename__ = "recruitment_requests"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    # 13 个必填字段
+    # 18 个字段（2026-07-25 改造）
     position_name = Column(String(128), nullable=False)
     headcount = Column(Integer, nullable=False)                     # ≥1
-    position_goal = Column(Text, nullable=False)
+    department_id = Column(UUID(as_uuid=True), ForeignKey("departments.id"), nullable=True)
+    work_experience = Column(Text, nullable=False, default="")
+    education_requirement = Column(Text, nullable=False, default="")
+    job_responsibilities = Column(Text, nullable=False, default="")
+    job_description = Column(Text, nullable=False, default="")
+    job_requirements = Column(Text, nullable=False, default="")
+    bonus_items = Column(Text, nullable=True, default="")
     core_tasks = Column(Text, nullable=False)
     required_skills = Column(JSON, nullable=False)                  # list[str], 非空
     preferred_skills = Column(JSON, nullable=True)
-    project_experience_req = Column(Text, nullable=False)
     deliverable_req = Column(Text, nullable=False)
     salary_range = Column(String(64), nullable=False)               # 脱敏字段
     probation_goal = Column(Text, nullable=False)
     elimination_criteria = Column(Text, nullable=False)
-    interviewer_ids = Column(JSON, nullable=False)                  # [user_id, ...]
-    direct_manager_id = Column(UUID(as_uuid=True), nullable=False)  # FK users
+    interviewer_ids = Column(JSON, nullable=False)                  # [user_id 或姓名, ...]
+    direct_manager_id = Column(UUID(as_uuid=True), nullable=True)   # 可选：系统用户 UUID
+    direct_manager_name = Column(String(64), nullable=True)         # 表单填写的负责人姓名
 
     # 提交人
     submitter_id = Column(UUID(as_uuid=True), nullable=False)       # FK users

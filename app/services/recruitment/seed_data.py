@@ -3,7 +3,7 @@ import uuid
 from datetime import date
 from sqlalchemy import select, func
 from app.database import async_session_factory, Base, engine
-from app.models.recruitment import Position
+from app.models.recruitment import Position, Department
 from app.models.knowledge import KnowledgeCategory
 from app.models.settings import SystemSetting
 
@@ -87,12 +87,37 @@ DEFAULT_POSITIONS = [
 ]
 
 
+async def seed_departments(db) -> None:
+    """幂等创建 10 个默认部门。"""
+    names = [
+        ("技术部", "负责软件开发、架构设计和技术创新"),
+        ("产品部", "负责产品规划、需求分析和用户体验"),
+        ("设计部", "负责UI/UX设计、品牌视觉和交互设计"),
+        ("市场部", "负责市场推广、品牌营销和渠道拓展"),
+        ("运营部", "负责业务运营、客户服务和流程优化"),
+        ("财务部", "负责财务管理、预算控制和成本分析"),
+        ("人力资源部", "负责招聘、培训、绩效和员工关系"),
+        ("数据平台部", "负责数据平台建设、数据治理和分析"),
+        ("AI 平台部", "负责AI能力建设、模型训练和算法优化"),
+        ("综合管理部", "负责行政、法务和综合事务管理"),
+    ]
+    for name, desc in names:
+        exists = await db.execute(
+            select(Department).where(Department.name == name)
+        )
+        if not exists.scalar_one_or_none():
+            db.add(Department(name=name, description=desc))
+    await db.flush()
+
+
 async def seed_all():
     # Also seed V2 positions from the handbook
     from app.services.recruitment.seed_data_v2 import seed_positions_v2
 
     async with async_session_factory() as db:
         create_missing_positions = await _should_create_seed_positions(db)
+        await seed_departments(db)
+        await db.commit()
 
     await seed_positions_v2(create_missing=create_missing_positions)
 
