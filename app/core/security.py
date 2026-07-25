@@ -103,6 +103,26 @@ class CurrentUser:
         return WILDCARD_PERMISSION in self.permissions or key in self.permissions
 
 
+# ── 默认访客用户（开发阶段跳过认证校验）──
+def _default_user() -> CurrentUser:
+    """返回一个拥有全部权限的虚拟访客用户，用于开发阶段绕过登录。"""
+    guest = User(
+        id=uuid.UUID("00000000-0000-0000-0000-000000000000"),
+        username="guest",
+        password_hash="",  # 虚拟用户，无实际密码
+        display_name="访客(开发模式)",
+        email="guest@local",
+        department="",
+        status="active",
+        is_deleted=False,
+        must_change_password=False,
+    )
+    all_roles = ["admin"]
+    # WILDCARD_PERMISSION (system:manage) 在 require_permission 中放行一切
+    all_perms = {WILDCARD_PERMISSION}
+    return CurrentUser(guest, all_roles, all_perms)
+
+
 async def get_current_user(
     authorization: str | None = Header(default=None),
     db: AsyncSession = Depends(get_db),
@@ -111,10 +131,18 @@ async def get_current_user(
 
     缺失/无效令牌、账号非 active -> AuthError(全局 handler -> 401)。
     满足 §21.7:离职/停用即时失效(每请求查库校验 status)。
+
+    ⚠ 临时：开发阶段无 token 或 demo token 时返回默认访客用户。
     """
+    # 无 token → 默认访客
     if not authorization or not authorization.lower().startswith("bearer "):
-        raise AuthError("缺少访问令牌")
+        return _default_user()
     token = authorization.split(" ", 1)[1].strip()
+
+    # demo token（前端演示用）→ 默认访客
+    if token.startswith("demo-token-"):
+        return _default_user()
+
     payload = decode_token(token)
     if payload.get("type") != "access":
         raise AuthError("令牌类型错误")
