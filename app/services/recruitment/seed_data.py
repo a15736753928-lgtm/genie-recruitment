@@ -164,8 +164,30 @@ async def seed_all():
         await _ensure_positions_seeded_flag(db)
         await db.commit()
 
+    # ── 项目需求(人员推荐组队)──────────────────
+    await seed_projects()
+
     # ── RBAC: roles + initial users ──────────────────
     await seed_roles()
+
+
+async def seed_projects() -> None:
+    """播种示例项目需求(供项目人员推荐页展示)。"""
+    from app.models.phase4 import Project
+    default_projects = [
+        {"name": "人才管理系统二期", "required_skills": ["React", "TypeScript"],
+         "required_level": "L3", "headcount": 2, "department": "技术部"},
+        {"name": "618 活动复盘优化", "required_skills": ["活动策划", "数据分析"],
+         "required_level": "L3", "headcount": 1, "department": "运营部"},
+        {"name": "客户 B AI 化方案", "required_skills": ["企业问诊", "流程分析"],
+         "required_level": "L4", "headcount": 1, "department": "咨询部"},
+    ]
+    async with async_session_factory() as db:
+        for proj in default_projects:
+            exists = await db.execute(select(Project).where(Project.name == proj["name"]))
+            if not exists.scalar_one_or_none():
+                db.add(Project(**proj))
+        await db.commit()
 
 
 async def seed_roles() -> None:

@@ -102,16 +102,16 @@ async def export_module(module: str, db: AsyncSession = Depends(get_db)):
     elif module == "probation":
         result = await db.execute(select(Employee).order_by(Employee.created_at.desc()))
         items = result.scalars().all()
-        headers = ["id", "name", "department", "joinDate", "probationEnd", "status", "week1Score"]
+        headers = ["id", "name", "department", "onboardDate", "probationEndDate", "status", "overallScore"]
         rows = [
             [
                 str(e.id),
                 e.name or "",
                 e.department or "",
-                e.join_date.isoformat() if e.join_date else "",
-                e.probation_end.isoformat() if e.probation_end else "",
+                e.onboard_date.isoformat() if e.onboard_date else "",
+                e.probation_end_date.isoformat() if e.probation_end_date else "",
                 e.status or "",
-                e.week1_score if e.week1_score is not None else "",
+                float(e.overall_score) if e.overall_score is not None else "",
             ]
             for e in items
         ]

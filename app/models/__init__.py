@@ -36,6 +36,7 @@ from app.models.phase3 import (
 # 第四期业务表
 from app.models.phase4 import (
     TalentProfile, AbilityTag, PromotionRecord, EquityRecord,
+    Project, ProjectAssignment,
 )
 
 __all__ = [
@@ -57,4 +58,5 @@ __all__ = [
     "TrainingCourse", "EmployeeTrainingProgress", "MentorRecord",
     "WorkTask", "TaskAcceptance", "PointRecord", "RewardPenaltyRecord", "Appeal",
     "TalentProfile", "AbilityTag", "PromotionRecord", "EquityRecord",
+    "Project", "ProjectAssignment",
 ]

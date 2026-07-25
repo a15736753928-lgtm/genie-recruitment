@@ -1,5 +1,5 @@
 import json
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime
 from typing import Optional
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,23 +22,45 @@ settings = get_settings()
 
 
 
+def serialize_task(t: ProbationTask, employee_name: str = "") -> dict:
+    """完整任务对象,对齐前端 ProbationTask。"""
+    return {
+        "id": str(t.id),
+        "employeeId": str(t.employee_id),
+        "employeeName": employee_name,
+        "week": t.week_number,
+        "weekNumber": t.week_number,
+        "name": t.title,
+        "title": t.title,
+        "objective": t.objective or "",
+        "assignee": t.assignee or "",
+        "deadline": t.deadline.isoformat() if t.deadline else "",
+        "inputMaterials": t.input_materials,
+        "deliverables": t.deliverables or "",
+        "qualityStandard": t.quality_standard or "",
+        "testStandard": t.test_standard or "",
+        "reviewer": t.reviewer or "",
+        "expectedPoints": t.expected_points or 0,
+        "status": t.status,
+        "description": t.description,
+        "reviewNotes": t.review_notes,
+        "riskNote": t.risk_note,
+        "score": float(t.score) if t.score is not None else None,
+        "projectScores": t.project_scores,
+        "submittedAt": t.submitted_at.isoformat() if t.submitted_at else None,
+        "reviewedAt": t.reviewed_at.isoformat() if t.reviewed_at else None,
+    }
+
+
 def serialize_employee(emp: Employee) -> dict:
     tasks = list(emp.tasks or [])
     total_tasks = len(tasks)
-    completed_tasks = sum(1 for t in tasks if t.status == "completed")
+    # 完成判定统一到前端口径 "passed"
+    completed_tasks = sum(1 for t in tasks if t.status == "passed")
     tasks_by_week = {}
     for t in tasks:
         wk = t.week_number or 0
-        if wk not in tasks_by_week:
-            tasks_by_week[wk] = []
-        tasks_by_week[wk].append({
-            "id": str(t.id),
-            "title": t.title,
-            "description": t.description,
-            "status": t.status,
-            "deadline": t.deadline.isoformat() if t.deadline else "",
-            "reviewNotes": t.review_notes,
-        })
+        tasks_by_week.setdefault(wk, []).append(serialize_task(t, emp.name or ""))
 
     position_name = emp.position.name if emp.position else ""
 
@@ -47,25 +69,29 @@ def serialize_employee(emp: Employee) -> dict:
         "candidateId": str(emp.candidate_id) if emp.candidate_id else "",
         "positionId": str(emp.position_id) if emp.position_id else "",
         "positionName": position_name,
+        "position": position_name,
         "name": emp.name,
         "gender": emp.gender,
         "age": emp.age,
         "department": emp.department,
-        "joinDate": emp.join_date.isoformat() if emp.join_date else "",
-        "probationEnd": emp.probation_end.isoformat() if emp.probation_end else "",
-        "status": emp.status or "assessing",
-        "mentorName": emp.mentor,        "taskProgress": round(completed_tasks / total_tasks * 100) if total_tasks > 0 else 0,
+        "onboardDate": emp.onboard_date.isoformat() if emp.onboard_date else "",
+        "probationEndDate": emp.probation_end_date.isoformat() if emp.probation_end_date else "",
+        "status": emp.status or "pending_onboard",
+        "employeeType": emp.employee_type or "tech",
+        "matchLevel": emp.match_level,
+        "currentWeek": emp.current_week,
+        "totalWeeks": emp.total_weeks,
+        "mentor": emp.mentor,
+        "mentorName": emp.mentor,
+        "manager": emp.manager,
+        "overallScore": float(emp.overall_score) if emp.overall_score is not None else None,
+        "riskLevel": emp.risk_level,
+        "taskProgress": round(completed_tasks / total_tasks * 100) if total_tasks > 0 else 0,
         "totalTasks": total_tasks,
         "completedTasks": completed_tasks,
         "aiScore": emp.ai_score,
         "aiResult": emp.ai_result,
-        "tasks": [
-            {"id": str(t.id), "title": t.title, "weekNumber": t.week_number,
-             "status": t.status, "description": t.description,
-             "deadline": t.deadline.isoformat() if t.deadline else "",
-             "reviewNotes": t.review_notes}
-            for t in tasks
-        ],
+        "tasks": [serialize_task(t, emp.name or "") for t in tasks],
         "tasksByWeek": tasks_by_week,
     }
 
@@ -77,9 +103,12 @@ async def get_probation_stats(db: AsyncSession = Depends(get_db)):
     await sync_onboarding_candidates(db)
 
     total_query = select(func.count()).select_from(Employee)
-    assessing_query = select(func.count()).select_from(Employee).where(Employee.status == "assessing")
-    passed_query = select(func.count()).select_from(Employee).where(Employee.status == "passed")
-    failed_query = select(func.count()).select_from(Employee).where(Employee.status == "failed")
+    # 新词表口径: 考核中=training/probation/pending_confirmation; 通过=formal; 未通过=离场
+    assessing_query = select(func.count()).select_from(Employee).where(
+        Employee.status.in_(["training", "probation", "pending_confirmation"]))
+    passed_query = select(func.count()).select_from(Employee).where(Employee.status == "formal")
+    failed_query = select(func.count()).select_from(Employee).where(
+        Employee.status.in_(["transferred", "resigned"]))
 
     total = (await db.execute(total_query)).scalar() or 0
     assessing = (await db.execute(assessing_query)).scalar() or 0
@@ -198,11 +227,11 @@ async def create_employee(
         gender=req.gender,
         age=req.age,
         department=req.department,
-        join_date=join_date,
-        probation_end=probation_end,
-        mentor_name=req.mentorName,
+        onboard_date=join_date,
+        probation_end_date=probation_end,
+        mentor=req.mentorName,
         mentor_id=req.mentorId,
-        status="assessing",
+        status="pending_onboard",
     )
     db.add(emp)
     await db.flush()
@@ -217,7 +246,7 @@ async def create_employee(
             week_number=i,
             description=f"完成第 {i} 周工作目标与复盘",
             deadline=join_date + timedelta(days=7 * i),
-            status="pending",
+            status="in_progress",
         ))
 
     await db.flush()
@@ -233,13 +262,13 @@ async def create_probation_task(
     db: AsyncSession = Depends(get_db),
 ):
     employee_id = body.get("employeeId")
-    week_number = body.get("weekNumber")
-    task_title = body.get("taskTitle", body.get("title", ""))
-    task_description = body.get("description", "")
+    # 兼容前端 name/week 与 taskTitle/weekNumber
+    week_number = body.get("week", body.get("weekNumber"))
+    task_title = body.get("name", body.get("taskTitle", body.get("title", "")))
     deadline_str = body.get("deadline", "")
 
     result = await db.execute(
-        select(Employee).options(selectinload(Employee.tasks)).where(Employee.id == employee_id)
+        select(Employee).where(Employee.id == employee_id)
     )
     emp = result.scalar_one_or_none()
     if not emp:
@@ -249,13 +278,22 @@ async def create_probation_task(
         employee_id=employee_id,
         title=task_title,
         week_number=week_number,
-        description=task_description,
+        description=body.get("description", ""),
         deadline=date.fromisoformat(deadline_str) if deadline_str else None,
+        status=body.get("status", "in_progress"),
+        objective=body.get("objective"),
+        assignee=body.get("assignee"),
+        input_materials=body.get("inputMaterials"),
+        deliverables=body.get("deliverables"),
+        quality_standard=body.get("qualityStandard"),
+        test_standard=body.get("testStandard"),
+        reviewer=body.get("reviewer"),
+        expected_points=body.get("expectedPoints"),
+        risk_note=body.get("riskNote"),
     )
     db.add(task)
     await db.flush()
-    await db.refresh(emp)
-    return {"code": 0, "message": "ok", "data": serialize_employee(emp)}
+    return {"code": 0, "message": "ok", "data": serialize_task(task, emp.name or "")}
 
 
 @router.put("/probation/tasks/{task_id}")
@@ -264,21 +302,43 @@ async def update_probation_task(
     body: dict,
     db: AsyncSession = Depends(get_db),
 ):
-    result = await db.execute(select(ProbationTask).where(ProbationTask.id == task_id))
+    result = await db.execute(
+        select(ProbationTask).options(selectinload(ProbationTask.employee)).where(ProbationTask.id == task_id)
+    )
     task = result.scalar_one_or_none()
     if not task:
         return {"code": 404, "message": "任务不存在", "data": None}
 
-    for field in ["title", "status", "description", "reviewNotes"]:
+    # camelCase(前端) → snake_case(ORM) 映射
+    field_map = {
+        "name": "title", "title": "title", "status": "status",
+        "description": "description", "reviewNotes": "review_notes",
+        "objective": "objective", "assignee": "assignee",
+        "inputMaterials": "input_materials", "deliverables": "deliverables",
+        "qualityStandard": "quality_standard", "testStandard": "test_standard",
+        "reviewer": "reviewer", "expectedPoints": "expected_points",
+        "riskNote": "risk_note", "projectScores": "project_scores",
+    }
+    for field, column in field_map.items():
         if field in body:
-            setattr(task, field, body[field])
-    if "weekNumber" in body:
+            setattr(task, column, body[field])
+    if "week" in body:
+        task.week_number = body["week"]
+    elif "weekNumber" in body:
         task.week_number = body["weekNumber"]
+    if "score" in body and body["score"] is not None:
+        task.score = body["score"]
     if "deadline" in body and body["deadline"]:
         task.deadline = date.fromisoformat(body["deadline"])
+    # 状态流转打时间戳
+    if body.get("status") == "pending_review" and task.submitted_at is None:
+        task.submitted_at = datetime.utcnow()
+    if body.get("status") == "passed":
+        task.reviewed_at = datetime.utcnow()
 
     await db.flush()
-    return {"code": 0, "message": "ok", "data": None}
+    emp_name = task.employee.name if task.employee else ""
+    return {"code": 0, "message": "ok", "data": serialize_task(task, emp_name or "")}
 
 
 # ── AI Evaluate ──

@@ -13,6 +13,7 @@ from typing import Optional, List, Any
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import select, func, delete
+from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
@@ -51,7 +52,17 @@ async def _get_setting(db: AsyncSession, key: str, default: Any) -> Any:
 # ── 序列化 ───────────────────────────────────────────────────
 
 def _serialize_plan(p: ProbationPlan) -> dict:
-    return {"id": str(p.id), "employeeId": str(p.employee_id), "type": p.type,
+    # employee 关系已 selectinload 时带上员工名/岗位
+    emp_name = emp_position = ""
+    try:
+        if p.employee is not None:
+            emp_name = p.employee.name or ""
+            if p.employee.position is not None:
+                emp_position = p.employee.position.name or ""
+    except Exception:
+        pass
+    return {"id": str(p.id), "employeeId": str(p.employee_id),
+            "employeeName": emp_name, "position": emp_position, "type": p.type,
             "totalWeeks": p.total_weeks, "startDate": p.start_date.isoformat() if p.start_date else None,
             "endDate": p.end_date.isoformat() if p.end_date else None, "status": p.status,
             "aiGenerated": p.ai_generated, "weeks": p.weeks,
@@ -65,7 +76,22 @@ def _serialize_review(r: ProbationWeekReview) -> dict:
             "reviewedAt": r.reviewed_at.isoformat() if r.reviewed_at else None}
 
 def _serialize_confirmation(cr: ConfirmationReview) -> dict:
+    # employee 关系已 selectinload 时带上员工信息，供前端列表/详情展示
+    emp_name = emp_dept = emp_mentor = emp_manager = ""
+    emp_position = ""
+    try:
+        if cr.employee is not None:
+            emp_name = cr.employee.name or ""
+            emp_dept = cr.employee.department or ""
+            emp_mentor = cr.employee.mentor or ""
+            emp_manager = cr.employee.manager or ""
+            if cr.employee.position is not None:
+                emp_position = cr.employee.position.name or ""
+    except Exception:
+        pass
     return {"id": str(cr.id), "employeeId": str(cr.employee_id),
+            "employeeName": emp_name, "position": emp_position,
+            "department": emp_dept, "mentor": emp_mentor, "manager": emp_manager,
             "week1Score": float(cr.week1_score) if cr.week1_score else None,
             "week2Score": float(cr.week2_score) if cr.week2_score else None,
             "week3Score": float(cr.week3_score) if cr.week3_score else None,
@@ -181,6 +207,20 @@ async def create_plan(
     return ok(_serialize_plan(plan))
 
 
+@router.get("/probation/plans/list/all")
+async def list_plans(
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """查全部试用期计划(前端计划列表),带员工名/岗位,按创建时间倒序。"""
+    rows = (await db.execute(
+        select(ProbationPlan)
+        .options(selectinload(ProbationPlan.employee).selectinload(Employee.position))
+        .order_by(ProbationPlan.created_at.desc())
+    )).scalars().all()
+    return ok([_serialize_plan(p) for p in rows])
+
+
 @router.get("/probation/plans/{employee_id}")
 async def get_plan(
     employee_id: str,
@@ -191,7 +231,11 @@ async def get_plan(
         eid = uuid.UUID(employee_id)
     except ValueError:
         return not_found("员工不存在")
-    p = (await db.execute(select(ProbationPlan).where(ProbationPlan.employee_id == eid))).scalar_one_or_none()
+    p = (await db.execute(
+        select(ProbationPlan)
+        .options(selectinload(ProbationPlan.employee).selectinload(Employee.position))
+        .where(ProbationPlan.employee_id == eid)
+    )).scalar_one_or_none()
     if not p:
         return not_found("未找到试用期计划")
     return ok(_serialize_plan(p))
@@ -294,6 +338,20 @@ async def list_week_reviews(
 # ═══════════════════════════════════════════════
 # 转正审批
 # ═══════════════════════════════════════════════
+
+@router.get("/probation/confirmations/list")
+async def list_confirmations(
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """查全部转正审批单（前端转正审批页列表），带员工信息，按创建时间倒序。"""
+    rows = (await db.execute(
+        select(ConfirmationReview)
+        .options(selectinload(ConfirmationReview.employee).selectinload(Employee.position))
+        .order_by(ConfirmationReview.created_at.desc())
+    )).scalars().all()
+    return ok([_serialize_confirmation(cr) for cr in rows])
+
 
 @router.post("/probation/{employee_id}/confirmation/sync")
 async def sync_confirmation(
@@ -445,10 +503,17 @@ async def update_recommendation(
     )).scalar_one_or_none()
     if not cr:
         return not_found("无转正审批记录")
-    for field in ("employeeSummary", "projectResults", "abilityGaps", "next90DaysGoals", "recommendation"):
-        key = field  # snake_case
+    # camelCase(前端) → snake_case(ORM 列) 显式映射，避免 setattr 写到无效动态属性上
+    field_map = {
+        "employeeSummary": "employee_summary",
+        "projectResults": "project_results",
+        "abilityGaps": "ability_gaps",
+        "next90DaysGoals": "next_90days_goals",
+        "recommendation": "recommendation",
+    }
+    for field, column in field_map.items():
         if field in body:
-            setattr(cr, key, body[field])
+            setattr(cr, column, body[field])
     await db.flush()
     return ok(_serialize_confirmation(cr))
 
@@ -548,7 +613,9 @@ async def get_training_progress(
     except ValueError:
         return fail(400, "无效ID")
     tp = (await db.execute(
-        select(EmployeeTrainingProgress).where(EmployeeTrainingProgress.employee_id == eid)
+        select(EmployeeTrainingProgress)
+        .options(selectinload(EmployeeTrainingProgress.employee).selectinload(Employee.position))
+        .where(EmployeeTrainingProgress.employee_id == eid)
     )).scalar_one_or_none()
     if not tp:
         tp = await _ensure_training_progress(db, eid)
@@ -607,7 +674,18 @@ async def complete_course(
 def _serialize_training_progress(tp: EmployeeTrainingProgress | None) -> dict | None:
     if not tp:
         return None
-    return {"id": str(tp.id), "employeeId": str(tp.employee_id), "courses": tp.courses,
+    # employee 关系已 selectinload 时带上员工名/岗位，供前端展示
+    emp_name = emp_position = ""
+    try:
+        if tp.employee is not None:
+            emp_name = tp.employee.name or ""
+            if tp.employee.position is not None:
+                emp_position = tp.employee.position.name or ""
+    except Exception:
+        pass
+    return {"id": str(tp.id), "employeeId": str(tp.employee_id),
+            "employeeName": emp_name, "position": emp_position,
+            "courses": tp.courses,
             "overallRate": float(tp.overall_rate) if tp.overall_rate else 0,
             "completedAt": tp.completed_at.isoformat() if tp.completed_at else None}
 
@@ -617,7 +695,15 @@ def _serialize_training_progress(tp: EmployeeTrainingProgress | None) -> dict | 
 # ═══════════════════════════════════════════════
 
 def _serialize_mentor(m: MentorRecord) -> dict:
-    return {"id": str(m.id), "employeeId": str(m.employee_id), "week": m.week,
+    # employee 关系已 selectinload 时带上员工名，供前端列表展示
+    employee_name = ""
+    try:
+        if m.employee is not None:
+            employee_name = m.employee.name or ""
+    except Exception:
+        employee_name = ""
+    return {"id": str(m.id), "employeeId": str(m.employee_id),
+            "employeeName": employee_name, "week": m.week,
             "trainingContent": m.training_content,
             "masteredSkills": m.mastered_skills, "pendingSkills": m.pending_skills,
             "completedTasks": m.completed_tasks, "issues": m.issues,
@@ -640,6 +726,20 @@ class CreateMentorRecordRequest(BaseModel):
     mentor_score: Optional[int] = Field(None, alias="mentorScore")
 
 
+@router.get("/mentor-records")
+async def list_all_mentor_records(
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """查全部带教记录（前端无参调用），带员工名，按创建时间倒序。"""
+    rows = (await db.execute(
+        select(MentorRecord)
+        .options(selectinload(MentorRecord.employee))
+        .order_by(MentorRecord.created_at.desc())
+    )).scalars().all()
+    return ok([_serialize_mentor(m) for m in rows])
+
+
 @router.get("/mentor-records/{employee_id}")
 async def get_mentor_records(
     employee_id: str,
@@ -651,7 +751,9 @@ async def get_mentor_records(
     except ValueError:
         return not_found("员工不存在")
     rows = (await db.execute(
-        select(MentorRecord).where(MentorRecord.employee_id == eid)
+        select(MentorRecord)
+        .options(selectinload(MentorRecord.employee))
+        .where(MentorRecord.employee_id == eid)
         .order_by(MentorRecord.week)
     )).scalars().all()
     return ok([_serialize_mentor(m) for m in rows])

@@ -28,7 +28,7 @@ async def _default_probation_tasks(db: AsyncSession, emp: Employee, join_date: d
                 week_number=i,
                 description=f"完成第 {i} 周工作目标与复盘",
                 deadline=join_date + timedelta(days=7 * i),
-                status="pending",
+                status="in_progress",
             )
         )
 
@@ -65,9 +65,9 @@ async def ensure_employee_for_candidate(
         gender=candidate.gender,
         age=candidate.age,
         department=department,
-        join_date=join,
-        probation_end=probation_end,
-        status="assessing",
+        onboard_date=join,
+        probation_end_date=probation_end,
+        status="pending_onboard",
     )
     db.add(emp)
     await db.flush()

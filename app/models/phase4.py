@@ -148,3 +148,45 @@ class EquityRecord(Base):
     created_by = Column(UUID(as_uuid=True), nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     approved_at = Column(DateTime, nullable=True)
+
+
+# ═══════════════════════════════════════════════
+# 项目 & 项目人员分配(人员推荐组队)
+# ═══════════════════════════════════════════════
+
+class Project(Base):
+    """项目需求 —— AI 按技能匹配人才,项目负责人确认组队。"""
+    __tablename__ = "projects"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name = Column(String(128), nullable=False)
+    description = Column(Text, nullable=True)
+    required_skills = Column(JSON, nullable=True)               # [str]
+    required_level = Column(String(2), nullable=True, default="L3")   # L1-L5
+    headcount = Column(Integer, nullable=False, default=1)
+    department = Column(String(64), nullable=True)
+    status = Column(String(16), nullable=False, default="recruiting")  # recruiting / staffed / closed
+    created_by = Column(UUID(as_uuid=True), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    assignments = relationship("ProjectAssignment", back_populates="project",
+                               cascade="all, delete-orphan")
+
+
+class ProjectAssignment(Base):
+    """项目人员分配 —— 一个员工在一个项目里最多一条。"""
+    __tablename__ = "project_assignments"
+    __table_args__ = (UniqueConstraint("project_id", "employee_id", name="uq_project_member"),)
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    project_id = Column(UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"),
+                        nullable=False, index=True)
+    employee_id = Column(UUID(as_uuid=True), ForeignKey("employees.id", ondelete="CASCADE"),
+                         nullable=False, index=True)
+    employee_name = Column(String(64), nullable=True)           # 冗余便于列表展示
+    assigned_by = Column(String(64), nullable=True)             # 操作人名
+    assigned_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    project = relationship("Project", back_populates="assignments")

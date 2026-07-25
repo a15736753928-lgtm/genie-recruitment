@@ -77,17 +77,34 @@ class Employee(Base):
 
 
 class ProbationTask(Base):
-    """试用期任务 —— 第二期扩充,第一期建表保持兼容。"""
+    """试用期任务 —— 第二期扩充为可验收任务(对齐前端 ProbationTask)。"""
     __tablename__ = "probation_tasks"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     employee_id = Column(UUID(as_uuid=True), ForeignKey("employees.id", ondelete="CASCADE"), nullable=False)
-    title = Column(String(256), nullable=False)
-    week_number = Column(Integer, nullable=True)
+    title = Column(String(256), nullable=False)              # 前端 name
+    week_number = Column(Integer, nullable=True)             # 前端 week
     description = Column(Text, nullable=True)
-    status = Column(String(16), default="pending")
+    # 状态统一到前端 TaskStatus: draft/pending_confirm/in_progress/pending_review/passed/rework/closed
+    status = Column(String(24), default="in_progress")
     deadline = Column(Date, nullable=True)
     review_notes = Column(Text, nullable=True)
+
+    # ── 第二期扩充:可验收任务字段(对齐前端 ProbationTask) ──
+    objective = Column(Text, nullable=True)                  # 任务目标
+    assignee = Column(String(64), nullable=True)             # 负责人/执行人
+    input_materials = Column(Text, nullable=True)            # 输入材料
+    deliverables = Column(Text, nullable=True)               # 交付物
+    quality_standard = Column(Text, nullable=True)           # 质量标准
+    test_standard = Column(Text, nullable=True)              # 测试标准
+    reviewer = Column(String(64), nullable=True)             # 验收人
+    expected_points = Column(Integer, nullable=True)         # 预期积分
+    risk_note = Column(Text, nullable=True)                  # 风险说明
+    score = Column(Numeric(5, 2), nullable=True)             # 验收得分
+    project_scores = Column(JSON, nullable=True)             # 项目 8 维评分 {dimKey: score}
+    submitted_at = Column(DateTime, nullable=True)
+    reviewed_at = Column(DateTime, nullable=True)
+
     created_at = Column(DateTime, default=datetime.utcnow)
 
     employee = relationship("Employee", back_populates="tasks")

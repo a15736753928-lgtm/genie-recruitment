@@ -577,3 +577,10 @@ async def probation_dashboard(current: CurrentUser = Depends(get_current_user), 
         "totalEmployees": total_emp, "inProbation": in_prob, "formal": formal,
         "conversionExcellent": excellent, "conversionNormal": normal,
     })
+
+
+# ═══════════════════════════════════════════════
+# 项目 & 项目人员推荐(路由拆在 _project_routes.py)
+# ═══════════════════════════════════════════════
+from app.api.talent._project_routes import register_project_routes  # noqa: E402
+register_project_routes(router)
