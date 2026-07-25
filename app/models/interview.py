@@ -26,6 +26,11 @@ class InterviewQuestion(Base):
     difficulty = Column(String(8))
     # 题目来源：pre_generated=面试出题环节 AI 生成；transcript=从上传的面试转写文本中抽取
     source = Column(String(16), nullable=False, default="pre_generated")
+    # 第一期新增: 题目类型 + 8要素规格
+    question_type = Column(String(16), nullable=False, default="standard")
+    # standard(固定标准题) / verify(简历验证题) / practical(场景实操题)
+    spec = Column(JSON, nullable=True)
+    # {purpose,followUp,scoringDimensions,maxScore,excellentAnswer,acceptableAnswer,failAnswer,riskSignals}
     # 当 source='transcript' 时，关联到具体的转写记录（删除记录时级联删除其题目与评分）
     transcript_id = Column(UUID(as_uuid=True), ForeignKey("interview_transcripts.id", ondelete="CASCADE"), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)

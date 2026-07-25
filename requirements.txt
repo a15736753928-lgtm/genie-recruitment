@@ -60,3 +60,8 @@ apscheduler>=3.10.0
 
 # Agent OS (memory frontmatter parsing)
 PyYAML>=6.0
+
+# Auth (P0 reconstruction)
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+bcrypt==4.2.1

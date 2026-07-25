@@ -245,6 +245,13 @@ app.add_middleware(
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
+    # AuthError -> HTTP 401 (鉴权失败,非 500)
+    from app.core.security import AuthError
+    if isinstance(exc, AuthError):
+        return JSONResponse(
+            status_code=401,
+            content={"code": 401, "message": exc.message, "data": None},
+        )
     # Invalid UUID path/query params surface as asyncpg DataError or
     # sqlalchemy DBAPIError. Convert to a clean 400/404 instead of a 500 so
     # the frontend gets a meaningful message and the server logs stay clean.
@@ -270,22 +277,43 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 
 # ── Register routers ──
+# P0: 鉴权 & 用户管理 & 状态机/异常队列
+from app.api.auth import auth as auth_router, users as users_router
+from app.api.system import state_exceptions
 # 招聘管理
 from app.api.recruitment import positions, resumes
+from app.api.recruitment import requests as recruitment_requests_router, scoring as resume_scoring_router
 # 人才评估
-from app.api.talent import interview, probation, performance
+from app.api.talent import interview, probation, performance, phase1_interview, phase2 as phase2_probation, phase4 as phase4_talent
+from app.api.talent import offer as offer_router_module
 # 知识库
 from app.api.knowledge import knowledge_base as knowledge, rag
 # AI 功能 — 唯一 Agent 入口（v1/v2/v3 已合并，agent_chat_v2 已删除）
 from app.api.ai import agent_chat as ai_agent
+# 第三期: 任务积分
+from app.api.points import phase3 as points_router
 # 系统管理
 from app.api.system import dashboard, settings as settings_router, export as export_router
 from app.api.system import llm_config as llm_config_router
 
+# P0 先注册(鉴权白名单依赖路径匹配)
+app.include_router(auth_router.router, prefix="/api")
+app.include_router(users_router.router, prefix="/api")
+# roles 路由附在 users_router 模块里,单独注册
+from app.api.auth.users import roles_router
+app.include_router(roles_router, prefix="/api")
+app.include_router(state_exceptions.router, prefix="/api")
+app.include_router(recruitment_requests_router.router, prefix="/api")
+app.include_router(resume_scoring_router.router, prefix="/api")
 app.include_router(positions.router, prefix="/api")
 app.include_router(resumes.router, prefix="/api")
 app.include_router(interview.router, prefix="/api")
+app.include_router(phase1_interview.router, prefix="/api")
 app.include_router(probation.router, prefix="/api")
+app.include_router(offer_router_module.router, prefix="/api")
+app.include_router(phase2_probation.router, prefix="/api")  # 第二期: 试用期+培训+带教
+app.include_router(points_router.router, prefix="/api")    # 第三期: 任务积分奖惩申诉
+app.include_router(phase4_talent.router, prefix="/api")    # 第四期: 人才池/晋级/期权/看板
 app.include_router(performance.router, prefix="/api")
 app.include_router(knowledge.router, prefix="/api")
 app.include_router(dashboard.router, prefix="/api")
