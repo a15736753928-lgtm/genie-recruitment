@@ -162,15 +162,3 @@ class CandidateAIAnalysis(Base):
 
     candidate = relationship("Candidate", back_populates="ai_analysis")
 
-
-class TalentPool(Base):
-    __tablename__ = "talent_pool"
-    __table_args__ = (UniqueConstraint("candidate_id"),)
-
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    candidate_id = Column(UUID(as_uuid=True), ForeignKey("candidates.id", ondelete="CASCADE"), nullable=False)
-    position_id = Column(UUID(as_uuid=True), ForeignKey("positions.id"), nullable=True)
-    score = Column(Integer, nullable=True)
-    source_round = Column(String(8), nullable=True)
-    added_at = Column(DateTime, default=datetime.utcnow)
-    notes = Column(Text, nullable=True)

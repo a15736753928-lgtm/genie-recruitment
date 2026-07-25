@@ -7,9 +7,7 @@ from sqlalchemy import select, func
 from sqlalchemy.orm import selectinload
 from pydantic import BaseModel
 from app.database import get_db
-from app.models.probation import (
-    Employee, ProbationTask, ProbationWeek1Assessment, ProbationConversion
-)
+from app.models.probation import Employee, ProbationTask
 from app.models.recruitment import Candidate, Position
 from app.config import get_settings
 from app.services.system.system_settings import get_system_setting
@@ -22,46 +20,6 @@ settings = get_settings()
 
 # ── Serializers ─────────────────────────────────────────
 
-def serialize_week1(wa: Optional[ProbationWeek1Assessment]) -> Optional[dict]:
-    if not wa:
-        return None
-    return {
-        "id": str(wa.id),
-        "employeeId": str(wa.employee_id),
-        "dimensionCompletion": wa.dimension_completion,
-        "dimensionFidelity": wa.dimension_fidelity,
-        "dimensionProblemSolving": wa.dimension_problem_solving,
-        "dimensionStandards": wa.dimension_standards,
-        "totalScore": wa.total_score,
-        "deductionReasons": wa.deduction_reasons,
-        "assessorSignature": wa.assessor_signature,
-        "deptHeadSignature": wa.dept_head_signature,
-        "assessorDate": wa.assessor_date.isoformat() if wa.assessor_date else "",
-    }
-
-
-def serialize_conversion(conv: Optional[ProbationConversion]) -> Optional[dict]:
-    if not conv:
-        return None
-    return {
-        "id": str(conv.id),
-        "employeeId": str(conv.employee_id),
-        "projectPerformanceScore": conv.project_performance_score,
-        "projectPerformanceWeight": float(conv.project_performance_weight) if conv.project_performance_weight else 0.6,
-        "techCapabilityScore": conv.tech_capability_score,
-        "techCapabilityWeight": float(conv.tech_capability_weight) if conv.tech_capability_weight else 0.2,
-        "collaborationScore": conv.collaboration_score,
-        "collaborationWeight": float(conv.collaboration_weight) if conv.collaboration_weight else 0.2,
-        "totalScore": float(conv.total_score) if conv.total_score else 0,
-        "decision": conv.decision,
-        "mentorComments": conv.mentor_comments,
-        "mentorSignature": conv.mentor_signature,
-        "mentorDate": conv.mentor_date.isoformat() if conv.mentor_date else "",
-        "deptHeadSignature": conv.dept_head_signature,
-        "deptHeadDate": conv.dept_head_date.isoformat() if conv.dept_head_date else "",
-        "hrSignature": conv.hr_signature,
-        "hrDate": conv.hr_date.isoformat() if conv.hr_date else "",
-    }
 
 
 def serialize_employee(emp: Employee) -> dict:
@@ -96,12 +54,7 @@ def serialize_employee(emp: Employee) -> dict:
         "joinDate": emp.join_date.isoformat() if emp.join_date else "",
         "probationEnd": emp.probation_end.isoformat() if emp.probation_end else "",
         "status": emp.status or "assessing",
-        "mentorName": emp.mentor_name,
-        "week1Score": emp.week1_score,
-        "week1Passed": emp.week1_passed,
-        "conversionScore": float(emp.conversion_score) if emp.conversion_score else None,
-        "conversionDecision": emp.conversion_decision,
-        "taskProgress": round(completed_tasks / total_tasks * 100) if total_tasks > 0 else 0,
+        "mentorName": emp.mentor,        "taskProgress": round(completed_tasks / total_tasks * 100) if total_tasks > 0 else 0,
         "totalTasks": total_tasks,
         "completedTasks": completed_tasks,
         "aiScore": emp.ai_score,
@@ -114,8 +67,6 @@ def serialize_employee(emp: Employee) -> dict:
             for t in tasks
         ],
         "tasksByWeek": tasks_by_week,
-        "week1Assessment": serialize_week1(emp.week1_assessment),
-        "conversion": serialize_conversion(emp.conversion),
     }
 
 
@@ -154,8 +105,6 @@ async def list_probation(
     query = select(Employee).options(
         selectinload(Employee.tasks),
         selectinload(Employee.position),
-        selectinload(Employee.week1_assessment),
-        selectinload(Employee.conversion),
     )
 
     if department and department not in ("all", "全部部门"):
@@ -185,8 +134,7 @@ async def get_probation_employee(employee_id: str, db: AsyncSession = Depends(ge
         select(Employee).options(
             selectinload(Employee.tasks),
             selectinload(Employee.position),
-            selectinload(Employee.week1_assessment),
-            selectinload(Employee.conversion),
+            
         ).where(Employee.id == employee_id)
     )
     emp = result.scalar_one_or_none()
@@ -229,7 +177,7 @@ async def create_employee(
                 if req.department:
                     emp.department = req.department
                 if req.mentorName:
-                    emp.mentor_name = req.mentorName
+                    emp.mentor = req.mentorName
                 if req.mentorId:
                     emp.mentor_id = req.mentorId
                 await db.flush()
@@ -275,178 +223,6 @@ async def create_employee(
     await db.flush()
     await db.refresh(emp)
     return {"code": 0, "message": "ok", "data": serialize_employee(emp)}
-
-
-# ── Week 1 Assessment (per document Chapter 3) ──
-
-class Week1AssessmentRequest(BaseModel):
-    dimensionCompletion: int = 0
-    dimensionFidelity: int = 0
-    dimensionProblemSolving: int = 0
-    dimensionStandards: int = 0
-    deductionReasons: Optional[dict] = None
-    assessorSignature: Optional[str] = None
-    deptHeadSignature: Optional[str] = None
-
-
-@router.post("/probation/{employee_id}/week1")
-async def save_week1_assessment(
-    employee_id: str,
-    req: Week1AssessmentRequest,
-    db: AsyncSession = Depends(get_db),
-):
-    emp_result = await db.execute(
-        select(Employee).where(Employee.id == employee_id)
-    )
-    emp = emp_result.scalar_one_or_none()
-    if not emp:
-        return {"code": 404, "message": "员工不存在", "data": None}
-
-    total = req.dimensionCompletion + req.dimensionFidelity + req.dimensionProblemSolving + req.dimensionStandards
-    week1_threshold = int(await get_system_setting(db, "passScoreThreshold", 75) or 75)
-    # 第一周通过线取设置合格分与文档基准 70 的较低者，避免过严
-    passed = total >= min(70, week1_threshold)
-
-    # Upsert week1 assessment
-    wa_result = await db.execute(
-        select(ProbationWeek1Assessment).where(ProbationWeek1Assessment.employee_id == employee_id)
-    )
-    wa = wa_result.scalar_one_or_none()
-    if wa:
-        wa.dimension_completion = req.dimensionCompletion
-        wa.dimension_fidelity = req.dimensionFidelity
-        wa.dimension_problem_solving = req.dimensionProblemSolving
-        wa.dimension_standards = req.dimensionStandards
-        wa.total_score = total
-        wa.deduction_reasons = req.deductionReasons
-        wa.assessor_signature = req.assessorSignature
-        wa.dept_head_signature = req.deptHeadSignature
-        wa.assessor_date = date.today()
-    else:
-        wa = ProbationWeek1Assessment(
-            employee_id=employee_id,
-            dimension_completion=req.dimensionCompletion,
-            dimension_fidelity=req.dimensionFidelity,
-            dimension_problem_solving=req.dimensionProblemSolving,
-            dimension_standards=req.dimensionStandards,
-            total_score=total,
-            deduction_reasons=req.deductionReasons,
-            assessor_signature=req.assessorSignature,
-            dept_head_signature=req.deptHeadSignature,
-            assessor_date=date.today(),
-        )
-        db.add(wa)
-
-    # Update employee
-    emp.week1_score = total
-    emp.week1_passed = passed
-    if not passed:
-        emp.status = "failed"
-        emp.conversion_decision = "rejected"
-        try:
-            from app.services.system.notification import notify_if
-            from app.services.system.webhook import dispatch_webhook
-            await notify_if(
-                db,
-                "notifyProbationRisk",
-                "probation_risk",
-                f"试用期第一周未通过：{emp.name}（得分 {total}）",
-                {"employeeId": employee_id},
-            )
-            await dispatch_webhook(
-                db,
-                "probation.week1_failed",
-                {"employeeId": employee_id, "name": emp.name, "score": total},
-            )
-        except Exception:
-            pass
-
-    await db.flush()
-    return {"code": 0, "message": "ok", "data": {"totalScore": total, "passed": passed}}
-
-
-# ── Conversion evaluation (per document Chapter 4) ──
-
-class ConversionRequest(BaseModel):
-    projectPerformanceScore: int = 0
-    techCapabilityScore: int = 0
-    collaborationScore: int = 0
-    mentorComments: Optional[str] = None
-    mentorSignature: Optional[str] = None
-    deptHeadSignature: Optional[str] = None
-    hrSignature: Optional[str] = None
-
-
-@router.post("/probation/{employee_id}/conversion")
-async def save_conversion(
-    employee_id: str,
-    req: ConversionRequest,
-    db: AsyncSession = Depends(get_db),
-):
-    emp_result = await db.execute(
-        select(Employee).where(Employee.id == employee_id)
-    )
-    emp = emp_result.scalar_one_or_none()
-    if not emp:
-        return {"code": 404, "message": "员工不存在", "data": None}
-
-    # Compute weighted total: 60% + 20% + 20%
-    total = (req.projectPerformanceScore * 0.60 +
-             req.techCapabilityScore * 0.20 +
-             req.collaborationScore * 0.20)
-
-    # Decision per document: >= 80 convert, 70-79 extend, < 70 reject
-    if total >= 80:
-        decision = "converted"
-    elif total >= 70:
-        decision = "extended"
-    else:
-        decision = "rejected"
-
-    # Upsert conversion
-    conv_result = await db.execute(
-        select(ProbationConversion).where(ProbationConversion.employee_id == employee_id)
-    )
-    conv = conv_result.scalar_one_or_none()
-    if conv:
-        conv.project_performance_score = req.projectPerformanceScore
-        conv.tech_capability_score = req.techCapabilityScore
-        conv.collaboration_score = req.collaborationScore
-        conv.total_score = total
-        conv.decision = decision
-        conv.mentor_comments = req.mentorComments
-        conv.mentor_signature = req.mentorSignature
-        conv.mentor_date = date.today()
-        conv.dept_head_signature = req.deptHeadSignature
-        conv.dept_head_date = date.today() if req.deptHeadSignature else None
-        conv.hr_signature = req.hrSignature
-        conv.hr_date = date.today() if req.hrSignature else None
-    else:
-        conv = ProbationConversion(
-            employee_id=employee_id,
-            project_performance_score=req.projectPerformanceScore,
-            tech_capability_score=req.techCapabilityScore,
-            collaboration_score=req.collaborationScore,
-            total_score=total,
-            decision=decision,
-            mentor_comments=req.mentorComments,
-            mentor_signature=req.mentorSignature,
-            mentor_date=date.today(),
-            dept_head_signature=req.deptHeadSignature,
-            dept_head_date=date.today() if req.deptHeadSignature else None,
-            hr_signature=req.hrSignature,
-            hr_date=date.today() if req.hrSignature else None,
-        )
-        db.add(conv)
-
-    # Update employee
-    emp.conversion_score = total
-    emp.conversion_decision = decision
-    emp.status = "passed" if decision == "converted" else ("assessing" if decision == "extended" else "failed")
-
-    await db.flush()
-    await db.refresh(emp)
-    return {"code": 0, "message": "ok", "data": {"totalScore": total, "decision": decision}}
 
 
 # ── Tasks ──

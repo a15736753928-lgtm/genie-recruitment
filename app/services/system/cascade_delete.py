@@ -22,7 +22,7 @@ from sqlalchemy import select, delete as _delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.infrastructure import minio_storage
-from app.models.recruitment import Candidate, TalentPool
+from app.models.recruitment import Candidate
 from app.models.probation import Employee
 from app.models.performance import PerformanceRecord
 from app.models.knowledge import KnowledgeDocument, KnowledgeChunk
@@ -59,10 +59,7 @@ async def cascade_delete_by_candidate(
     # 1) 试用期员工 + 绩效记录
     await _delete_employee_and_performance(db, cid)
 
-    # 2) 人才库
-    await db.execute(_delete(TalentPool).where(TalentPool.candidate_id == cid))
-
-    # 3) RAG「简历」知识库中对应的文档
+    # 2) RAG「简历」知识库中对应的文档
     await _delete_linked_kb_documents(db, cid)
 
     # 4) 简历原件

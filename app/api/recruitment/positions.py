@@ -157,11 +157,7 @@ async def delete_position(
     if candidate_result.scalar_one_or_none():
         return {"code": 409, "message": "该岗位下有关联候选人，请先删除或转移相关简历后再删除岗位", "data": None}
 
-    # talent_pool / employees 外键是 NO ACTION，先解除引用再删岗位
-    await db.execute(
-        text("UPDATE talent_pool SET position_id = NULL WHERE position_id = :pid"),
-        {"pid": position_id},
-    )
+    # employees 外键是 NO ACTION，先解除引用再删岗位
     await db.execute(
         text("UPDATE employees SET position_id = NULL WHERE position_id = :pid"),
         {"pid": position_id},

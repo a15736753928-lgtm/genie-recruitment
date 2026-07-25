@@ -66,8 +66,6 @@ class ToolResultAdapter:
         "get_probation_stats": "stats",
         "get_probation_employee": "card",
         "create_probation_employee": "card",
-        "save_week1_assessment": "score",
-        "save_conversion": "score",
         "create_probation_task": "card",
         "update_probation_task": "card",
         "ai_evaluate_probation": "score",

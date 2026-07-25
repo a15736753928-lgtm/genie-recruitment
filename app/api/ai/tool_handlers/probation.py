@@ -73,28 +73,6 @@ async def _create_probation_employee(params: dict, db: AsyncSession) -> str:
     return f"新增失败：{result.get('message', '')}"
 
 
-async def _save_week1_assessment(params: dict, db: AsyncSession) -> str:
-    from app.api.talent.probation import save_week1_assessment as fn, Week1AssessmentRequest
-    req = Week1AssessmentRequest(**params)
-    result = await fn(employee_id=params["employeeId"], req=req, db=db)
-    if result["code"] == 0:
-        d = result.get("data", {})
-        verdict = "通过" if d.get("passed") else "未通过"
-        return f"第一周评估已保存，总分 {d.get('totalScore', 0)}，{verdict}"
-    return f"保存失败：{result.get('message', '')}"
-
-
-async def _save_conversion(params: dict, db: AsyncSession) -> str:
-    from app.api.talent.probation import save_conversion as fn, ConversionRequest
-    req = ConversionRequest(**params)
-    result = await fn(employee_id=params["employeeId"], req=req, db=db)
-    if result["code"] == 0:
-        d = result.get("data", {})
-        decision_map = {"converted": "转正", "extended": "延长试用期", "rejected": "不通过"}
-        return f"转正评估已保存，总分 {d.get('totalScore', 0)}，结论：{decision_map.get(d.get('decision', ''), d.get('decision', ''))}"
-    return f"保存失败：{result.get('message', '')}"
-
-
 async def _create_probation_task(params: dict, db: AsyncSession) -> str:
     from app.api.talent.probation import create_probation_task as fn
     result = await fn(body=params, db=db)
@@ -133,8 +111,6 @@ def register_handlers(registry) -> None:
     registry.register("get_probation_stats", _get_probation_stats)
     registry.register("get_probation_employee", _get_probation_employee)
     registry.register("create_probation_employee", _create_probation_employee)
-    registry.register("save_week1_assessment", _save_week1_assessment)
-    registry.register("save_conversion", _save_conversion)
     registry.register("create_probation_task", _create_probation_task)
     registry.register("update_probation_task", _update_probation_task)
     registry.register("ai_evaluate_probation", _ai_evaluate_probation)

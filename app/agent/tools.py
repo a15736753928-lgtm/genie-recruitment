@@ -467,42 +467,6 @@ TOOL_REGISTRY = {
             "required": ["name"],
         },
     },
-    "save_week1_assessment": {
-        "name": "save_week1_assessment",
-        "description": "保存试用期第一周评估（4个维度打分：完成度/准确度/问题解决/规范度，总分>=70通过）。",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "employeeId": {"type": "string"},
-                "dimensionCompletion": {"type": "integer", "description": "完成度 0-100"},
-                "dimensionFidelity": {"type": "integer", "description": "准确度 0-100"},
-                "dimensionProblemSolving": {"type": "integer", "description": "问题解决 0-100"},
-                "dimensionStandards": {"type": "integer", "description": "规范度 0-100"},
-                "deductionReasons": {"type": "object", "description": "扣分原因（可选）"},
-                "assessorSignature": {"type": "string", "description": "评估人签名（可选）"},
-                "deptHeadSignature": {"type": "string", "description": "部门负责人签名（可选）"},
-            },
-            "required": ["employeeId", "dimensionCompletion", "dimensionFidelity", "dimensionProblemSolving", "dimensionStandards"],
-        },
-    },
-    "save_conversion": {
-        "name": "save_conversion",
-        "description": "保存转正评估（项目表现60%+技术能力20%+团队协作20%，>=80转正/70-79延长/<70不通过）。",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "employeeId": {"type": "string"},
-                "projectPerformanceScore": {"type": "integer", "description": "项目表现 0-100"},
-                "techCapabilityScore": {"type": "integer", "description": "技术能力 0-100"},
-                "collaborationScore": {"type": "integer", "description": "团队协作 0-100"},
-                "mentorComments": {"type": "string", "description": "导师评语（可选）"},
-                "mentorSignature": {"type": "string"},
-                "deptHeadSignature": {"type": "string"},
-                "hrSignature": {"type": "string"},
-            },
-            "required": ["employeeId", "projectPerformanceScore", "techCapabilityScore", "collaborationScore"],
-        },
-    },
     "create_probation_task": {
         "name": "create_probation_task",
         "description": "为试用期员工新增任务。",
@@ -909,7 +873,7 @@ def get_tools_for_agent(agent_id: str = "recruit") -> List[dict]:
     ]
     training_tools = [
         "list_probation", "get_probation_stats", "get_probation_employee",
-        "create_probation_employee", "save_week1_assessment", "save_conversion",
+        "create_probation_employee",
         "create_probation_task", "update_probation_task",
         "ai_evaluate_probation", "update_probation_status", "manual_review_probation",
         "rag_search",

@@ -63,11 +63,6 @@ class Employee(Base):
     position = relationship("Position", back_populates="employees")
     tasks = relationship("ProbationTask", back_populates="employee", cascade="all, delete-orphan")
     performance_records = relationship("PerformanceRecord", back_populates="employee", cascade="all, delete-orphan")
-    # 旧评估关系(桩,一期内兼容)
-    week1_assessment = relationship("ProbationWeek1Assessment", back_populates="employee",
-                                    uselist=False, cascade="all, delete-orphan")
-    conversion = relationship("ProbationConversion", back_populates="employee",
-                              uselist=False, cascade="all, delete-orphan")
     # 第二期新增关系
     plan = relationship("ProbationPlan", back_populates="employee", uselist=False,
                         cascade="all, delete-orphan")
@@ -96,55 +91,3 @@ class ProbationTask(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     employee = relationship("Employee", back_populates="tasks")
-
-
-# ── 旧评估表(保留桩类,供现有 probation.py 路由 import —— 第二期全面重建) ──
-
-class ProbationWeek1Assessment(Base):
-    """第一周考核(旧结构桩,第二期用 probation_week_reviews 替代)。"""
-    __tablename__ = "probation_week1_assessments"
-    __table_args__ = ({"extend_existing": True},)
-
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    employee_id = Column(UUID(as_uuid=True), ForeignKey("employees.id", ondelete="CASCADE"),
-                         nullable=False, unique=True)
-    dimension_completion = Column(Integer, default=0)
-    dimension_fidelity = Column(Integer, default=0)
-    dimension_problem_solving = Column(Integer, default=0)
-    dimension_standards = Column(Integer, default=0)
-    total_score = Column(Integer, default=0)
-    deduction_reasons = Column(JSON, nullable=True)
-    assessor_signature = Column(String(64), nullable=True)
-    dept_head_signature = Column(String(64), nullable=True)
-    assessor_date = Column(Date, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-    employee = relationship("Employee", back_populates="week1_assessment")
-
-
-class ProbationConversion(Base):
-    """转正考核(旧结构桩,第二期用 confirmation_reviews 替代)。"""
-    __tablename__ = "probation_conversions"
-    __table_args__ = ({"extend_existing": True},)
-
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    employee_id = Column(UUID(as_uuid=True), ForeignKey("employees.id", ondelete="CASCADE"),
-                         nullable=False, unique=True)
-    project_performance_score = Column(Integer, default=0)
-    project_performance_weight = Column(Numeric(3, 2), default=0.60)
-    tech_capability_score = Column(Integer, default=0)
-    tech_capability_weight = Column(Numeric(3, 2), default=0.20)
-    collaboration_score = Column(Integer, default=0)
-    collaboration_weight = Column(Numeric(3, 2), default=0.20)
-    total_score = Column(Numeric(5, 2), default=0)
-    decision = Column(String(16), nullable=True)
-    mentor_comments = Column(Text, nullable=True)
-    mentor_signature = Column(String(64), nullable=True)
-    mentor_date = Column(Date, nullable=True)
-    dept_head_signature = Column(String(64), nullable=True)
-    dept_head_date = Column(Date, nullable=True)
-    hr_signature = Column(String(64), nullable=True)
-    hr_date = Column(Date, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-    employee = relationship("Employee", back_populates="conversion")

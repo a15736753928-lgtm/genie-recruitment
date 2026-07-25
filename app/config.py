@@ -107,16 +107,6 @@ class Settings(BaseSettings):
     ocr_enabled: bool = True
     ocr_fallback_threshold: int = 100  # chars below which OCR is triggered
 
-    # Agent OS — intelligent agent layer
-    agent_os_enabled: bool = True
-    skills_dir: str = "skills/"
-    max_context_tokens: int = 8000
-    enable_reflection: bool = True
-    enable_verification: bool = True
-    enable_parallel_subagents: bool = False   # Phase 4
-    max_subagents: int = 10                    # Phase 4
-    plan_confirm_timeout: int = 300            # Phase 3 (5 minutes)
-
     @field_validator("deepseek_model", "vision_model", mode="before")
     @classmethod
     def _normalize_model_fields(cls, v):
