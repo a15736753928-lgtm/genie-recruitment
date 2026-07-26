@@ -95,7 +95,6 @@ ROLE_PERMISSIONS: dict[str, list[str]] = {
         "position:publish", "position:manage",
         "resume:view", "resume:decide",
         "interview:manage",
-        "offer:approve",
         "salary:view", "audit:view",
         "probation:manage", "training:view", "training:manage",
         "task:view", "points:confirm",

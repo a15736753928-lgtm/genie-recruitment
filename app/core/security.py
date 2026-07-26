@@ -85,11 +85,12 @@ class AuthError(StarletteHTTPException):
         super().__init__(status_code=401, detail=message)
 
 
-class PermissionError_(Exception):
-    """无权限 —— 端点层捕获返回 code:403(HTTP 200)。"""
+class PermissionError_(StarletteHTTPException):
+    """无权限异常。继承 Starlette HTTPException，FastAPI 框架层原生拦截，
+    不会被 ExceptionGroup 包装后泄漏到 uvicorn ERROR 日志。"""
     def __init__(self, message: str = "无权限执行此操作"):
         self.message = message
-        super().__init__(message)
+        super().__init__(status_code=403, detail=message)
 
 
 # ── 当前用户主体 ──

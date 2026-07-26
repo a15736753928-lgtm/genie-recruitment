@@ -202,7 +202,7 @@ app.add_middleware(
 )
 
 
-from app.core.security import AuthError
+from app.core.security import AuthError, PermissionError_
 
 @app.exception_handler(AuthError)
 async def auth_error_handler(request: Request, exc: AuthError):
@@ -216,9 +216,20 @@ async def auth_error_handler(request: Request, exc: AuthError):
     )
 
 
+@app.exception_handler(PermissionError_)
+async def permission_error_handler(request: Request, exc: PermissionError_):
+    """PermissionError_（无权限）→ HTTP 403 信封。
+
+    继承 Starlette HTTPException，框架层原生拦截，不会泄漏到 uvicorn ERROR。"""
+    return JSONResponse(
+        status_code=403,
+        content={"code": 403, "message": exc.message, "data": None},
+    )
+
+
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    # AuthError 已由专用 handler 拦截，此处不再需要 isinstance 检查
+    # AuthError / PermissionError_ 已由专用 handler 拦截，此处不再需要 isinstance 检查
     # Invalid UUID path/query params surface as asyncpg DataError or
     # sqlalchemy DBAPIError. Convert to a clean 400/404 instead of a 500 so
     # the frontend gets a meaningful message and the server logs stay clean.
