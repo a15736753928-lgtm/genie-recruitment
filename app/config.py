@@ -85,19 +85,6 @@ class Settings(BaseSettings):
     rrf_k: int = 60                   # RRF smoothing constant
     rrf_dense_weight: float = 0.7     # dense semantic match weight
     rrf_sparse_weight: float = 0.3    # sparse keyword match weight
-    rrf_graph_weight: float = 0.25    # graph structure weight
-
-    # RAG — Kuzu Graph Database
-    # 图谱检索为三路混合召回的第三路（dense+sparse+graph）。默认关闭：
-    # 检索由 dense+sparse+rerank 承担，图谱那路对结果无必需贡献，且新版 Kuzu
-    # 路径/API 兼容问题会在启动刷错。需要 GraphRAG 时把下面三个开关置 True 即可，
-    # 代码路径仍完整保留。
-    kuzu_data_dir: str = "storage/kuzu_data"
-    kuzu_enabled: bool = False
-    graph_index_enabled: bool = False  # background graph indexing after ingestion
-
-    # RAG — Community Detection
-    community_enabled: bool = False
 
     # RAG — Ingestion
     ingest_batch_size: int = 64     # embedding batch size

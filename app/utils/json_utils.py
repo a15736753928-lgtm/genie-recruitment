@@ -25,34 +25,24 @@ def extract_json_from_text(content: str, *, fix_trailing_comma: bool = True) -> 
     - Prose before/after the JSON object
     - Trailing commas (the most common JSON formatting error)
     """
-    content = content.strip()
-
-    # 1) Strip markdown code fence
-    if content.startswith("```json"):
-        content = content[7:]
-    elif content.startswith("```"):
-        content = content[3:]
-    if content.endswith("```"):
-        content = content[:-3]
-    content = content.strip()
-
-    # 2) Find the outermost { ... }
-    start = content.find("{")
-    if start == -1:
-        return content
-    end = content.rfind("}")
-    if end > start:
-        content = content[start:end + 1]
-
-    # 3) Remove trailing commas
+    content = _extract_bracket(content, "{", "}")
     if fix_trailing_comma:
         content = re.sub(r",\s*([}\]])", r"\1", content)
-
     return content
 
 
-def extract_json_array_from_text(content: str) -> str:
-    """Like ``extract_json_from_text`` but for JSON arrays ``[...]``."""
+def extract_json_array_from_text(content: str, *, fix_trailing_comma: bool = True) -> str:
+    """Like ``extract_json_from_text`` but for JSON arrays ``[...]``.
+
+    Useful when the LLM returns a top-level JSON array.
+    """
+    content = _extract_bracket(content, "[", "]")
+    if fix_trailing_comma:
+        content = re.sub(r",\s*([\]])", r"\1", content)
+    return content
+
+def _extract_bracket(content: str, open_bracket: str, close_bracket: str) -> str:
+    """Extract the outermost bracket-delimited block from LLM output."""
     content = content.strip()
 
     if content.startswith("```json"):
@@ -63,10 +53,10 @@ def extract_json_array_from_text(content: str) -> str:
         content = content[:-3]
     content = content.strip()
 
-    start = content.find("[")
+    start = content.find(open_bracket)
     if start == -1:
         return content
-    end = content.rfind("]")
+    end = content.rfind(close_bracket)
     if end > start:
         content = content[start:end + 1]
 

@@ -1,12 +1,12 @@
 """
-Search/retrieval pipeline — three-way hybrid (Dense + Sparse + Graph) + RRF fusion.
+Search/retrieval pipeline — two-way hybrid (Dense + Sparse) + RRF fusion.
 
 Blueprint alignment: Section 9
 
 Pipeline:
-  query → normalize → [dense recall + sparse recall + graph recall]
-       → RRF three-way fusion → PG enrich → empty fallback
-       → rerank → highlight → community attach → respond
+  query → normalize → [dense recall + sparse recall]
+       → RRF two-way fusion → PG enrich → empty fallback
+       → rerank → highlight → respond
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ from sqlalchemy import select
 
 from app.config import get_settings
 from app.database import async_session_factory
-from app.models.knowledge import KnowledgeChunk, KnowledgeDocument, KnowledgeBase, GraphCommunity
+from app.models.knowledge import KnowledgeChunk, KnowledgeDocument, KnowledgeBase
 from app.services.rag.embedding import encode_query_dense, encode_query_sparse
 from app.services.rag.text_processor import (
     clean_text,
@@ -98,20 +98,8 @@ async def search(
         except Exception:
             pass
 
-    # 4. Graph recall (async)
-    all_graph = []
-    if settings.kuzu_enabled:
-        try:
-            from app.services.rag.graph_search_service import graph_search
-            graph_result = await graph_search(query, kb_ids, rerank_top_k)
-            for h in graph_result.get("chunk_hits", []):
-                h["source"] = "graph"
-            all_graph = graph_result.get("chunk_hits", [])
-        except Exception:
-            pass
-
-    # 5. RRF three-way fusion
-    fused = _rrf_fuse(all_dense, all_sparse, all_graph, top_k=rerank_top_k)
+    # 4. RRF two-way fusion
+    fused = _rrf_fuse(all_dense, all_sparse, top_k=rerank_top_k)
 
     # 6. Empty result fallback — expand dense recall
     if not fused:
@@ -153,15 +141,12 @@ async def search(
     # 9. Filter by min similarity
     enriched = [r for r in enriched if r["similarity"] >= min_similarity]
 
-    # 10. Limit to top_k
+    # 12. Limit to top_k
     enriched = enriched[:top_k]
 
-    # 11. Extract highlights
+    # 13. Extract highlights
     for r in enriched:
         r["highlights"] = extract_highlight_terms(query_normalized, r["content"])
-
-    # 12. Attach community info
-    await _attach_community_info(enriched)
 
     return enriched
 
@@ -171,22 +156,12 @@ async def search(
 def _rrf_fuse(
     dense: list[dict],
     sparse: list[dict],
-    graph: list[dict],
     top_k: int = 10,
 ) -> list[dict]:
-    """Reciprocal Rank Fusion — blueprint Section 9.3.
-
-    score(chunk) = dense_w / (k + rank_dense + 1)
-                 + sparse_w / (k + rank_sparse + 1)
-                 + graph_w / (k + rank_graph + 1)
-
-    Returns:
-        List of {id, distance: rrf_score, kb_id, sources: [...], match_type}
-    """
+    """Reciprocal Rank Fusion — two-way (dense + sparse)."""
     k = settings.rrf_k
     w_dense = settings.rrf_dense_weight
     w_sparse = settings.rrf_sparse_weight
-    w_graph = settings.rrf_graph_weight
 
     fusion_map: dict[int, dict] = {}
 
@@ -204,17 +179,9 @@ def _rrf_fuse(
         fusion_map[pk]["score"] += w_sparse / (k + rank + 1)
         fusion_map[pk]["sources"].append("sparse")
 
-    for rank, hit in enumerate(graph):
-        pk = hit["id"]
-        if pk not in fusion_map:
-            fusion_map[pk] = {"id": pk, "kb_id": hit.get("kb_id", ""), "score": 0.0, "sources": [], "distance": hit.get("distance", 0.0)}
-        graph_weight = w_graph * hit.get("distance", 0.25)  # graph uses overlap rate
-        fusion_map[pk]["score"] += graph_weight / (k + rank + 1)
-        fusion_map[pk]["sources"].append("graph")
-
     results = list(fusion_map.values())
     for r in results:
-        r["distance"] = r["score"]  # RRF score becomes the distance
+        r["distance"] = r["score"]
         r["match_type"] = "+".join(r.get("sources", []))
 
     results.sort(key=lambda x: x["score"], reverse=True)
@@ -271,40 +238,6 @@ async def _enrich_results(combined: list[dict]) -> list[dict]:
     return enriched
 
 
-# ── Community Attachment ───────────────────────────────
-
-async def _attach_community_info(results: list[dict]) -> None:
-    """Attach community_id and community_name to results (O(n+m) indexed lookup)."""
-    if not results or not settings.community_enabled:
-        return
-
-    pks = {int(r["id"]) for r in results if r["id"].isdigit()}
-    if not pks:
-        return
-
-    try:
-        async with async_session_factory() as db:
-            com_result = await db.execute(select(GraphCommunity))
-            communities = com_result.scalars().all()
-
-            # Build inverted index: chunk_id → (community_id, community_name)
-            pk_to_community: dict[int, tuple] = {}
-            for com in communities:
-                try:
-                    com_chunk_ids = json.loads(com.chunk_ids) if com.chunk_ids else []
-                except (json.JSONDecodeError, TypeError):
-                    continue
-                for cid in com_chunk_ids:
-                    if isinstance(cid, int):
-                        pk_to_community[cid] = (com.id, com.name)
-
-            for r in results:
-                info = pk_to_community.get(int(r["id"]))
-                if info:
-                    r["community_id"] = info[0]
-                    r["community_name"] = info[1]
-    except Exception:
-        pass
 
 
 async def get_chunk_content(milvus_pk: int) -> Optional[dict]:

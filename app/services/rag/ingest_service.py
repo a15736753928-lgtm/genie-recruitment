@@ -259,22 +259,6 @@ def _merge_texts(fast_text: str, ocr_text: str) -> str:
     return ocr  # fallback: whatever we have
 
 
-# ── Graph Index Building ───────────────────────────────
-
-def _build_graph_index(doc_id: str, kb_id: str, chunks: list[str], milvus_ids: list[int]):
-    """Build Kuzu graph index for a document's chunks (background, non-blocking).
-
-    Called synchronously in the background thread but failures are non-fatal.
-    """
-    try:
-        from app.services.rag.graph_indexer import index_document_chunks
-        index_document_chunks(doc_id, kb_id, chunks, milvus_ids)
-    except ImportError:
-        logger.debug("graph_indexer 不可用，跳过图谱索引")
-    except Exception as e:
-        logger.warning("图谱索引异常: %s", e)
-
-
 # ── Background Ingestion ────────────────────────────────────
 
 def _run_ingest_sync(
@@ -464,14 +448,6 @@ def _run_ingest_sync(
             kb.doc_count = (kb.doc_count or 0) + 1
             kb.chunk_count = (kb.chunk_count or 0) + len(chunks)
             kb.updated_at = _now_ms()
-
-        # 9. Background: graph index + community detection
-        if settings.graph_index_enabled and settings.kuzu_enabled:
-            try:
-                _update("completed", 98, "启动图谱索引...")
-                _build_graph_index(doc_id, kb_id, chunks, milvus_ids)
-            except Exception as e:
-                logger.warning("图谱索引失败 (非致命): %s", e)
 
         _update("completed", 100, f"入库完成，共 {len(chunks)} 个分片")
         logger.info(

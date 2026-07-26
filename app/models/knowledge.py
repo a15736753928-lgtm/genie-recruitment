@@ -131,25 +131,3 @@ class IngestionTask(Base):
     message = Column(String(500), default="")
     created_at = Column(BigInteger, nullable=False, default=_now_ms)
     updated_at = Column(BigInteger, nullable=False, default=_now_ms)
-
-
-class GraphCommunity(Base):
-    """Louvain community detection results — maps to blueprint Section 8.4.
-
-    Each community groups related entities/chunks discovered by
-    Louvain community detection on the Kuzu knowledge graph,
-    with an LLM-generated summary (150-250 chars).
-    """
-    __tablename__ = "graph_communities"
-
-    id = Column(String(128), primary_key=True)  # com_{uuid8}
-    kb_id = Column(String(128), ForeignKey("knowledge_bases.id", ondelete="CASCADE"), nullable=False)
-    name = Column(String(255), default="")
-    summary = Column(Text, nullable=False, default="")  # LLM-generated summary
-    entity_ids = Column(Text, default="[]")   # JSON array of entity names
-    chunk_ids = Column(Text, default="[]")    # JSON array of milvus_pk values
-    created_at = Column(BigInteger, nullable=False, default=_now_ms)
-
-    __table_args__ = (
-        Index("idx_communities_kb_id", "kb_id"),
-    )

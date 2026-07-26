@@ -3,16 +3,6 @@ from typing import List
 
 from app.agent.tool_desc import tool_desc
 
-# ── Destructive tools ──────────────────────────────────────
-# Irreversible / overwriting operations. The full deny-first PermissionEngine
-# was removed as over-engineering; a recruitment assistant only needs the model
-# to confirm before these run (enforced conversationally via rules.txt).
-DESTRUCTIVE_TOOLS = frozenset({
-    "delete_resume", "delete_position", "delete_knowledge_item",
-    "delete_document", "delete_knowledge_base",
-    "batch_parse_resumes",  # can overwrite parsed data
-})
-
 
 TOOL_REGISTRY = {
     # Recruitment tools

@@ -25,21 +25,6 @@ from app.services.ai.router import (
 
 logger = logging.getLogger(__name__)
 
-# ── 延迟加载 Router ───────────────────────────────────────
-
-_router_initialized: bool = False
-
-
-async def _ensure_router(db=None):
-    """首次调用时 warm-up Router。"""
-    global _router_initialized
-    if _router_initialized:
-        return
-    if db is not None:
-        await reload_llm_config(db)
-        _router_initialized = True
-
-
 __all__ = [
     "get_llm_client",
     "get_sync_llm_client",
@@ -47,5 +32,4 @@ __all__ = [
     "create_langchain_llm",
     "reload_llm_config",
     "get_router_stats",
-    "_ensure_router",
 ]

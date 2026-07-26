@@ -1625,28 +1625,3 @@ async def agent_chat(
     )
 
 
-# ── Plan confirmation (formerly /agent-os/confirm-plan) ───────
-# Moved here so the frontend PlanConfirmCard keeps working without any
-# change, while we remove the entire agent_chat_v2 / Agent OS dead stack.
-# The plan_coordinator module is intentionally NOT imported — we do not
-# need the full coordinator state machine; the endpoint only needs to
-# acknowledge the user's decision (approve/reject/modify) and the current
-# LangGraph turn will simply continue without pausing on plan approval.
-
-@router.post("/agent-os/confirm-plan")
-async def confirm_plan(body: dict):
-    """Acknowledge a plan proposal from the frontend.
-
-    The plan was already injected into the system prompt before the LangGraph
-    run, so the agent proceeds regardless. This endpoint simply returns success
-    so PlanConfirmCard can dismiss its UI state without an error.
-    """
-    plan_id = (body.get("plan_id") or "").strip()
-    action  = (body.get("action")  or "approve").strip()
-    if not plan_id:
-        return {"code": 400, "message": "plan_id 是必填字段", "data": None}
-    return {
-        "code": 0,
-        "message": f"计划 {plan_id} 已{action}",
-        "data": {"plan_id": plan_id, "action": action},
-    }

@@ -75,10 +75,14 @@ def decode_token(token: str) -> dict:
 
 
 # ── 异常(全局 handler 捕获 -> HTTP 401 信封) ──
-class AuthError(Exception):
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
+class AuthError(StarletteHTTPException):
+    """鉴权失败异常。继承 Starlette HTTPException，FastAPI 框架层原生拦截，
+    不会被 ExceptionGroup 包装后泄漏到 uvicorn ERROR 日志。"""
     def __init__(self, message: str = "未登录或登录已过期"):
         self.message = message
-        super().__init__(message)
+        super().__init__(status_code=401, detail=message)
 
 
 class PermissionError_(Exception):
@@ -132,15 +136,19 @@ async def get_current_user(
     缺失/无效令牌、账号非 active -> AuthError(全局 handler -> 401)。
     满足 §21.7:离职/停用即时失效(每请求查库校验 status)。
 
-    ⚠ 临时：开发阶段无 token 或 demo token 时返回默认访客用户。
+    GENIE_DEV_MODE 环境变量为 true 时，无 token 返回默认访客（开发用）。
     """
-    # 无 token → 默认访客
+    # 无 token → 仅 GENIE_DEV_MODE 下返回默认访客
     if not authorization or not authorization.lower().startswith("bearer "):
+        if not os.getenv("GENIE_DEV_MODE"):
+            raise AuthError("未登录")
         return _default_user()
     token = authorization.split(" ", 1)[1].strip()
 
-    # demo token（前端演示用）→ 默认访客
+    # demo token（前端演示用）→ 仅 GENIE_DEV_MODE 下放行
     if token.startswith("demo-token-"):
+        if not os.getenv("GENIE_DEV_MODE"):
+            raise AuthError("未登录")
         return _default_user()
 
     payload = decode_token(token)

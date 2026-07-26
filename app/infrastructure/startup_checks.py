@@ -267,38 +267,6 @@ async def check_reranker_model(settings: Settings) -> CheckResult:
         )
 
 
-async def check_kuzu_graph(settings: Settings) -> CheckResult:
-    """Verify the Kuzu graph database library is available."""
-    t0 = time.perf_counter()
-    try:
-        import kuzu
-        with tempfile.TemporaryDirectory() as tmpdir:
-            db = kuzu.Database(os.path.join(tmpdir, "health_check"))
-            conn = kuzu.Connection(db)
-            conn.execute(
-                "CREATE NODE TABLE IF NOT EXISTS _health_check("
-                "id INT64, PRIMARY KEY(id))"
-            )
-            conn.execute("DROP TABLE _health_check")
-        return CheckResult(
-            "Kuzu Graph DB", "optional", CheckStatus.PASS,
-            "Library available, create/query OK",
-            (time.perf_counter() - t0) * 1000,
-        )
-    except ImportError:
-        return CheckResult(
-            "Kuzu Graph DB", "optional", CheckStatus.FAIL,
-            "kuzu package not installed",
-            (time.perf_counter() - t0) * 1000,
-        )
-    except Exception as e:
-        return CheckResult(
-            "Kuzu Graph DB", "optional", CheckStatus.FAIL,
-            str(e),
-            (time.perf_counter() - t0) * 1000,
-        )
-
-
 async def check_rapidocr(settings: Settings) -> CheckResult:
     """Verify the OCR engine can be initialized."""
     t0 = time.perf_counter()
@@ -730,8 +698,6 @@ async def run_startup_checks(settings: Settings) -> list[CheckResult]:
         check_milvus_lite,
         check_embedding_model,
         check_reranker_model,
-        # Kuzu 图谱默认关闭（config.kuzu_enabled=False），不再做启动检查。
-        # 需要 GraphRAG 时把开关打开并把 check_kuzu_graph 加回本列表。
         check_rapidocr,
     ]
     checks_phase3: list[CheckFn] = [

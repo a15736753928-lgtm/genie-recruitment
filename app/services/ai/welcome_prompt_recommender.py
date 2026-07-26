@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import json
 import logging
-from copy import deepcopy
 from datetime import datetime
 from typing import List, Optional
 
@@ -26,6 +25,7 @@ from app.models.interview import InterviewEvaluation
 from app.models.probation import Employee
 from app.models.recruitment import Candidate, Position
 from app.models.settings import SystemSetting
+from app.utils.json_utils import extract_json_array_from_text
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -92,11 +92,11 @@ async def get_cached_welcome_prompts(db: AsyncSession) -> List[dict]:
     )
     row = result.scalar_one_or_none()
     if not row or not isinstance(row.value, dict):
-        return deepcopy(DEFAULT_PROMPTS)
+        return DEFAULT_PROMPTS
 
     prompts = _normalize_prompts(row.value.get("prompts"))
     if prompts is None:
-        return deepcopy(DEFAULT_PROMPTS)
+        return DEFAULT_PROMPTS
     return prompts
 
 
@@ -187,7 +187,7 @@ async def _generate_with_llm(db: AsyncSession) -> List[dict]:
         snapshot = await _gather_system_snapshot(db)
     except Exception as e:
         logger.warning("welcome_prompt_recommender 收集系统状态失败: %s", e)
-        return deepcopy(DEFAULT_PROMPTS)
+        return DEFAULT_PROMPTS
 
     try:
         from app.services.ai import get_llm_client
@@ -199,22 +199,16 @@ async def _generate_with_llm(db: AsyncSession) -> List[dict]:
             max_tokens=512,
         )
         content = (resp.choices[0].message.content or "").strip()
-        if content.startswith("```json"):
-            content = content[7:]
-        if content.startswith("```"):
-            content = content[3:]
-        if content.endswith("```"):
-            content = content[:-3]
-        data = json.loads(content.strip())
+        data = json.loads(extract_json_array_from_text(content))
     except json.JSONDecodeError as e:
         logger.warning("welcome_prompt_recommender 返回非法 JSON: %s", e)
-        return deepcopy(DEFAULT_PROMPTS)
+        return DEFAULT_PROMPTS
     except Exception as e:
         logger.warning("welcome_prompt_recommender LLM 调用失败: %s", e)
-        return deepcopy(DEFAULT_PROMPTS)
+        return DEFAULT_PROMPTS
 
     prompts = _normalize_prompts(data)
-    return prompts if prompts is not None else deepcopy(DEFAULT_PROMPTS)
+    return prompts if prompts is not None else DEFAULT_PROMPTS
 
 
 async def refresh_welcome_prompts(db: AsyncSession) -> List[dict]:

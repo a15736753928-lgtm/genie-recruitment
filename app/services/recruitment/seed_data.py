@@ -221,21 +221,41 @@ async def seed_roles() -> None:
                     db.add(RolePermission(role_code=role_code, permission_key=key))
         await db.flush()
 
-        # ── 3. 初始账号 ──
+        # ── 3. 初始账号（8 角色，密码统一 123456）──
         INIT_USERS = [
-            {"username": "admin", "password": "admin@123", "display_name": "系统管理员", "role": "admin"},
-            {"username": "hr01", "password": "hr@123", "display_name": "HR 专员", "role": "hr"},
+            {"username": "admin", "password": "123456", "display_name": "系统管理员", "role": "admin"},
+            {"username": "hr01", "password": "123456", "display_name": "HR 专员", "role": "hr"},
+            {"username": "ceo01", "password": "123456", "display_name": "公司负责人", "role": "ceo"},
+            {"username": "mgr01", "password": "123456", "display_name": "部门负责人", "role": "manager"},
+            {"username": "ivr01", "password": "123456", "display_name": "面试官", "role": "interviewer"},
+            {"username": "mtr01", "password": "123456", "display_name": "带教人", "role": "mentor"},
+            {"username": "pld01", "password": "123456", "display_name": "项目负责人", "role": "project_lead"},
+            {"username": "emp01", "password": "123456", "display_name": "员工", "role": "employee"},
         ]
         for u_info in INIT_USERS:
             row = await db.execute(select(User).where(User.username == u_info["username"]))
-            if row.scalar_one_or_none() is None:
+            existing_user = row.scalar_one_or_none()
+            if existing_user is None:
                 new_user = User(
                     username=u_info["username"],
                     password_hash=hash_password(u_info["password"]),
                     display_name=u_info["display_name"],
-                    must_change_password=True,
+                    must_change_password=False,
                 )
                 db.add(new_user)
                 await db.flush()
                 db.add(UserRole(user_id=new_user.id, role_code=u_info["role"]))
+            else:
+                # 已存在用户也强制更新密码为 123456，确保启动即生效
+                existing_user.password_hash = hash_password(u_info["password"])
+                existing_user.must_change_password = False
+                # 确保角色存在
+                role_row = await db.execute(
+                    select(UserRole).where(
+                        UserRole.user_id == existing_user.id,
+                        UserRole.role_code == u_info["role"],
+                    )
+                )
+                if role_row.scalar_one_or_none() is None:
+                    db.add(UserRole(user_id=existing_user.id, role_code=u_info["role"]))
         await db.commit()

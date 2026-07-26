@@ -3,14 +3,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 import logging
-import time
 import sys
 import io
 import os
+import time
 from app.config import get_settings
-from app.middleware.trace import get_trace_id
+from app.log_config import configure_logging
 
-# ── Early logging setup (before uvicorn takes over) ──
+# ── Early UTF-8 setup (before uvicorn takes over) ──
 # On Windows the default stdout/stderr encoding is often GBK and chokes on
 # emoji/box-drawing characters used in startup logs. Force UTF-8 so logs
 # render correctly regardless of the system codepage.
@@ -21,52 +21,11 @@ except (AttributeError, io.UnsupportedOperation):
     pass
 
 
-class _ColoredFormatter(logging.Formatter):
-    """纯 ANSI 彩色日志格式器 —— 不依赖 TTY 检测，始终输出颜色。"""
-
-    _LEVEL_COLORS = {
-        logging.DEBUG:    "\033[36m",  # cyan
-        logging.INFO:     "\033[32m",  # green
-        logging.WARNING:  "\033[33m",  # yellow
-        logging.ERROR:    "\033[31m",  # red
-        logging.CRITICAL: "\033[1;31m",  # bold red
-    }
-    _RESET  = "\033[0m"
-    _DIM   = "\033[2m"
-    _WHITE = "\033[37m"
-
-    def format(self, record: logging.LogRecord) -> str:
-        # 拷贝 record，避免修改原始对象影响其他 handler
-        record = logging.LogRecord(
-            record.name, record.levelno, record.pathname, record.lineno,
-            record.msg, record.args, record.exc_info,
-            func=record.funcName, sinfo=record.stack_info,
-        )
-        color = self._LEVEL_COLORS.get(record.levelno, "")
-        record.levelname = f"{color}{record.levelname:8}{self._RESET}"
-        record.name = f"{self._DIM}{record.name}{self._RESET}"
-        record.asctime = self.formatTime(record, self.datefmt)
-        trace_id = get_trace_id()
-        trace = f" {self._WHITE}[{trace_id}]{self._RESET}" if trace_id else ""
-        # asctime 也做 dim 处理，整体视觉更柔和
-        return f"{self._DIM}{record.asctime}{self._RESET} {record.name} {record.levelname}{trace} {record.getMessage()}"
-
-
 # 强制 Rich / uvicorn 等库启用颜色（它们依赖 FORCE_COLOR 环境变量）
 os.environ.setdefault("FORCE_COLOR", "1")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(name)s %(levelname)s %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    handlers=[logging.StreamHandler(sys.stdout)],
-)
-# 替换为彩色 formatter
-for h in logging.getLogger().handlers:
-    h.setFormatter(_ColoredFormatter(
-        fmt="%(asctime)s %(name)s %(levelname)s %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    ))
+# 启动早期即初始化彩色日志（log_config.py 的 formatter 是唯一实现）
+configure_logging()
 
 logger = logging.getLogger("genie.startup")
 
@@ -169,10 +128,10 @@ async def lifespan(app: FastAPI):
 
     # ── Warm up LLM Router ──
     try:
-        from app.services.ai import _ensure_router
+        from app.services.ai import reload_llm_config
         from app.database import async_session_factory
         async with async_session_factory() as session:
-            await _ensure_router(session)
+            await reload_llm_config(session)
             logger.info("✓ LLM Router 已预热 (%s)", _elapsed())
     except Exception as e:
         logger.warning("⚠ LLM Router 预热失败: %s (%s)", e, _elapsed())
@@ -243,15 +202,23 @@ app.add_middleware(
 )
 
 
+from app.core.security import AuthError
+
+@app.exception_handler(AuthError)
+async def auth_error_handler(request: Request, exc: AuthError):
+    """AuthError（鉴权失败）→ HTTP 401 信封。
+
+    作为 HTTPException 子类的专用 handler，FastAPI 在依赖注入阶段即可原生拦截，
+    不会被 ExceptionGroup 包装后泄漏到 uvicorn ERROR 日志。"""
+    return JSONResponse(
+        status_code=401,
+        content={"code": 401, "message": exc.message, "data": None},
+    )
+
+
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    # AuthError -> HTTP 401 (鉴权失败,非 500)
-    from app.core.security import AuthError
-    if isinstance(exc, AuthError):
-        return JSONResponse(
-            status_code=401,
-            content={"code": 401, "message": exc.message, "data": None},
-        )
+    # AuthError 已由专用 handler 拦截，此处不再需要 isinstance 检查
     # Invalid UUID path/query params surface as asyncpg DataError or
     # sqlalchemy DBAPIError. Convert to a clean 400/404 instead of a 500 so
     # the frontend gets a meaningful message and the server logs stay clean.

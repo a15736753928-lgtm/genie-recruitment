@@ -14,10 +14,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.settings import AuditLog
 
 
-def audit_time() -> str:
-    return datetime.utcnow().strftime("%Y-%m-%d %H:%M")
-
-
 async def write_audit(
     db: AsyncSession,
     *,
@@ -28,7 +24,7 @@ async def write_audit(
 ) -> None:
     db.add(AuditLog(
         id=uuid.uuid4().hex,
-        time=audit_time(),
+        time=datetime.utcnow().strftime("%Y-%m-%d %H:%M"),
         actor=actor or "系统",
         action=action,
         section=section,
