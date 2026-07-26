@@ -6,6 +6,7 @@ from sqlalchemy.orm import selectinload
 from pydantic import BaseModel, Field
 from app.database import get_db
 from app.models.recruitment import Position, Candidate, PositionQuestion
+from app.utils.clock import iso_utc
 router = APIRouter(tags=["岗位"])
 
 
@@ -67,8 +68,8 @@ def serialize_position(p: Position) -> dict:
         "weeks24Plan": p.weeks_2_4_plan,
         "laterWeekScoring": p.later_week_scoring,
         "conversionCriteria": p.conversion_criteria,
-        "createdAt": p.created_at.isoformat() if p.created_at else "",
-        "updatedAt": p.updated_at.isoformat() if p.updated_at else "",
+        "createdAt": iso_utc(p.created_at),
+        "updatedAt": iso_utc(p.updated_at),
     }
 
 

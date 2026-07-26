@@ -13,8 +13,13 @@ from app.models.recruitment import Candidate
 from app.services.system.system_settings import get_system_setting
 
 # Candidate statuses that should appear on the probation assessment page.
-# Product rule: 6-state flow — 「已通过」(passed) enters probation tracking.
-PROBATION_CANDIDATE_STATUSES = frozenset({"passed", "onboarded", "probation", "offer_pending"})
+# 与状态机(app/core/state_machine.py TRANSITIONS["candidate"])对齐：
+# 只有 hired（Offer 审批通过后）才应该有对应的 Employee 记录。
+# 曾经这里包含 "passed"/"onboarded"/"probation"/"offer_pending"(拼写有误，
+# 应为 pending_offer) —— 会在候选人尚未经过录用审批时就抢先建员工，
+# 与 offer.py 的官方入职流程形成两条并行通道，现已收敛为仅 "hired" 一个值，
+# 此函数只作为"hired 但漏建 Employee"的兜底补偿，不再作为入职触发器。
+PROBATION_CANDIDATE_STATUSES = frozenset({"hired"})
 
 
 async def _default_probation_tasks(db: AsyncSession, emp: Employee, join_date: date) -> None:

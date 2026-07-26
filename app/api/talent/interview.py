@@ -16,13 +16,14 @@ from app.config import get_settings
 from app.infrastructure import minio_storage
 from app.services.system.system_settings import get_system_setting
 from app.services.ai import get_llm_client
+from app.core.state_machine import transition, StateError
 import logging
 
 logger = logging.getLogger("genie.interview")
 router = APIRouter(tags=["面试"])
 settings = get_settings()
 
-INTERVIEW_ELIGIBLE_STATUSES = {"passed", "first_interview", "second_interview", "pending_interview"}
+INTERVIEW_ELIGIBLE_STATUSES = {"invited", "round1", "round2"}
 
 
 def normalize_interview_round(round: str) -> str:
@@ -1185,8 +1186,8 @@ async def get_leaderboard(
 ):
     """Get evaluation leaderboard by category (first_result | second_result)."""
     status_map = {
-        "first_result": "first_interview",
-        "second_result": "second_interview",
+        "first_result": "round1",
+        "second_result": "round2",
     }
     candidate_status = status_map.get(category)
     if not candidate_status:
@@ -2008,43 +2009,44 @@ async def submit_evaluation(
     cand_result = await db.execute(select(Candidate).where(Candidate.id == candidate_id))
     candidate = cand_result.scalar_one_or_none()
     if candidate:
-        if passed:
-            if round == "second":
-                candidate.status = "passed"
-                try:
-                    from app.services.system.notification import notify_if
-                    from app.services.system.webhook import dispatch_webhook
-                    await notify_if(
-                        db,
-                        "notifyOfferPending",
-                        "passed",
-                        f"二面通过（已通过）：{candidate.name}",
-                        {"candidateId": candidate_id},
-                    )
-                    await dispatch_webhook(
-                        db,
-                        "candidate.passed",
-                        {"candidateId": candidate_id, "name": candidate.name, "avgScore": final_score},
-                    )
-                except Exception:
-                    pass
-                try:
-                    from app.services.talent.probation_sync import ensure_employee_for_candidate
-                    from sqlalchemy.orm import selectinload
-                    cand_full = await db.execute(
-                        select(Candidate)
-                        .options(selectinload(Candidate.position))
-                        .where(Candidate.id == candidate_id)
-                    )
-                    c = cand_full.scalar_one_or_none()
-                    if c:
-                        await ensure_employee_for_candidate(db, c)
-                except Exception:
-                    pass
+        # 注意：本端点当前无鉴权(无 Depends(get_current_user))，属于全仓已知的
+        # 零鉴权路由之一(另案处理)，故 transition() 无 actor 信息可传，
+        # actor_name 用默认值"系统"。状态变更一律经状态机写入，不再直接赋值。
+        try:
+            if passed:
+                if round == "second":
+                    # 二面通过 → 待发 Offer，等候「录用审批」流程处理。
+                    # 注意：员工记录只能由 offer.py 的录用审批通过后自动生成
+                    # （见 CLAUDE.md「员工数据来源」）。这里过去会直接调用
+                    # ensure_employee_for_candidate() 绕开审批创建员工，
+                    # 与 offer.py 形成两条并行的入职通道，现已移除。
+                    await transition(db, "candidate", candidate, "pending_offer",
+                                      reason=f"二面评定通过，加权总分 {final_score}")
+                    try:
+                        from app.services.system.notification import notify_if
+                        from app.services.system.webhook import dispatch_webhook
+                        await notify_if(
+                            db,
+                            "notifyOfferPending",
+                            "pending_offer",
+                            f"二面通过，待发起录用审批：{candidate.name}",
+                            {"candidateId": candidate_id},
+                        )
+                        await dispatch_webhook(
+                            db,
+                            "candidate.pending_offer",
+                            {"candidateId": candidate_id, "name": candidate.name, "avgScore": final_score},
+                        )
+                    except Exception:
+                        pass
+                else:
+                    await transition(db, "candidate", candidate, "round2",
+                                      reason=f"一面评定通过，加权总分 {final_score}")
             else:
-                candidate.status = "second_interview"
-        else:
-            candidate.status = "failed"
+                await transition(db, "candidate", candidate, "rejected",
+                                  reason=f"{'二面' if round == 'second' else '一面'}评定未通过，加权总分 {final_score}")
+        except StateError as e:
+            return {"code": 409, "message": e.message, "data": None}
 
     await db.flush()
     return {
@@ -2187,7 +2189,7 @@ async def get_rankings(
             "candidateId": str(c.id),
             "name": c.name,
             "score": c.score or 0,
-            "status": "done" if c.status in ("second_interview", "passed", "probation", "onboarded") else "pending",
+            "status": "done" if c.status in ("pending_offer", "hired", "rejected") else "pending",
             "isCurrent": str(c.id) == candidateId,
         })
 

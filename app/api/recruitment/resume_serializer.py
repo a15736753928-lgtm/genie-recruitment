@@ -9,6 +9,7 @@ import os
 from typing import Optional
 
 from app.models.recruitment import Candidate
+from app.utils.clock import iso_utc
 
 UNKNOWN = "未知"
 IN_SCHOOL = "在校中"
@@ -62,6 +63,22 @@ def is_candidate_parsed(candidate: Candidate) -> bool:
     )
 
 
+# 与 scoring.py compute_grade() 使用同一组默认阈值。candidate.grade 并非独立列，
+# 而是按 candidate.score 派生——这里是同步函数（大量调用点无 db/await），
+# 拿不到 system_settings 里可能被管理员改过的阈值，只能退回默认值展示。
+_DEFAULT_GRADE_THRESHOLDS = {"A": 85, "B": 70, "C": 60}
+
+
+def compute_grade_sync(score: int) -> str:
+    if score >= _DEFAULT_GRADE_THRESHOLDS["A"]:
+        return "A"
+    if score >= _DEFAULT_GRADE_THRESHOLDS["B"]:
+        return "B"
+    if score >= _DEFAULT_GRADE_THRESHOLDS["C"]:
+        return "C"
+    return "D"
+
+
 def serialize_candidate(c: Candidate) -> dict:
     """Convert ORM Candidate + relationships to frontend-expected dict."""
     from app.services.recruitment.education_tier_tag import (
@@ -82,8 +99,9 @@ def serialize_candidate(c: Candidate) -> dict:
         "position": c.position.name if c.position else UNKNOWN,
         "positionId": str(c.position_id) if c.position_id else "",
         "score": c.score or 0,
-        "status": c.status or "job_hunting",
-        "uploadTime": c.upload_time.isoformat() if c.upload_time else "",
+        "grade": compute_grade_sync(c.score or 0),
+        "status": c.status or "new",
+        "uploadTime": iso_utc(c.upload_time),
         "phone": display_text(c.phone),
         "email": display_text(c.email),
         "ethnicity": normalize_ethnicity(c.ethnicity),

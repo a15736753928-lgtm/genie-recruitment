@@ -33,9 +33,9 @@ async def _get_questions(params: dict, db: AsyncSession) -> str:
         return "\n".join(lines)
 
     cand = (await db.execute(select(Candidate).where(Candidate.id == candidate_id))).scalar_one_or_none()
-    if cand and cand.status == "job_hunting":
+    if cand and cand.status in ("new", "parsed", "pending_screen"):
         return (
-            f"暂无{round_label}面试题。候选人当前为「求职中」，需先通过初筛（状态改为 passed）"
+            f"暂无{round_label}面试题。候选人当前为「待筛选」，需先通过初筛（状态改为 invited）"
             f"后再生成{round_label}面试题；或使用 generate_questions 强制出题。"
         )
     return f"暂无{round_label}面试题，请使用 generate_questions 生成"

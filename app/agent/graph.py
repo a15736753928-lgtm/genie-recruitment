@@ -212,6 +212,12 @@ async def stream_agent_response(
                 "params": tool_input,
                 "result": "",
                 "status": "running",
+                # LangGraph's ToolNode runs parallel tool_calls concurrently
+                # (asyncio.gather), so completion order can differ from start
+                # order. run_id uniquely ties each on_tool_end back to the
+                # on_tool_start that spawned it — without it, two in-flight
+                # tools can get their results swapped.
+                "_run_id": event.get("run_id"),
             })
 
             yield _sse("tool_call", {
@@ -247,8 +253,15 @@ async def stream_agent_response(
             tr.display_hint = _display_hint_for(tool_name)
             sse_data = tr.to_sse_dict()
 
-            # Update the most recent running block
-            for block in reversed(result.tool_blocks):
+            # Match this completion back to its own tool_start via run_id
+            # (falls back to "most recent running block" only if run_id is
+            # unavailable, e.g. an older LangGraph version).
+            end_run_id = event.get("run_id")
+            candidates = reversed(result.tool_blocks)
+            if end_run_id is not None:
+                matched = [b for b in result.tool_blocks if b.get("_run_id") == end_run_id and b["status"] == "running"]
+                candidates = matched if matched else candidates
+            for block in candidates:
                 if block["status"] == "running":
                     block["result"] = raw_text
                     block["status"] = "done"
@@ -256,10 +269,12 @@ async def stream_agent_response(
                     block["success"] = tr.success
                     block["summary"] = tr.summary
                     block["display_hint"] = tr.display_hint
-                    if tr.data:
+                    if tr.data is not None:
                         block["data"] = tr.data
                     if tr.error:
-                        block["error"] = tr.error.model_dump()
+                        # ErrorDetail 是 dataclass（无 model_dump），用 asdict 序列化
+                        from dataclasses import asdict
+                        block["error"] = asdict(tr.error)
                     yield _sse("tool_result", {
                         "id": block["id"],
                         "result": raw_text,

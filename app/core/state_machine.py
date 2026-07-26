@@ -59,13 +59,27 @@ TRANSITIONS: dict[str, dict[str, list[str | None]]] = {
         "transferred":           ["formal", "probation"],
         "resigned":              ["formal", "probation", "training", "pending_onboard"],
     },
-    "task": {
+    # 注意: 试用期任务与工作任务是两个不同实体, 状态词表也不同,
+    # 必须分开登记 —— 曾因共用 "task" 键导致工作任务发布必定 409。
+    "probation_task": {
+        # ProbationTask (probation_tasks 表), 见 models/probation.py
+        # 自动建任务时直接以 in_progress 起步, 故 in_progress 允许 None
         "draft":           [None],
         "pending_confirm": ["draft"],
-        "in_progress":     ["pending_confirm", "rework"],
+        "in_progress":     [None, "pending_confirm", "rework"],
         "pending_review":  ["in_progress"],
         "passed":          ["pending_review"],
         "rework":          ["pending_review"],
+        "closed":          ["passed", "rework"],
+    },
+    "work_task": {
+        # WorkTask (work_tasks 表), 见 models/phase3.py
+        "draft":           [None],
+        "pending":         ["draft"],
+        "in_progress":     ["pending", "rework"],
+        "pending_accept":  ["in_progress"],
+        "passed":          ["pending_accept"],
+        "rework":          ["pending_accept"],
         "closed":          ["passed", "rework"],
     },
     "offer": {

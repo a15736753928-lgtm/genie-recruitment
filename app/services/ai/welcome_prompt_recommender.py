@@ -26,6 +26,7 @@ from app.models.probation import Employee
 from app.models.recruitment import Candidate, Position
 from app.models.settings import SystemSetting
 from app.utils.json_utils import extract_json_array_from_text
+from app.utils.clock import iso_utc
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -103,7 +104,7 @@ async def get_cached_welcome_prompts(db: AsyncSession) -> List[dict]:
 async def _save_cache(db: AsyncSession, prompts: List[dict]) -> None:
     payload = {
         "prompts": prompts,
-        "updatedAt": datetime.utcnow().isoformat() + "Z",
+        "updatedAt": iso_utc(datetime.utcnow()),
     }
     result = await db.execute(
         select(SystemSetting).where(SystemSetting.key == CACHE_KEY)
@@ -158,10 +159,10 @@ def _build_prompt(snapshot: dict) -> str:
         "## 当前系统状态\n"
         f"{json.dumps(snapshot, ensure_ascii=False)}\n\n"
         "## 状态字段说明\n"
-        "- candidateByStatus: 候选人按状态分桶，常见状态：job_hunting(求职中) / first_interview(一面中) "
-        "/ second_interview(二面中) / passed(已通过) / failed(未通过) / expired(已失效)\n"
-        "- employeeByStatus: 试用期员工按状态分桶，常见状态：assessing(考核中) / passed(已转正) "
-        "/ failed(未通过) / extended(延期)\n"
+        "- candidateByStatus: 候选人按状态分桶，常见状态：pending_screen(待筛选) / invited(初筛通过待安排面试) "
+        "/ round1(一面中) / round2(二面中) / pending_offer(待发Offer) / hired(已录用) / rejected(未通过)\n"
+        "- employeeByStatus: 试用期员工按状态分桶，常见状态：training/probation/pending_confirmation(考核中) "
+        "/ formal(已转正) / transferred/resigned(离场)\n"
         "- pendingInterviewEvaluations: 待处理的面试评估数量\n"
         "- positionCount: 在招岗位数量\n\n"
         "## 推荐规则\n"

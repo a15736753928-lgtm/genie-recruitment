@@ -67,7 +67,7 @@ async def check_interview_reminders(db: AsyncSession) -> int:
 
     result = await db.execute(
         select(Candidate).where(
-            Candidate.status.in_(["pending_interview", "first_interview", "second_interview"])
+            Candidate.status.in_(["invited", "round1", "round2"])
         )
     )
     candidates = list(result.scalars().all())

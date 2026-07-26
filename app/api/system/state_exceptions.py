@@ -12,6 +12,7 @@ from app.core.security import get_current_user, CurrentUser
 from app.core.exceptions import serialize_exception
 from app.utils.responses import ok, fail, not_found
 from app.utils.audit import write_audit
+from app.utils.clock import iso_utc
 import uuid as _uuid
 from datetime import datetime
 
@@ -91,7 +92,7 @@ def _serialize_transition(t: StateTransition) -> dict:
         "evidence": t.evidence,
         "actorId": str(t.actor_id) if t.actor_id else None,
         "actorName": t.actor_name,
-        "createdAt": t.created_at.isoformat() if t.created_at else None,
+        "createdAt": iso_utc(t.created_at),
     }
 
 

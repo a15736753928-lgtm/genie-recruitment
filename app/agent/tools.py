@@ -63,7 +63,7 @@ TOOL_REGISTRY = {
             "更新候选人状态或字段（写操作）",
             "通过初筛/安排一面/一面未通过/淘汰/改电话等",
             "查详情(get_resume)、出题(generate_questions)、搜知识库(rag_search)",
-            "「一面未通过」→ update_resume(id, status=failed)",
+            "「一面未通过」→ update_resume(id, status=rejected)",
         ),
         "parameters": {
             "type": "object",
@@ -71,8 +71,8 @@ TOOL_REGISTRY = {
                 "id": {"type": "string", "description": "候选人ID"},
                 "status": {
                     "type": "string",
-                    "enum": ["job_hunting", "passed", "first_interview", "second_interview", "failed", "expired"],
-                    "description": "passed=已通过(进入试用期考核), first_interview=一面, second_interview=二面, failed=未通过, job_hunting=求职中",
+                    "enum": ["new", "parsed", "pending_screen", "invited", "round1", "round2", "pending_offer", "hired", "talent_pool", "rejected"],
+                    "description": "pending_screen=待筛选, invited=初筛通过待安排面试, round1=一面中, round2=二面中, pending_offer=待发Offer, hired=已录用, rejected=未通过/淘汰, talent_pool=人才池",
                 },
                 "fields": {"type": "object", "description": "要更新的其他字段"},
             },

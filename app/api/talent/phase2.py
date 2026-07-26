@@ -28,6 +28,7 @@ from app.core.state_machine import transition, StateError
 from app.core.exceptions import push_exception
 from app.utils.responses import ok, fail, not_found
 from app.utils.audit import write_audit
+from app.utils.clock import iso_utc
 
 router = APIRouter(tags=["试用期&培训(Phase2)"])
 
@@ -63,17 +64,17 @@ def _serialize_plan(p: ProbationPlan) -> dict:
         pass
     return {"id": str(p.id), "employeeId": str(p.employee_id),
             "employeeName": emp_name, "position": emp_position, "type": p.type,
-            "totalWeeks": p.total_weeks, "startDate": p.start_date.isoformat() if p.start_date else None,
-            "endDate": p.end_date.isoformat() if p.end_date else None, "status": p.status,
+            "totalWeeks": p.total_weeks, "startDate": iso_utc(p.start_date),
+            "endDate": iso_utc(p.end_date), "status": p.status,
             "aiGenerated": p.ai_generated, "weeks": p.weeks,
             "createdById": str(p.created_by_id) if p.created_by_id else None,
-            "createdAt": p.created_at.isoformat() if p.created_at else None}
+            "createdAt": iso_utc(p.created_at)}
 
 def _serialize_review(r: ProbationWeekReview) -> dict:
     return {"id": str(r.id), "employeeId": str(r.employee_id), "weekNumber": r.week_number,
             "dimensions": r.dimensions, "totalScore": r.total_score, "comment": r.comment,
             "reviewerId": str(r.reviewer_id) if r.reviewer_id else None, "reviewerName": r.reviewer_name,
-            "reviewedAt": r.reviewed_at.isoformat() if r.reviewed_at else None}
+            "reviewedAt": iso_utc(r.reviewed_at)}
 
 def _serialize_confirmation(cr: ConfirmationReview) -> dict:
     # employee 关系已 selectinload 时带上员工信息，供前端列表/详情展示
@@ -105,7 +106,7 @@ def _serialize_confirmation(cr: ConfirmationReview) -> dict:
             "recommendation": cr.recommendation, "status": cr.status,
             "mentorComment": cr.mentor_comment, "managerComment": cr.manager_comment,
             "managerApproved": cr.manager_approved,
-            "createdAt": cr.created_at.isoformat() if cr.created_at else None}
+            "createdAt": iso_utc(cr.created_at)}
 
 def _serialize_employee(e: Employee) -> dict:
     return {"id": str(e.id), "name": e.name, "department": e.department, "status": e.status,
@@ -113,8 +114,8 @@ def _serialize_employee(e: Employee) -> dict:
             "currentWeek": e.current_week, "totalWeeks": e.total_weeks,
             "mentor": e.mentor, "mentorId": str(e.mentor_id) if e.mentor_id else None,
             "manager": e.manager, "managerId": str(e.manager_id) if e.manager_id else None,
-            "onboardDate": e.onboard_date.isoformat() if e.onboard_date else None,
-            "probationEndDate": e.probation_end_date.isoformat() if e.probation_end_date else None,
+            "onboardDate": iso_utc(e.onboard_date),
+            "probationEndDate": iso_utc(e.probation_end_date),
             "overallScore": float(e.overall_score) if e.overall_score else None,
             "riskLevel": e.risk_level}
 
@@ -687,7 +688,7 @@ def _serialize_training_progress(tp: EmployeeTrainingProgress | None) -> dict | 
             "employeeName": emp_name, "position": emp_position,
             "courses": tp.courses,
             "overallRate": float(tp.overall_rate) if tp.overall_rate else 0,
-            "completedAt": tp.completed_at.isoformat() if tp.completed_at else None}
+            "completedAt": iso_utc(tp.completed_at)}
 
 
 # ═══════════════════════════════════════════════
@@ -709,8 +710,8 @@ def _serialize_mentor(m: MentorRecord) -> dict:
             "completedTasks": m.completed_tasks, "issues": m.issues,
             "improvementPlan": m.improvement_plan, "mentorScore": m.mentor_score,
             "employeeConfirmed": m.employee_confirmed,
-            "confirmedAt": m.confirmed_at.isoformat() if m.confirmed_at else None,
-            "createdAt": m.created_at.isoformat() if m.created_at else None}
+            "confirmedAt": iso_utc(m.confirmed_at),
+            "createdAt": iso_utc(m.created_at)}
 
 
 class CreateMentorRecordRequest(BaseModel):

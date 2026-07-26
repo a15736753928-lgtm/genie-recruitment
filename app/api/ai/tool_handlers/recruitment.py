@@ -108,20 +108,22 @@ async def _get_resume(params: dict, db: AsyncSession) -> str:
 async def _update_resume(params: dict, db: AsyncSession) -> str:
     from app.api.recruitment.resumes import update_resume as fn
 
+    # 中文口语 → 状态机词表(state_machine.py TRANSITIONS["candidate"])的英文 key。
+    # 注意：不提供"已入职/入职"别名 —— hired 只能由 Offer 审批通过后自动生成
+    # （见 app/api/talent/offer.py），不允许对话侧直接把候选人改成 hired。
     STATUS_ALIASES = {
-        "rejected": "failed",
-        "淘汰": "failed",
-        "未通过": "failed",
-        "一面未通过": "failed",
-        "二面未通过": "failed",
-        "初筛不通过": "failed",
-        "求职中": "job_hunting",
-        "初筛通过": "passed",
-        "一面中": "first_interview",
-        "二面中": "second_interview",
-        "已入职": "passed",
-        "已通过": "passed",
-        "入职": "passed",
+        "淘汰": "rejected",
+        "未通过": "rejected",
+        "一面未通过": "rejected",
+        "二面未通过": "rejected",
+        "初筛不通过": "rejected",
+        "求职中": "pending_screen",
+        "待筛选": "pending_screen",
+        "初筛通过": "invited",
+        "一面中": "round1",
+        "二面中": "round2",
+        "待发offer": "pending_offer",
+        "待发Offer": "pending_offer",
     }
 
     fields = dict(params.get("fields") or {})
@@ -132,6 +134,11 @@ async def _update_resume(params: dict, db: AsyncSession) -> str:
         raw_status = str(fields["status"]).strip()
         fields["status"] = STATUS_ALIASES.get(raw_status, raw_status)
 
+    # hired 只能由「录用审批通过」自动生成(会同时创建 Employee 记录)，
+    # 对话侧禁止直接把候选人改成 hired，否则会出现"候选人显示已录用但无员工档案"的脏数据。
+    if fields.get("status") == "hired":
+        return "无法直接将候选人标记为已录用：请通过「录用审批」流程操作，审批通过后会自动生成员工档案。"
+
     result = await fn(resume_id=params["id"], body=fields, db=db)
     if result["code"] == 0:
         data = result.get("data") or {}
@@ -139,8 +146,8 @@ async def _update_resume(params: dict, db: AsyncSession) -> str:
         new_status = fields.get("status") or data.get("status") or ""
         if new_status:
             msg = f"已成功更新候选人「{name}」(ID: {params['id']})，状态 → {new_status}"
-            if new_status == "passed":
-                msg += "（已进入试用期考核列表）"
+            if new_status == "pending_offer":
+                msg += "（可发起录用审批）"
             return msg
         return f"已成功更新候选人 {params['id']} 的信息"
     return f"更新失败：{result['message']}"

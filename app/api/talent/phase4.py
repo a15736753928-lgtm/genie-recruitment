@@ -21,6 +21,7 @@ from app.core.security import get_current_user, require_permission, CurrentUser
 from app.core.exceptions import push_exception
 from app.utils.responses import ok, fail, not_found
 from app.utils.audit import write_audit
+from app.utils.clock import iso_utc
 
 router = APIRouter(tags=["人才池&晋级&期权(Phase4)"])
 
@@ -41,12 +42,12 @@ def _serialize_profile(p: TalentProfile) -> dict:
             "canMentor": p.can_mentor,
             "promotionReadiness": float(p.promotion_readiness) if p.promotion_readiness else None,
             "talentRisk": p.talent_risk, "aiAnalysis": p.ai_analysis,
-            "createdAt": p.created_at.isoformat() if p.created_at else None}
+            "createdAt": iso_utc(p.created_at)}
 
 def _serialize_tag(t: AbilityTag) -> dict:
     return {"id": str(t.id), "employeeId": str(t.employee_id), "tag": t.tag, "level": t.level,
             "evidence": t.evidence, "confirmedBy": str(t.confirmed_by) if t.confirmed_by else None,
-            "confirmedAt": t.confirmed_at.isoformat() if t.confirmed_at else None}
+            "confirmedAt": iso_utc(t.confirmed_at)}
 
 def _serialize_promotion(pr: PromotionRecord) -> dict:
     return {"id": str(pr.id), "employeeId": str(pr.employee_id),
@@ -57,7 +58,7 @@ def _serialize_promotion(pr: PromotionRecord) -> dict:
             "reviewResult": pr.review_result, "approverIds": pr.approver_ids,
             "rejectReason": pr.reject_reason, "status": pr.status,
             "createdBy": str(pr.created_by) if pr.created_by else None,
-            "createdAt": pr.created_at.isoformat() if pr.created_at else None}
+            "createdAt": iso_utc(pr.created_at)}
 
 def _serialize_equity(e: EquityRecord) -> dict:
     return {"id": str(e.id), "employeeId": str(e.employee_id),
@@ -70,7 +71,7 @@ def _serialize_equity(e: EquityRecord) -> dict:
             "aiRecommendation": e.ai_recommendation,
             "approverIds": e.approver_ids, "rejectReason": e.reject_reason,
             "status": e.status, "createdBy": str(e.created_by) if e.created_by else None,
-            "createdAt": e.created_at.isoformat() if e.created_at else None}
+            "createdAt": iso_utc(e.created_at)}
 
 
 # ═══════════════════════════════════════════════

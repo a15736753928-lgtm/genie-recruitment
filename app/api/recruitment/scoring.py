@@ -17,6 +17,7 @@ from app.core.exceptions import push_exception
 from app.schemas.ai_advice import AIAdvice
 from app.utils.responses import ok, fail, not_found
 from app.utils.audit import write_audit
+from app.utils.clock import iso_utc
 
 router = APIRouter(tags=["简历筛选"])
 
@@ -52,7 +53,7 @@ def serialize_score(s: ResumeScore, viewer: CurrentUser | None = None) -> dict:
             "bonusSkill": s.bonus_skill,
         },
         "advice": s.advice,   # already snake_case AIAdvice dict
-        "createdAt": s.created_at.isoformat() if s.created_at else None,
+        "createdAt": iso_utc(s.created_at),
     }
 
 

@@ -27,6 +27,7 @@ from app.core.security import get_current_user, require_permission, CurrentUser
 from app.core.state_machine import transition, StateError
 from app.utils.responses import ok, fail, not_found
 from app.utils.audit import write_audit
+from app.utils.clock import iso_utc
 from app.services.ai import llm_chat
 import logging
 
@@ -62,13 +63,13 @@ def serialize_offer(offer: OfferApproval, viewer=None) -> dict:
         "conversionCriteria": offer.conversion_criteria,
         "eliminationCriteria": offer.elimination_criteria,
         "approverId": str(offer.approver_id) if offer.approver_id else None,
-        "approvedAt": offer.approved_at.isoformat() if offer.approved_at else None,
+        "approvedAt": iso_utc(offer.approved_at),
         "rejectReason": offer.reject_reason,
         "aiResult": offer.ai_result,
         "result": offer.result,
         "status": offer.status,
-        "createdAt": offer.created_at.isoformat() if offer.created_at else None,
-        "updatedAt": offer.updated_at.isoformat() if offer.updated_at else None,
+        "createdAt": iso_utc(offer.created_at),
+        "updatedAt": iso_utc(offer.updated_at),
     }
 
 
@@ -387,8 +388,20 @@ async def approve_offer(
 
     hired_employee: Optional[Employee] = None
 
+    # 一个审批动作要同时迁移 offer 和 candidate 两个实体的状态，
+    # 而 get_db() 只在路由抛出异常时才 rollback（见 app/database.py:28-37）；
+    # 若第一个 transition() 已 flush 成功、第二个才失败，直接 return fail()
+    # 会导致前者被静默提交，造成"offer 显示已批准但候选人未同步"的脏数据。
+    # 因此第二个 transition() 失败时必须显式 rollback 撤销第一个的 flush。
     if body.result == "reject":
-        offer.status = "rejected"
+        try:
+            await transition(
+                db, "offer", offer, "rejected",
+                actor_id=current.id, actor_name=current.username,
+                reason=f"录用审批-拒绝: {body.reason}", skip_block_check=True,
+            )
+        except StateError as e:
+            return fail(409, e.message)
         try:
             await transition(
                 db, "candidate", candidate, "rejected",
@@ -396,9 +409,17 @@ async def approve_offer(
                 reason=f"录用审批-拒绝: {body.reason}", skip_block_check=True,
             )
         except StateError as e:
+            await db.rollback()
             return fail(409, e.message)
     else:
-        offer.status = "approved"
+        try:
+            await transition(
+                db, "offer", offer, "approved",
+                actor_id=current.id, actor_name=current.username,
+                reason=f"录用审批-{body.result}", skip_block_check=True,
+            )
+        except StateError as e:
+            return fail(409, e.message)
         try:
             await transition(
                 db, "candidate", candidate, "hired",
@@ -406,6 +427,7 @@ async def approve_offer(
                 reason=f"录用审批-{body.result}", skip_block_check=True,
             )
         except StateError as e:
+            await db.rollback()
             return fail(409, e.message)
 
         # Auto-create Employee
@@ -479,7 +501,7 @@ async def list_offers(
         items.append(item)
 
     return ok({
-        "items": items,
+        "list": items,
         "total": total,
         "page": page,
         "pageSize": pageSize,

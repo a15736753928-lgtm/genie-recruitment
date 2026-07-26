@@ -18,6 +18,7 @@ from app.models.probation import Employee
 from app.core.security import get_current_user, require_permission, CurrentUser
 from app.utils.responses import ok, fail, not_found
 from app.utils.audit import write_audit
+from app.utils.clock import iso_utc
 
 _LEVEL_NUM = {"L1": 1, "L2": 2, "L3": 3, "L4": 4, "L5": 5}
 
@@ -29,7 +30,7 @@ def _serialize_project(p: Project, assigned_count: int = 0) -> dict:
         "level": p.required_level, "headcount": p.headcount,
         "department": p.department, "status": p.status,
         "assignedCount": assigned_count,
-        "createdAt": p.created_at.isoformat() if p.created_at else None,
+        "createdAt": iso_utc(p.created_at),
     }
 
 
@@ -38,7 +39,7 @@ def _serialize_assignment(a: ProjectAssignment) -> dict:
         "id": str(a.id), "projectId": str(a.project_id),
         "employeeId": str(a.employee_id), "employeeName": a.employee_name,
         "assignedBy": a.assigned_by,
-        "assignedAt": a.assigned_at.isoformat() if a.assigned_at else None,
+        "assignedAt": iso_utc(a.assigned_at),
     }
 
 

@@ -13,6 +13,7 @@ from app.models.recruitment import Candidate
 from app.models.settings import AuditLog
 from app.services.system.cascade_delete import cascade_delete_by_candidate
 from app.services.system.system_settings import get_system_setting
+from app.utils.clock import iso_utc
 
 logger = logging.getLogger("genie.data_retention")
 
@@ -60,7 +61,7 @@ async def cleanup_expired(db: AsyncSession) -> dict[str, Any]:
 
     summary = {
         "retentionDays": days,
-        "cutoff": cutoff.isoformat(),
+        "cutoff": iso_utc(cutoff),
         "deletedCandidates": deleted_candidates,
         "deletedFiles": deleted_files,
         "deletedAuditLogs": deleted_audit,

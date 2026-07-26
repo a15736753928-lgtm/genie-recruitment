@@ -17,6 +17,7 @@ from app.core.security import get_current_user, require_permission, CurrentUser
 from app.core.state_machine import transition, StateError
 from app.utils.responses import ok, fail, not_found
 from app.utils.audit import write_audit
+from app.utils.clock import iso_utc
 
 router = APIRouter(tags=["招聘需求"])
 
@@ -149,12 +150,12 @@ def _serialize_req(req: RecruitmentRequest, viewer: CurrentUser | None = None) -
         "aiDraft": req.ai_draft,
         "aiOutputs": _format_ai_outputs(req.ai_draft),
         "hrConfirmedBy": str(req.hr_confirmed_by) if req.hr_confirmed_by else None,
-        "hrConfirmedAt": req.hr_confirmed_at.isoformat() if req.hr_confirmed_at else None,
+        "hrConfirmedAt": iso_utc(req.hr_confirmed_at),
         "deptConfirmedBy": str(req.dept_confirmed_by) if req.dept_confirmed_by else None,
-        "deptConfirmedAt": req.dept_confirmed_at.isoformat() if req.dept_confirmed_at else None,
+        "deptConfirmedAt": iso_utc(req.dept_confirmed_at),
         "positionId": str(req.position_id) if req.position_id else None,
-        "createdAt": req.created_at.isoformat() if req.created_at else None,
-        "updatedAt": req.updated_at.isoformat() if req.updated_at else None,
+        "createdAt": iso_utc(req.created_at),
+        "updatedAt": iso_utc(req.updated_at),
     }
 
 
@@ -313,8 +314,8 @@ async def ai_generate(
             await transition(db, "recruitment_request", req, "ai_generated",
                              actor_id=current.id, actor_name=current.username,
                              skip_block_check=True)
-        except StateError:
-            req.status = "ai_generated"
+        except StateError as e:
+            return fail(409, e.message)
     await write_audit(db, actor=current.username, action="AI 生成招聘草稿", section="recruitment")
     return ok(_serialize_req(req, current))
 
@@ -407,6 +408,12 @@ async def confirm_request(
     if req.status in ("published", "closed"):
         return fail(409, "已发布或关闭，不可再确认")
 
+    # 注意：hr_confirmed_by/dept_confirmed_by 的赋值发生在状态迁移校验之前；
+    # get_db() 只在路由抛出异常时才 rollback（见 app/database.py:28-37），
+    # 若 transition() 校验失败后直接 return fail()，这两个字段的赋值仍会被
+    # 悄悄提交——曾导致"一次不合法的 dept 确认"残留 dept_confirmed_by，
+    # 污染后续请求让状态直接跳级（跳过 hr_confirmed 直接到 dept_confirmed）。
+    # 因此任何一次 transition() 失败都必须显式 rollback。
     now = datetime.utcnow()
     if body.role == "hr":
         req.hr_confirmed_by = current.id
@@ -416,8 +423,9 @@ async def confirm_request(
                 await transition(db, "recruitment_request", req, "hr_confirmed",
                                  actor_id=current.id, actor_name=current.username,
                                  skip_block_check=True)
-            except StateError:
-                req.status = "hr_confirmed"
+            except StateError as e:
+                await db.rollback()
+                return fail(409, e.message)
     elif body.role == "dept":
         req.dept_confirmed_by = current.id
         req.dept_confirmed_at = now
@@ -430,8 +438,9 @@ async def confirm_request(
             await transition(db, "recruitment_request", req, "dept_confirmed",
                              actor_id=current.id, actor_name=current.username,
                              skip_block_check=True)
-        except StateError:
-            req.status = "dept_confirmed"
+        except StateError as e:
+            await db.rollback()
+            return fail(409, e.message)
 
     await write_audit(db, actor=current.username, action="确认招聘需求", section="recruitment")
     return ok(_serialize_req(req, current))

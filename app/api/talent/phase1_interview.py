@@ -29,6 +29,7 @@ from app.core.state_machine import transition, StateError
 from app.core.exceptions import push_exception, has_blocking_exception
 from app.schemas.ai_advice import AIAdvice, parse_ai_advice
 from app.utils.responses import ok, fail, not_found
+from app.utils.clock import iso_utc
 from app.services.ai import llm_chat
 from app.services.system.system_settings import get_system_setting
 import logging
@@ -70,14 +71,14 @@ def serialize_interview(iv: Interview, viewer=None) -> dict:
         "candidateId": str(iv.candidate_id),
         "positionId": str(iv.position_id) if iv.position_id else None,
         "round": iv.round,
-        "scheduledAt": iv.scheduled_at.isoformat() if iv.scheduled_at else None,
+        "scheduledAt": iso_utc(iv.scheduled_at),
         "interviewerIds": iv.interviewer_ids or [],
         "status": iv.status,
         "practicalScore": iv.practical_score,
         "compositeScore": float(iv.composite_score) if iv.composite_score is not None else None,
         "conclusion": iv.conclusion,
-        "createdAt": iv.created_at.isoformat() if iv.created_at else None,
-        "updatedAt": iv.updated_at.isoformat() if iv.updated_at else None,
+        "createdAt": iso_utc(iv.created_at),
+        "updatedAt": iso_utc(iv.updated_at),
     }
 
 
@@ -90,7 +91,7 @@ def serialize_interviewer_score(s: InterviewerScore) -> dict:
         "total": s.total,
         "comment": s.comment,
         "isSubmitted": s.is_submitted,
-        "createdAt": s.created_at.isoformat() if s.created_at else None,
+        "createdAt": iso_utc(s.created_at),
     }
 
 

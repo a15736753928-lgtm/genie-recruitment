@@ -15,6 +15,7 @@ from app.core.security import (
 from app.core.permissions import ROLES, ROLE_PERMISSIONS, PERMISSION_REGISTRY
 from app.utils.responses import ok, fail, not_found
 from app.utils.audit import write_audit
+from app.utils.clock import iso_utc
 import uuid
 
 router = APIRouter(tags=["用户管理"], prefix="/users")
@@ -32,8 +33,8 @@ def _serialize_user(user: User, roles: list[str]) -> dict:
         "status": user.status,
         "mustChangePassword": user.must_change_password,
         "roles": roles,
-        "createdAt": user.created_at.isoformat() if user.created_at else None,
-        "lastLoginAt": user.last_login_at.isoformat() if user.last_login_at else None,
+        "createdAt": iso_utc(user.created_at),
+        "lastLoginAt": iso_utc(user.last_login_at),
     }
 
 

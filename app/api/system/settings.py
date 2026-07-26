@@ -10,6 +10,7 @@ from app.services.system.system_settings import (
     get_system_settings,
     invalidate_cache,
 )
+from app.utils.clock import iso_utc
 
 router = APIRouter(tags=["系统设置"])
 
@@ -90,7 +91,7 @@ async def append_audit_log(body: dict, db: AsyncSession = Depends(get_db)):
     """追加一条审计日志。body: { actor, action, section }"""
     log = AuditLog(
         id=f"log-{uuid.uuid4().hex[:12]}",
-        time=body.get("time") or datetime.utcnow().strftime("%Y-%m-%d %H:%M"),
+        time=body.get("time") or iso_utc(datetime.utcnow()),
         actor=body.get("actor", "系统"),
         action=body.get("action", ""),
         section=body.get("section"),

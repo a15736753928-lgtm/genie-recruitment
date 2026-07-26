@@ -21,6 +21,7 @@ from app.core.state_machine import transition, StateError
 from app.core.exceptions import push_exception
 from app.utils.responses import ok, fail, not_found
 from app.utils.audit import write_audit
+from app.utils.clock import iso_utc
 
 router = APIRouter(tags=["任务积分(Phase3)"])
 
@@ -36,28 +37,28 @@ async def _get_setting(db: AsyncSession, key: str, default: Any) -> Any:
 
 def _serialize_task(t: WorkTask) -> dict:
     return {"id": str(t.id), "name": t.name, "goal": t.goal, "ownerId": str(t.owner_id) if t.owner_id else None,
-            "collaboratorIds": t.collaborator_ids, "startAt": t.start_at.isoformat() if t.start_at else None,
-            "deadline": t.deadline.isoformat() if t.deadline else None, "priority": t.priority,
+            "collaboratorIds": t.collaborator_ids, "startAt": iso_utc(t.start_at),
+            "deadline": iso_utc(t.deadline), "priority": t.priority,
             "difficulty": t.difficulty, "level": t.level, "basePoints": t.base_points,
             "acceptanceCriteria": t.acceptance_criteria, "acceptorId": str(t.acceptor_id) if t.acceptor_id else None,
             "deliverables": t.deliverables, "riskNote": t.risk_note, "department": t.department,
             "status": t.status, "reworkCount": t.rework_count, "createdBy": str(t.created_by) if t.created_by else None,
-            "createdAt": t.created_at.isoformat() if t.created_at else None}
+            "createdAt": iso_utc(t.created_at)}
 
 def _serialize_acceptance(a: TaskAcceptance) -> dict:
     return {"id": str(a.id), "taskId": str(a.task_id), "acceptorId": str(a.acceptor_id) if a.acceptor_id else None,
             "completionCoeff": float(a.completion_coeff), "qualityCoeff": float(a.quality_coeff),
             "timelinessCoeff": float(a.timeliness_coeff), "collaborationPoints": a.collaboration_points,
             "innovationPoints": a.innovation_points, "penaltyPoints": a.penalty_points,
-            "notes": a.notes, "acceptedAt": a.accepted_at.isoformat() if a.accepted_at else None}
+            "notes": a.notes, "acceptedAt": iso_utc(a.accepted_at)}
 
 def _serialize_point(p: PointRecord) -> dict:
     return {"id": str(p.id), "employeeId": str(p.employee_id), "taskId": str(p.task_id) if p.task_id else None,
             "basePoints": p.base_points, "actualPoints": float(p.actual_points), "aiAdvice": p.ai_advice,
             "status": p.status, "source": p.source, "description": p.description,
             "confirmedBy": str(p.confirmed_by) if p.confirmed_by else None,
-            "confirmedAt": p.confirmed_at.isoformat() if p.confirmed_at else None,
-            "createdAt": p.created_at.isoformat() if p.created_at else None}
+            "confirmedAt": iso_utc(p.confirmed_at),
+            "createdAt": iso_utc(p.created_at)}
 
 def _serialize_rp(rp: RewardPenaltyRecord) -> dict:
     return {"id": str(rp.id), "employeeId": str(rp.employee_id), "type": rp.type, "points": rp.points,
@@ -66,14 +67,14 @@ def _serialize_rp(rp: RewardPenaltyRecord) -> dict:
             "dualApproved": rp.dual_approved, "employeeNotified": rp.employee_notified,
             "employeeAcknowledged": rp.employee_acknowledged, "status": rp.status,
             "createdBy": str(rp.created_by) if rp.created_by else None,
-            "createdAt": rp.created_at.isoformat() if rp.created_at else None}
+            "createdAt": iso_utc(rp.created_at)}
 
 def _serialize_appeal(a: Appeal) -> dict:
     return {"id": str(a.id), "employeeId": str(a.employee_id), "targetType": a.target_type,
             "targetId": str(a.target_id), "content": a.content, "status": a.status,
             "handlerId": str(a.handler_id) if a.handler_id else None, "resolution": a.resolution,
-            "resolvedAt": a.resolved_at.isoformat() if a.resolved_at else None,
-            "createdAt": a.created_at.isoformat() if a.created_at else None}
+            "resolvedAt": iso_utc(a.resolved_at),
+            "createdAt": iso_utc(a.created_at)}
 
 
 # ═══════════════════════════════════════════════
@@ -106,7 +107,7 @@ async def create_task(
 ):
     # 验收标准必填
     if not body.acceptance_criteria.strip():
-        await push_exception(db, entity_type="task", entity_id=uuid.uuid4(),
+        await push_exception(db, entity_type="work_task", entity_id=uuid.uuid4(),
                              exception_type="no_acceptance_criteria", detail="无验收标准不得发布", severity="block")
         return fail(422, "验收标准不可为空")
 
@@ -236,7 +237,7 @@ async def publish_task(task_id: str, current: CurrentUser = Depends(require_perm
     t = (await db.execute(select(WorkTask).where(WorkTask.id == tid))).scalar_one_or_none()
     if not t: return not_found("任务不存在")
     if t.status != "draft": return fail(409, "只有草稿可发布")
-    try: await transition(db, "task", t, "pending", actor_id=current.id, actor_name=current.username, skip_block_check=True)
+    try: await transition(db, "work_task", t, "pending", actor_id=current.id, actor_name=current.username, skip_block_check=True)
     except StateError as e: return fail(409, e.message)
     await write_audit(db, actor=current.username, action=f"发布任务: {t.name}", section="tasks")
     return ok(_serialize_task(t))
@@ -249,7 +250,7 @@ async def start_task(task_id: str, current: CurrentUser = Depends(require_permis
     t = (await db.execute(select(WorkTask).where(WorkTask.id == tid))).scalar_one_or_none()
     if not t: return not_found("任务不存在")
     if t.status != "pending": return fail(409, "只有待认领的任务可开始")
-    try: await transition(db, "task", t, "in_progress", actor_id=current.id, actor_name=current.username, skip_block_check=True)
+    try: await transition(db, "work_task", t, "in_progress", actor_id=current.id, actor_name=current.username, skip_block_check=True)
     except StateError as e: return fail(409, e.message)
     return ok(_serialize_task(t))
 
@@ -262,7 +263,7 @@ async def submit_task(task_id: str, body: dict, current: CurrentUser = Depends(r
     if not t: return not_found("任务不存在")
     if t.status != "in_progress": return fail(409, "只有进行中的任务可提交")
     t.deliverables = body.get("deliverables") or t.deliverables
-    try: await transition(db, "task", t, "pending_accept", actor_id=current.id, actor_name=current.username, skip_block_check=True)
+    try: await transition(db, "work_task", t, "pending_accept", actor_id=current.id, actor_name=current.username, skip_block_check=True)
     except StateError as e: return fail(409, e.message)
     await write_audit(db, actor=current.username, action=f"提交任务: {t.name}", section="tasks")
     return ok(_serialize_task(t))
@@ -325,7 +326,13 @@ async def accept_task(
     )
     db.add(pr)
 
-    t.status = "passed"
+    try:
+        await transition(db, "work_task", t, "passed", actor_id=current.id, actor_name=current.username, skip_block_check=True)
+    except StateError as e:
+        # acc/pr 此时已 db.add() 但未提交；get_db() 只在异常时才 rollback，
+        # 这里必须显式回滚，否则验收失败仍会连带把验收记录/积分记录提交进库。
+        await db.rollback()
+        return fail(409, e.message)
     await db.flush()
     await write_audit(db, actor=current.username, action=f"验收任务: {t.name} 得分: {actual}", section="tasks")
     return ok({"task": _serialize_task(t), "acceptance": _serialize_acceptance(acc),

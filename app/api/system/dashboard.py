@@ -17,28 +17,25 @@ async def query_recruitment_summary(db: AsyncSession) -> dict:
     total_employees = (await db.execute(select(func.count()).select_from(Employee))).scalar() or 0
 
     job_hunting = (await db.execute(
-        select(func.count()).select_from(Candidate).where(Candidate.status == "job_hunting")
-    )).scalar() or 0
-    passed_count = (await db.execute(
-        select(func.count()).select_from(Candidate).where(Candidate.status == "passed")
-    )).scalar() or 0
-    first_interview = (await db.execute(
-        select(func.count()).select_from(Candidate).where(Candidate.status == "first_interview")
-    )).scalar() or 0
-    second_interview = (await db.execute(
-        select(func.count()).select_from(Candidate).where(Candidate.status == "second_interview")
-    )).scalar() or 0
-    legacy_passed = (await db.execute(
         select(func.count()).select_from(Candidate).where(
-            Candidate.status.in_(["pending_interview", "probation", "onboarded"])
+            Candidate.status.in_(["new", "parsed", "pending_screen"])
         )
     )).scalar() or 0
+    passed_count = (await db.execute(
+        select(func.count()).select_from(Candidate).where(Candidate.status == "invited")
+    )).scalar() or 0
+    first_interview = (await db.execute(
+        select(func.count()).select_from(Candidate).where(Candidate.status == "round1")
+    )).scalar() or 0
+    second_interview = (await db.execute(
+        select(func.count()).select_from(Candidate).where(Candidate.status == "round2")
+    )).scalar() or 0
     failed = (await db.execute(
-        select(func.count()).select_from(Candidate).where(Candidate.status == "failed")
+        select(func.count()).select_from(Candidate).where(Candidate.status == "rejected")
     )).scalar() or 0
 
-    passed = passed_count + legacy_passed
-    total_interviews = passed_count + first_interview + second_interview + legacy_passed
+    passed = passed_count
+    total_interviews = passed_count + first_interview + second_interview
 
     avg_score_result = (await db.execute(select(func.avg(Candidate.score)).select_from(Candidate)))
     avg_score = round(float(avg_score_result.scalar() or 0), 1)

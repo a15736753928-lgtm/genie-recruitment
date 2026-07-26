@@ -413,7 +413,7 @@ POSITIONS_DATA = [
     },
     {
         "name": "全栈开发工程师",
-        "department": "技术研发部",
+        "department": "技术部",
         "jd_responsibilities": (
             "1. 负责公司业务系统的前后端全栈开发,包括Web前端页面、后端API、数据库设计;\n"
             "2. 参与系统架构设计、技术选型和代码评审;\n"

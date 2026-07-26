@@ -217,6 +217,31 @@ async def api_error_handler(request: Request, exc):
     )
 
 
+from fastapi.exceptions import RequestValidationError
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(request: Request, exc: RequestValidationError):
+    """请求体/参数校验失败(422) → 统一 JSON 信封。
+
+    FastAPI 默认返回 {"detail": [...]}，没有 code 字段，会打穿前端 client.ts
+    的信封解析分支，最终弹出一个空白 toast，用户完全看不到错误原因。
+    """
+    errors = exc.errors()
+    if errors:
+        first = errors[0]
+        # loc 形如 ("body", "role")，去掉开头的 body/query 前缀更贴近用户视角
+        loc = [str(p) for p in first.get("loc", []) if p not in ("body", "query", "path")]
+        field = ".".join(loc) if loc else "请求参数"
+        message = f"参数校验失败: {field} {first.get('msg', '')}".strip()
+    else:
+        message = "参数校验失败"
+    logger.warning("422 on %s %s: %s", request.method, request.url.path, errors)
+    return JSONResponse(
+        status_code=422,
+        content={"code": 422, "message": message, "data": None},
+    )
+
+
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     # AuthError / PermissionError_ 已由专用 handler 拦截，此处不再需要 isinstance 检查
@@ -238,9 +263,12 @@ async def global_exception_handler(request: Request, exc: Exception):
             content={"code": 404, "message": "记录不存在或 ID 格式无效", "data": None},
         )
     logger.error("Unhandled exception: %s", exc, exc_info=True)
+    # 中文提示: client.ts 对真实 5xx 会自行替换成中文文案，但 api/services/agent.ts
+    # 是直接把 envelope.message 原样弹 toast——英文字符串会导致同一个后端 500
+    # 在两个前端客户端里一个中文一个英文，此处统一在源头改成中文即可两边一致。
     return JSONResponse(
         status_code=500,
-        content={"code": 500, "message": "Internal server error", "data": None},
+        content={"code": 500, "message": "服务器内部错误，请稍后重试或联系管理员", "data": None},
     )
 
 

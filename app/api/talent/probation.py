@@ -13,6 +13,8 @@ from app.config import get_settings
 from app.services.system.system_settings import get_system_setting
 from app.services.ai import get_llm_client
 from app.services.talent.probation_sync import ensure_employee_for_candidate, sync_onboarding_candidates
+from app.core.state_machine import transition, StateError
+from app.utils.clock import iso_utc
 
 router = APIRouter(tags=["试用期"])
 settings = get_settings()
@@ -34,7 +36,7 @@ def serialize_task(t: ProbationTask, employee_name: str = "") -> dict:
         "title": t.title,
         "objective": t.objective or "",
         "assignee": t.assignee or "",
-        "deadline": t.deadline.isoformat() if t.deadline else "",
+        "deadline": iso_utc(t.deadline),
         "inputMaterials": t.input_materials,
         "deliverables": t.deliverables or "",
         "qualityStandard": t.quality_standard or "",
@@ -47,8 +49,8 @@ def serialize_task(t: ProbationTask, employee_name: str = "") -> dict:
         "riskNote": t.risk_note,
         "score": float(t.score) if t.score is not None else None,
         "projectScores": t.project_scores,
-        "submittedAt": t.submitted_at.isoformat() if t.submitted_at else None,
-        "reviewedAt": t.reviewed_at.isoformat() if t.reviewed_at else None,
+        "submittedAt": iso_utc(t.submitted_at),
+        "reviewedAt": iso_utc(t.reviewed_at),
     }
 
 
@@ -74,8 +76,8 @@ def serialize_employee(emp: Employee) -> dict:
         "gender": emp.gender,
         "age": emp.age,
         "department": emp.department,
-        "onboardDate": emp.onboard_date.isoformat() if emp.onboard_date else "",
-        "probationEndDate": emp.probation_end_date.isoformat() if emp.probation_end_date else "",
+        "onboardDate": iso_utc(emp.onboard_date),
+        "probationEndDate": iso_utc(emp.probation_end_date),
         "status": emp.status or "pending_onboard",
         "employeeType": emp.employee_type or "tech",
         "matchLevel": emp.match_level,
@@ -310,8 +312,10 @@ async def update_probation_task(
         return {"code": 404, "message": "任务不存在", "data": None}
 
     # camelCase(前端) → snake_case(ORM) 映射
+    # 注意：status 不在这个通用映射里 —— 状态变更必须走 transition()校验合法迁移，
+    # 不能像其他字段一样裸 setattr（见 app/core/state_machine.py TRANSITIONS["probation_task"]）。
     field_map = {
-        "name": "title", "title": "title", "status": "status",
+        "name": "title", "title": "title",
         "description": "description", "reviewNotes": "review_notes",
         "objective": "objective", "assignee": "assignee",
         "inputMaterials": "input_materials", "deliverables": "deliverables",
@@ -330,11 +334,17 @@ async def update_probation_task(
         task.score = body["score"]
     if "deadline" in body and body["deadline"]:
         task.deadline = date.fromisoformat(body["deadline"])
-    # 状态流转打时间戳
-    if body.get("status") == "pending_review" and task.submitted_at is None:
-        task.submitted_at = datetime.utcnow()
-    if body.get("status") == "passed":
-        task.reviewed_at = datetime.utcnow()
+
+    if "status" in body and body["status"]:
+        try:
+            await transition(db, "probation_task", task, body["status"], skip_block_check=True)
+        except StateError as e:
+            return {"code": 409, "message": e.message, "data": None}
+        # 状态流转打时间戳
+        if task.status == "pending_review" and task.submitted_at is None:
+            task.submitted_at = datetime.utcnow()
+        if task.status == "passed":
+            task.reviewed_at = datetime.utcnow()
 
     await db.flush()
     emp_name = task.employee.name if task.employee else ""
@@ -408,7 +418,12 @@ async def update_probation_status(
     if not emp:
         return {"code": 404, "message": "员工不存在", "data": None}
 
-    emp.status = body.get("status", emp.status)
+    new_status = body.get("status")
+    if new_status and new_status != emp.status:
+        try:
+            await transition(db, "employee", emp, new_status, skip_block_check=True)
+        except StateError as e:
+            return {"code": 409, "message": e.message, "data": None}
     await db.flush()
     return {"code": 0, "message": "ok", "data": None}
 

@@ -13,6 +13,8 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import select, update
+
+from app.utils.clock import iso_utc
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.system import ExceptionQueue
@@ -71,6 +73,6 @@ def serialize_exception(exc: ExceptionQueue) -> dict:
         "handlerId": str(exc.handler_id) if exc.handler_id else None,
         "handlerName": exc.handler_name,
         "resolution": exc.resolution,
-        "handledAt": exc.handled_at.isoformat() if exc.handled_at else None,
-        "createdAt": exc.created_at.isoformat() if exc.created_at else None,
+        "handledAt": iso_utc(exc.handled_at),
+        "createdAt": iso_utc(exc.created_at),
     }

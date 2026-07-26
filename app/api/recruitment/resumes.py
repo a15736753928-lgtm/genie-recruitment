@@ -19,6 +19,8 @@ from sqlalchemy import select, or_, func, desc, asc
 from sqlalchemy.orm import selectinload
 
 from app.database import get_db, async_session_factory
+from app.core.state_machine import transition, StateError
+from app.core.security import CurrentUser, require_permission
 from app.models.recruitment import (
     Candidate, Position, CandidateSkill, CandidateEducation,
     CandidateWorkExperience, CandidateProjectExperience,
@@ -26,11 +28,6 @@ from app.models.recruitment import (
 from app.config import get_settings
 from app.infrastructure import minio_storage
 from app.services.system.system_settings import get_system_setting
-from app.services.talent.probation_sync import (
-    ensure_employee_for_candidate,
-    sync_onboarding_candidates,
-    PROBATION_CANDIDATE_STATUSES,
-)
 
 # Re-exported from split modules for backward compatibility
 from app.api.recruitment.resume_parser import (
@@ -109,12 +106,7 @@ async def query_candidate_list(
     if statuses:
         status_list = [s.strip() for s in statuses.split(",") if s.strip()]
         if status_list:
-            expanded: list[str] = []
-            for status in status_list:
-                expanded.append(status)
-                if status == "passed":
-                    expanded.extend(["pending_interview"])
-            query = query.where(Candidate.status.in_(expanded))
+            query = query.where(Candidate.status.in_(status_list))
 
     if keyword:
         kw = f"%{keyword}%"
@@ -473,7 +465,12 @@ async def update_resume(
     resume_id: str,
     body: dict,
     db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(require_permission("resume:decide")),
 ):
+    # 注意：AI 工具 handler(app/api/ai/tool_handlers/recruitment.py::_update_resume)
+    # 是直接 import 本函数并以 fn(resume_id=..., body=..., db=db) 调用的，
+    # 不走 FastAPI 依赖注入，因此 current 必须有默认值(Depends(...) 即默认值)，
+    # 否则该调用会 TypeError。current 在本函数体内不使用，仅用于 HTTP 层守卫。
     result = await db.execute(
         select(Candidate)
         .options(*CANDIDATE_LOAD_OPTIONS)
@@ -483,10 +480,22 @@ async def update_resume(
     if not candidate:
         return {"code": 404, "message": "候选人不存在", "data": None}
 
-    # Simple fields
-    for field in ["name", "gender", "age", "education", "experience", "status", "phone", "email", "ethnicity"]:
+    # Simple fields（status 不在此列——状态变更必须走 transition() 校验合法迁移，
+    # 不能像其他字段一样裸 setattr，见 app/core/state_machine.py）
+    for field in ["name", "gender", "age", "education", "experience", "phone", "email", "ethnicity"]:
         if field in body:
             setattr(candidate, field, body[field])
+
+    if "status" in body and body["status"] and body["status"] != candidate.status:
+        # hired 只能由「录用审批通过」自动生成（见 offer.py），此通用编辑端点
+        # 禁止直接把候选人改成 hired，否则会绕开审批必填字段/审批人记录，
+        # 与 offer.py 形成第二条并行入职通道。
+        if body["status"] == "hired":
+            return {"code": 400, "message": "无法直接将候选人标记为已录用：请通过「录用审批」流程操作。", "data": None}
+        try:
+            await transition(db, "candidate", candidate, body["status"], skip_block_check=True)
+        except StateError as e:
+            return {"code": 409, "message": e.message, "data": None}
 
     if "ethnicity" in body:
         candidate.ethnicity = normalize_ethnicity(candidate.ethnicity)
@@ -543,9 +552,8 @@ async def update_resume(
     await db.flush()
     await db.refresh(candidate)
 
-    new_status = body.get("status")
-    if new_status in PROBATION_CANDIDATE_STATUSES:
-        await ensure_employee_for_candidate(db, candidate)
+    # 注：hired 已在上面被禁止直接设置，故此处不再需要 ensure_employee_for_candidate
+    # 兜底调用——员工记录只应由 offer.py 的录用审批流程产生。
 
     return {"code": 0, "message": "ok", "data": serialize_candidate(candidate)}
 

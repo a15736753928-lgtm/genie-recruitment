@@ -21,6 +21,7 @@ from pydantic import BaseModel
 from openai import AsyncOpenAI
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from app.database import get_db, async_session_factory
+from app.utils.clock import iso_utc
 from app.models.agent_session import AgentProject, AgentSession, AgentMessage, AgentMaterial, AgentTask
 from app.models.recruitment import Candidate, Position
 from app.agent.tools import create_langchain_tools
@@ -65,20 +66,128 @@ def _compact_messages(messages: list, max_tokens: int = 6000) -> tuple[list, int
     Keeps at least the final message (current user turn). Simpler and
     safer than the old CompactionPipeline, which was coupled to LoopState
     and silently corrupted ToolMessage metadata.
+
+    Messages are dropped in atomic units, not one at a time: an
+    AIMessage carrying ``tool_calls`` is grouped with the ToolMessage(s)
+    that immediately follow it (history reconstruction upstream always
+    emits them as an adjacent pair — one tool_call per AIMessage). If we
+    popped from the front message-by-message, a cut could land between
+    such a pair and leave an orphaned ToolMessage with no preceding
+    tool_calls — which OpenAI-compatible APIs reject outright (400).
     """
     if not messages:
         return messages, 0
     total = _estimate_tokens_msgs(messages)
     if total <= max_tokens:
         return messages, 0
-    result = list(messages)
+
+    units: list[list] = []
+    i, n = 0, len(messages)
+    while i < n:
+        msg = messages[i]
+        unit = [msg]
+        i += 1
+        if getattr(msg, "tool_calls", None):
+            while i < n and getattr(messages[i], "type", None) == "tool":
+                unit.append(messages[i])
+                i += 1
+        units.append(unit)
+
     dropped = 0
-    # Drop from the front (oldest) but never drop the last message.
-    while len(result) > 1 and total > max_tokens:
-        removed = result.pop(0)
-        total -= _estimate_tokens(str(getattr(removed, "content", "") or ""))
-        dropped += 1
+    # Drop whole units from the front (oldest) but never drop the last unit.
+    while len(units) > 1 and total > max_tokens:
+        removed_unit = units.pop(0)
+        for m in removed_unit:
+            total -= _estimate_tokens(str(getattr(m, "content", "") or ""))
+        dropped += len(removed_unit)
+
+    result = [m for unit in units for m in unit]
     return result, dropped
+
+
+async def _persist_assistant_turn(
+    *,
+    session_obj_id,
+    task_id,
+    result: "AgentResult",
+    message: str,
+    is_new_session: bool,
+    session_title: str,
+    task_status: str,
+) -> None:
+    """Save the assistant message + close out the task, on every exit path.
+
+    Previously this only ran on the success path — GraphRecursionError and
+    generic-exception branches skipped it entirely, so a task that errored
+    out stayed ``status="running"`` forever (the overview panel would show
+    a phantom "in progress" task that never finishes) and any partial reply
+    already streamed to the user was lost from history on refresh.
+    """
+    # A block can still be "running" here if the client disconnected
+    # mid-tool-call (the success path's `if await request.is_disconnected():
+    # break` stops consuming events without waiting for on_tool_end) or the
+    # stream errored out between on_tool_start and on_tool_end. Left as-is,
+    # that tool card would render a permanent spinner every time this
+    # message is reloaded from history — resolve it to a neutral terminal
+    # state instead.
+    persisted_tool_blocks = [
+        {k: v for k, v in block.items() if not k.startswith("_")}
+        if block.get("status") != "running"
+        else {
+            **{k: v for k, v in block.items() if not k.startswith("_")},
+            "status": "done",
+            "success": False,
+            "summary": "连接中断，执行结果未知",
+        }
+        for block in result.tool_blocks
+    ] if result.tool_blocks else None
+    async with async_session_factory() as db:
+        assistant_msg = AgentMessage(
+            session_id=session_obj_id,
+            role="assistant",
+            content=result.full_content,
+            thinking=None,
+            tool_blocks=persisted_tool_blocks,
+        )
+        db.add(assistant_msg)
+        await db.flush()
+
+        # AI-generated session title (only worth it if the turn actually
+        # produced content — skip on empty/failed turns).
+        if (is_new_session or session_title == "新对话") and result.full_content:
+            try:
+                title_prompt = (
+                    f"根据以下对话内容，生成一个简短的标题（10个字以内，不要引号）：\n"
+                    f"用户：{message[:200]}\nAI：{result.full_content[:200]}"
+                )
+                title_resp = await get_llm_client().chat.completions.create(
+                    model=settings.deepseek_model,
+                    messages=[{"role": "user", "content": title_prompt}],
+                    temperature=0.7,
+                    max_tokens=32,
+                )
+                new_title = title_resp.choices[0].message.content.strip().strip('"').strip("'")
+                if new_title and len(new_title) > 1:
+                    sess_result = await db.execute(
+                        select(AgentSession).where(AgentSession.id == session_obj_id)
+                    )
+                    sess = sess_result.scalar_one_or_none()
+                    if sess:
+                        sess.title = new_title[:50]
+                        await db.flush()
+            except Exception:
+                pass
+
+        # Update task status
+        if task_id is not None:
+            task_result = await db.execute(select(AgentTask).where(AgentTask.id == task_id))
+            task_obj = task_result.scalar_one_or_none()
+            if task_obj:
+                task_obj.status = task_status
+                task_obj.progress = 100 if task_status == "done" else task_obj.progress
+                task_obj.finished_at = datetime.utcnow()
+
+        await db.commit()
 
 
 async def _verify_executor(tool_name: str, params: dict) -> str:
@@ -92,24 +201,6 @@ async def _verify_executor(tool_name: str, params: dict) -> str:
         return await _execute_tool_sync(tool_name, **params)
     except Exception as e:
         return f"验证查询失败: {e}"
-
-
-def iso_utc(dt: Optional[datetime]) -> str:
-    """Serialize naive UTC datetime with trailing Z so browsers parse correctly.
-
-    ``datetime.utcnow()`` / DB columns are naive UTC. ``isoformat()`` alone
-    yields ``2026-07-19T06:00:00`` which JS treats as *local* time — in CST
-    (UTC+8) a just-created session then shows as 「8 小时前」.
-    """
-    if not dt:
-        return ""
-    text = dt.isoformat()
-    if text.endswith("Z") or text.endswith("+00:00"):
-        return text
-    # Already has an offset like +08:00
-    if len(text) >= 6 and text[-6] in "+-" and text[-3] == ":":
-        return text
-    return text + "Z"
 
 
 def serialize_session(s: AgentSession) -> dict:
@@ -140,15 +231,17 @@ def serialize_project(p: AgentProject, session_count: int = 0) -> dict:
 async def _build_global_overview(db: AsyncSession) -> dict:
     """Workspace overview for all projects (global recruitment stats)."""
     job_hunting = (await db.execute(
-        select(func.count()).select_from(Candidate).where(Candidate.status == "job_hunting")
+        select(func.count()).select_from(Candidate).where(
+            Candidate.status.in_(["new", "parsed", "pending_screen"])
+        )
     )).scalar() or 0
     interview_count = (await db.execute(
         select(func.count()).select_from(Candidate).where(
-            Candidate.status.in_(["passed", "first_interview", "second_interview"])
+            Candidate.status.in_(["invited", "round1", "round2"])
         )
     )).scalar() or 0
     passed_count = (await db.execute(
-        select(func.count()).select_from(Candidate).where(Candidate.status == "passed")
+        select(func.count()).select_from(Candidate).where(Candidate.status == "invited")
     )).scalar() or 0
     position_count = (await db.execute(select(func.count()).select_from(Position))).scalar() or 0
 
@@ -235,7 +328,8 @@ async def _build_project_overview(db: AsyncSession, project_id: str) -> dict | N
         completed_tasks = (await db.execute(
             select(func.count()).select_from(AgentTask).where(
                 AgentTask.session_id.in_(session_ids),
-                AgentTask.status == "completed",
+                # chat 端点写入的完成态是 "done"（历史上曾误写 "completed" 导致统计恒 0）
+                AgentTask.status == "done",
             )
         )).scalar() or 0
         task_result = await db.execute(
@@ -578,9 +672,69 @@ async def get_session_messages(
                 "role": m.role,
                 "content": m.content,
                 "meta": m.handoffs if m.role == "user" and isinstance(m.handoffs, dict) else None,
+                "toolBlocks": m.tool_blocks if isinstance(m.tool_blocks, list) else None,
                 "createdAt": iso_utc(m.created_at),
             }
             for m in messages
+        ],
+    }
+
+
+@router.get("/ai-agent/sessions/{session_id}/materials")
+async def get_session_materials(
+    session_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """会话已上传素材列表（页面刷新后恢复右栏文件区）。"""
+    result = await db.execute(
+        select(AgentMaterial)
+        .where(AgentMaterial.session_id == session_id)
+        .order_by(AgentMaterial.uploaded_at)
+    )
+    materials = result.scalars().all()
+    return {
+        "code": 0,
+        "message": "ok",
+        "data": [
+            {
+                "id": str(m.id),
+                "name": m.name,
+                "type": m.type,
+                "ingested": bool(m.file_path and m.file_path.startswith("resumes/")),
+                "uploadedAt": iso_utc(m.uploaded_at),
+            }
+            for m in materials
+        ],
+    }
+
+
+@router.get("/ai-agent/sessions/{session_id}/tasks")
+async def get_session_tasks(
+    session_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """会话任务列表（右栏工作状态：最近任务与进行中任务）。"""
+    result = await db.execute(
+        select(AgentTask)
+        .where(AgentTask.session_id == session_id)
+        .order_by(desc(AgentTask.started_at))
+        .limit(20)
+    )
+    tasks = result.scalars().all()
+    return {
+        "code": 0,
+        "message": "ok",
+        "data": [
+            {
+                "id": str(t.id),
+                "title": t.title or "",
+                "description": t.description or "",
+                "progress": t.progress or 0,
+                "status": t.status or "",
+                "startedAt": iso_utc(t.started_at),
+                "finishedAt": iso_utc(t.finished_at),
+            }
+            for t in tasks
         ],
     }
 
@@ -676,13 +830,13 @@ async def materials_from_candidates(body: dict, db: AsyncSession = Depends(get_d
             "id": str(material.id),
             "name": material.name,
             "type": "resume",
-            "uploadedAt": material.uploaded_at.isoformat() if material.uploaded_at else "",
+            "uploadedAt": iso_utc(material.uploaded_at),
             "ingested": True,
             "candidateId": str(candidate.id),
             "position": candidate.position.name if candidate.position else "",
             "positionId": str(candidate.position_id) if candidate.position_id else "",
             "score": candidate.score or 0,
-            "status": candidate.status or "job_hunting",
+            "status": candidate.status or "new",
             "skills": [s.skill for s in (candidate.skills or [])],
         })
 
@@ -736,13 +890,13 @@ async def ingest_materials_batch(body: dict, db: AsyncSession = Depends(get_db))
             if candidate:
                 fast_items[mid] = {
                     "id": str(mat.id), "name": mat.name, "type": mat.type,
-                    "uploadedAt": mat.uploaded_at.isoformat() if mat.uploaded_at else "",
+                    "uploadedAt": iso_utc(mat.uploaded_at),
                     "ingested": True,
                     "candidateId": str(candidate.id),
                     "position": candidate.position.name if candidate.position else "",
                     "positionId": str(candidate.position_id) if candidate.position_id else "",
                     "score": candidate.score or 0,
-                    "status": candidate.status or "job_hunting",
+                    "status": candidate.status or "new",
                     "skills": [s.skill for s in (candidate.skills or [])],
                 }
                 continue
@@ -751,7 +905,7 @@ async def ingest_materials_batch(body: dict, db: AsyncSession = Depends(get_db))
         if mat.type not in ("resume", "file", "jd", "material"):
             fast_items[mid] = {
                 "id": str(mat.id), "name": mat.name, "type": mat.type,
-                "uploadedAt": mat.uploaded_at.isoformat() if mat.uploaded_at else "",
+                "uploadedAt": iso_utc(mat.uploaded_at),
                 "ingested": False,
             }
             continue
@@ -770,7 +924,7 @@ async def ingest_materials_batch(body: dict, db: AsyncSession = Depends(get_db))
         except Exception as e:
             fast_items[mid] = {
                 "id": str(mat.id), "name": mat.name, "type": mat.type,
-                "uploadedAt": mat.uploaded_at.isoformat() if mat.uploaded_at else "",
+                "uploadedAt": iso_utc(mat.uploaded_at),
                 "ingested": False,
                 "analysis": {"summary": f"读取文件失败: {e}"},
             }
@@ -810,7 +964,7 @@ async def ingest_materials_batch(body: dict, db: AsyncSession = Depends(get_db))
                                 "position": candidate.position.name if candidate.position else "",
                                 "positionId": str(candidate.position_id) if candidate.position_id else "",
                                 "score": candidate.score or 0,
-                                "status": candidate.status or "job_hunting",
+                                "status": candidate.status or "new",
                                 "skills": [s.skill for s in (candidate.skills or [])],
                             })
                         await task_db.commit()
@@ -831,7 +985,7 @@ async def ingest_materials_batch(body: dict, db: AsyncSession = Depends(get_db))
                                 "position": candidate.position.name if candidate.position else "",
                                 "positionId": str(candidate.position_id) if candidate.position_id else "",
                                 "score": candidate.score or 0,
-                                "status": candidate.status or "job_hunting",
+                                "status": candidate.status or "new",
                                 "skills": [s.skill for s in (candidate.skills or [])],
                             })
                         await task_db.commit()
@@ -900,7 +1054,8 @@ async def upload_material(
     file: UploadFile = File(None),
     knowledgeId: str = Form(None),
     knowledgeName: str = Form(None),
-  autoIngest: str = Form("true"),
+    autoIngest: str = Form("true"),
+    sessionId: str = Form(None),
     db: AsyncSession = Depends(get_db),
 ):
     """Upload a material (resume/document/knowledge) for the current session.
@@ -913,11 +1068,19 @@ async def upload_material(
     Non-resume files are stored as session attachments with a plain AI analysis preview.
     """
     should_ingest = autoIngest.strip().lower() not in ("false", "0", "no")
-    # Get or create session
-    session_result = await db.execute(
-        select(AgentSession).order_by(desc(AgentSession.updated_at)).limit(1)
-    )
-    session = session_result.scalar_one_or_none()
+    # Get or create session — prefer the explicit sessionId from the caller
+    # (falling back to "latest session" keeps老前端兼容，但有并发竞态)
+    session = None
+    if sessionId:
+        try:
+            session = await db.get(AgentSession, uuid.UUID(sessionId))
+        except ValueError:
+            session = None
+    if not session:
+        session_result = await db.execute(
+            select(AgentSession).order_by(desc(AgentSession.updated_at)).limit(1)
+        )
+        session = session_result.scalar_one_or_none()
     if not session:
         session = AgentSession(title="新对话", agent_id="recruit")
         db.add(session)
@@ -937,7 +1100,7 @@ async def upload_material(
             "code": 0, "message": "ok",
             "data": {
                 "id": str(material.id), "name": material.name, "type": material.type,
-                "uploadedAt": material.uploaded_at.isoformat() if material.uploaded_at else "",
+                "uploadedAt": iso_utc(material.uploaded_at),
                 "analysis": None,
             },
         }
@@ -1056,7 +1219,7 @@ async def upload_material(
         candidate = Candidate(
             name=parsed.get("name") or filename,
             position_id=resolved_position_id,
-            status="job_hunting",
+            status="new",
             resume_file=object_key,
             upload_time=date.today(),
         )
@@ -1102,7 +1265,7 @@ async def upload_material(
                 "position": position_name,
                 "positionId": resolved_position_id,
                 "score": candidate.score or 0,
-                "status": candidate.status or "job_hunting",
+                "status": candidate.status or "new",
                 "skills": [s.skill for s in (candidate.skills or [])],
             }
 
@@ -1122,7 +1285,7 @@ async def upload_material(
                 "id": str(material.id),
                 "name": material.name,
                 "type": "resume",
-                "uploadedAt": material.uploaded_at.isoformat() if material.uploaded_at else "",
+                "uploadedAt": iso_utc(material.uploaded_at),
                 "ingested": True,
                 **resp_data,
             },
@@ -1173,7 +1336,7 @@ async def upload_material(
         "data": {
             "id": str(material.id), "name": material.name, "type": material.type,
             "knowledgeId": str(material.knowledge_id) if material.knowledge_id else None,
-            "uploadedAt": material.uploaded_at.isoformat() if material.uploaded_at else "",
+            "uploadedAt": iso_utc(material.uploaded_at),
             "ingested": False,
             "analysis": analysis,
         },
@@ -1422,7 +1585,7 @@ async def agent_chat(
                 yield sse_event("meta", {"traceId": trace_id, "sessionId": str(session_id)})
 
             # Send initial thinking
-            thinking_text = "好的，我先看看你的需求…"
+            thinking_text = "正在思考…"
             yield sse_event("thinking", {"text": thinking_text, "append": False})
 
             # Create task for tracking (short-lived session)
@@ -1522,52 +1685,15 @@ async def agent_chat(
                 pass
 
             # Save assistant message + update task (short-lived session)
-            async with async_session_factory() as db:
-                assistant_msg = AgentMessage(
-                    session_id=session_obj_id,
-                    role="assistant",
-                    content=result.full_content,
-                    thinking=None,
-                    tool_blocks=result.tool_blocks if result.tool_blocks else None,
-                )
-                db.add(assistant_msg)
-                await db.flush()
-
-                # AI-generated session title
-                if is_new_session or session_title == "新对话":
-                    try:
-                        title_prompt = (
-                            f"根据以下对话内容，生成一个简短的标题（10个字以内，不要引号）：\n"
-                            f"用户：{message[:200]}\nAI：{result.full_content[:200]}"
-                        )
-                        title_resp = await get_llm_client().chat.completions.create(
-                            model=settings.deepseek_model,
-                            messages=[{"role": "user", "content": title_prompt}],
-                            temperature=0.7,
-                            max_tokens=32,
-                        )
-                        new_title = title_resp.choices[0].message.content.strip().strip('"').strip("'")
-                        if new_title and len(new_title) > 1:
-                            sess_result = await db.execute(
-                                select(AgentSession).where(AgentSession.id == session_obj_id)
-                            )
-                            sess = sess_result.scalar_one_or_none()
-                            if sess:
-                                sess.title = new_title[:50]
-                                await db.flush()
-                    except Exception:
-                        pass
-
-                # Update task status
-                if task_id is not None:
-                    task_result = await db.execute(select(AgentTask).where(AgentTask.id == task_id))
-                    task_obj = task_result.scalar_one_or_none()
-                    if task_obj:
-                        task_obj.status = "done"
-                        task_obj.progress = 100
-                        task_obj.finished_at = datetime.utcnow()
-
-                await db.commit()
+            await _persist_assistant_turn(
+                session_obj_id=session_obj_id,
+                task_id=task_id,
+                result=result,
+                message=message,
+                is_new_session=is_new_session,
+                session_title=session_title,
+                task_status="done",
+            )
 
             yield sse_event("phase_result", {
                 "id": f"phase_{uuid.uuid4().hex[:6]}",
@@ -1606,12 +1732,47 @@ async def agent_chat(
             # Task needed more tool-calling rounds than the recursion budget.
             # Any prior writes already committed; give the user a readable note
             # instead of a raw stack-trace-style error.
-            yield sse_event("content", {"delta": (
+            note = (
                 "\n\n（这个任务步骤较多，我已尽力执行到当前进度。"
                 "如果还没完成，请把剩下的部分再说一次，我接着做。）"
-            )})
+            )
+            result.full_content += note
+            yield sse_event("content", {"delta": note})
+            try:
+                await _persist_assistant_turn(
+                    session_obj_id=session_obj_id,
+                    task_id=task_id,
+                    result=result,
+                    message=message,
+                    is_new_session=is_new_session,
+                    session_title=session_title,
+                    task_status="done",
+                )
+            except Exception:
+                # Best-effort — the user already saw the note above even if
+                # persistence fails, so don't turn this into a hard error.
+                pass
             yield sse_event("done", {})
         except Exception as e:
+            # Persist whatever partial reply/tool results were streamed
+            # before the failure, and close out the task as "failed" instead
+            # of leaving it stuck at "running" forever (previously this
+            # branch skipped persistence entirely — see _persist_assistant_turn
+            # docstring).
+            if not result.full_content:
+                result.full_content = "（抱歉，这次回复出现异常，请重试。）"
+            try:
+                await _persist_assistant_turn(
+                    session_obj_id=session_obj_id,
+                    task_id=task_id,
+                    result=result,
+                    message=message,
+                    is_new_session=is_new_session,
+                    session_title=session_title,
+                    task_status="failed",
+                )
+            except Exception:
+                pass
             yield sse_event("error", {"message": str(e)})
 
     return StreamingResponse(

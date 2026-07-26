@@ -71,6 +71,10 @@ class Candidate(Base):
     position_id = Column(UUID(as_uuid=True), ForeignKey("positions.id"))
     score = Column(Integer, default=0)
     status = Column(String(32), nullable=False, default="new")
+    # 合法值与迁移见 app/core/state_machine.py TRANSITIONS["candidate"]:
+    # new / parsed / pending_screen / pending_materials / invited /
+    # round1 / round2 / pending_offer / hired / talent_pool / rejected
+    # 一律通过 core.state_machine.transition() 变更，不允许直接赋值。
     resume_file = Column(String(512))
     resume_file_hash = Column(String(64), nullable=True, index=True)
     upload_time = Column(Date, default=date.today)

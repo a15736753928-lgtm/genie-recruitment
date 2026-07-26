@@ -204,7 +204,7 @@ def _run_migrations(connection):
     # v3: 知识文档来源追踪（简历级联删除）
     _add_column_if_missing(connection, "knowledge_documents", "source_type", "VARCHAR(32) DEFAULT ''")
     _add_column_if_missing(connection, "knowledge_documents", "source_id", "VARCHAR(64) DEFAULT ''")
-    # v4: 修正历史脏状态 low_match —— 该状态不在前端合法状态枚举内，恢复为「求职中」
+    # v4: 修正历史脏状态 low_match —— 该状态不在状态机合法词表内，恢复为「待筛选」
     _cleanup_low_match_status(connection)
     # v5: 面试题来源标记（pre_generated/transcript），区分面试出题与面试评定抽取的题目
     _add_column_if_missing(connection, "interview_questions", "source", "VARCHAR(16) NOT NULL DEFAULT 'pre_generated'")
@@ -247,6 +247,9 @@ def _run_migrations(connection):
     _migrate_v14_recruitment_form(connection)
     # v15: 直属负责人支持姓名填写（UUID 可选）
     _migrate_v15_direct_manager_name(connection)
+    # v16: 候选人状态词表统一——历史上曾有两套并行词表(状态机词表 vs AI/简历模块词表)
+    # 同表混存，见 app/core/state_machine.py TRANSITIONS["candidate"] 的注释。
+    _migrate_v16_candidate_status_vocabulary(connection)
 
 
 def _migrate_v15_direct_manager_name(connection) -> None:
@@ -338,10 +341,11 @@ def _migrate_transcript_history(connection) -> None:
 
 
 def _cleanup_low_match_status(connection) -> None:
-    """把 candidates.status = 'low_match' 的历史脏数据恢复为 'job_hunting'。
+    """把 candidates.status = 'low_match' 的历史脏数据恢复为 'pending_screen'。
 
-    low_match 曾被用作 AI 评分低于阈值时的标记，但它不在前端简历状态下拉枚举中，
-    会在界面上原样显示成英文串。低匹配信息已通过 screening_ai_score/score 保留，
+    low_match 曾被用作 AI 评分低于阈值时的标记，但它不在状态机合法词表
+    （app/core/state_machine.py TRANSITIONS["candidate"]）中，会在界面上
+    原样显示成英文串。低匹配信息已通过 screening_ai_score/score 保留，
     状态本身回归合法值即可。
     """
     from sqlalchemy import text
@@ -356,8 +360,58 @@ def _cleanup_low_match_status(connection) -> None:
         return
 
     connection.execute(text(
-        "UPDATE candidates SET status = 'job_hunting' WHERE status = 'low_match'"
+        "UPDATE candidates SET status = 'pending_screen' WHERE status = 'low_match'"
     ))
+
+
+def _migrate_v16_candidate_status_vocabulary(connection) -> None:
+    """把 candidates.status 里残留的旧词表值统一改写为状态机合法词表。
+
+    历史上 AI 对话模块 / 简历上传接口曾使用另一套词表
+    （job_hunting/passed/first_interview/second_interview/failed/expired），
+    与 app/core/state_machine.py 的状态机词表
+    （new/parsed/pending_screen/invited/round1/round2/pending_offer/hired/
+    talent_pool/rejected）同表混存。此外还有更早的历史遗留值
+    （pending_interview/onboarded/probation/offer_pending，其中 offer_pending
+    是 pending_offer 的拼写颠倒）。这些非法值不在状态机迁移表内，会导致：
+    - 前端状态徽章渲染为 undefined（标签表只认状态机词表）
+    - AI 上传的简历进不了筛选流程（scoring.py 只放行 new/parsed）
+    - 二面通过的候选人进不了录用审批（offer.py 要求 pending_offer）
+    此迁移是幂等的，每次启动都会执行，不会影响已经是合法值的行。
+
+    passed 的映射存在语义上的一次性判断：本项目 AI 提示词(prompts/system.txt)
+    明确 passed 表示"初筛已通过"而非"全部面试通过/已入职"，故统一映射为
+    invited（初筛通过待安排面试），而不是 hired。
+    """
+    from sqlalchemy import text
+
+    table_exists = connection.execute(text(
+        "SELECT EXISTS ("
+        "  SELECT 1 FROM information_schema.tables"
+        "  WHERE table_schema = 'public' AND table_name = 'candidates'"
+        ")"
+    )).scalar()
+    if not table_exists:
+        return
+
+    # 旧值 -> 状态机合法值。执行顺序无关紧要，每条各自独立生效。
+    mapping = {
+        "job_hunting": "pending_screen",
+        "passed": "invited",
+        "first_interview": "round1",
+        "second_interview": "round2",
+        "failed": "rejected",
+        "expired": "rejected",
+        "pending_interview": "invited",
+        "onboarded": "hired",
+        "probation": "hired",
+        "offer_pending": "pending_offer",
+    }
+    for old_status, new_status in mapping.items():
+        connection.execute(
+            text("UPDATE candidates SET status = :new_status WHERE status = :old_status"),
+            {"new_status": new_status, "old_status": old_status},
+        )
 
 
 def _migrate_interview_questions_unique_constraint(connection) -> None:
