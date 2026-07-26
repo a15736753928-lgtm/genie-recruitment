@@ -74,22 +74,19 @@ def decode_token(token: str) -> dict:
         raise AuthError(f"令牌无效或已过期: {e}")
 
 
-# ── 异常(全局 handler 捕获 -> HTTP 401 信封) ──
+# ── 异常(全局 handler 捕获 -> HTTP 401/403 信封) ──
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 class AuthError(StarletteHTTPException):
     """鉴权失败异常。继承 Starlette HTTPException，FastAPI 框架层原生拦截，
     不会被 ExceptionGroup 包装后泄漏到 uvicorn ERROR 日志。"""
     def __init__(self, message: str = "未登录或登录已过期"):
-        self.message = message
         super().__init__(status_code=401, detail=message)
 
 
 class PermissionError_(StarletteHTTPException):
-    """无权限异常。继承 Starlette HTTPException，FastAPI 框架层原生拦截，
-    不会被 ExceptionGroup 包装后泄漏到 uvicorn ERROR 日志。"""
+    """无权限 → HTTP 403 信封（拦截机制同 AuthError）。"""
     def __init__(self, message: str = "无权限执行此操作"):
-        self.message = message
         super().__init__(status_code=403, detail=message)
 
 
@@ -177,7 +174,7 @@ async def get_current_user(
 
 
 def require_permission(*keys: str):
-    """写接口权限守卫。缺任一权限 -> PermissionError_(端点层 -> code:403)。
+    """写接口权限守卫。缺任一权限 -> PermissionError_(全局 handler -> HTTP 403 信封)。
 
     持 WILDCARD_PERMISSION(system:manage,即 admin)放行一切。
     """

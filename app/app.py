@@ -205,25 +205,15 @@ app.add_middleware(
 from app.core.security import AuthError, PermissionError_
 
 @app.exception_handler(AuthError)
-async def auth_error_handler(request: Request, exc: AuthError):
-    """AuthError（鉴权失败）→ HTTP 401 信封。
+@app.exception_handler(PermissionError_)
+async def api_error_handler(request: Request, exc):
+    """AuthError(401) / PermissionError_(403) → 统一 JSON 信封。
 
     作为 HTTPException 子类的专用 handler，FastAPI 在依赖注入阶段即可原生拦截，
     不会被 ExceptionGroup 包装后泄漏到 uvicorn ERROR 日志。"""
     return JSONResponse(
-        status_code=401,
-        content={"code": 401, "message": exc.message, "data": None},
-    )
-
-
-@app.exception_handler(PermissionError_)
-async def permission_error_handler(request: Request, exc: PermissionError_):
-    """PermissionError_（无权限）→ HTTP 403 信封。
-
-    继承 Starlette HTTPException，框架层原生拦截，不会泄漏到 uvicorn ERROR。"""
-    return JSONResponse(
-        status_code=403,
-        content={"code": 403, "message": exc.message, "data": None},
+        status_code=exc.status_code,
+        content={"code": exc.status_code, "message": exc.detail, "data": None},
     )
 
 
