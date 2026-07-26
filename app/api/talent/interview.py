@@ -195,8 +195,8 @@ async def generate_questions_with_llm(
 def extract_text(file_path: str) -> str:
     ext = os.path.splitext(file_path)[1].lower()
     if ext == '.pdf':
-        from PyPDF2 import PdfReader
-        return "\n".join(page.extract_text() or "" for page in PdfReader(file_path).pages)
+        import fitz
+        return "\n".join(page.get_text() for page in fitz.open(file_path))
     elif ext in ('.docx', '.doc'):
         from docx import Document
         return "\n".join(p.text for p in Document(file_path).paragraphs)

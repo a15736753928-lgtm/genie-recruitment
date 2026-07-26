@@ -3,7 +3,7 @@
 Blueprint: file → parse (fast → render → OCR) → clean → chunk → embed → store.
 
 Matches the reference RAG system's 3-layer approach:
-  1. Fast text extraction (PyPDF2 / python-docx)
+  1. Fast text extraction (PyMuPDF / python-docx)
   2. OCR fallback for images and low-text pages (RapidOCR)
   3. Merge results, preferring OCR when it produces more text
 
@@ -59,7 +59,7 @@ def _ocr_enabled() -> bool:
 def _extract_text(file_path: str) -> str:
     """Parse file to text with format-specific extractors.
 
-    Layer 1: Fast text extraction (PyPDF2, python-docx, raw read)
+    Layer 1: Fast text extraction (PyMuPDF, python-docx, raw read)
     Layer 2: OCR fallback for images and low-text documents
     Layer 3: Merge results
     """
@@ -109,21 +109,20 @@ def _extract_text_fast(path: str, ext: str) -> str:
 
 
 def _extract_pdf_text(path: str) -> str:
-    """Extract text from PDF using PyPDF2 (fast path)."""
+    """Extract text from PDF using PyMuPDF (fast path)."""
     try:
-        from PyPDF2 import PdfReader
-        reader = PdfReader(path)
+        import fitz
         texts = []
-        for page in reader.pages:
+        for page in fitz.open(path):
             try:
-                t = page.extract_text()
+                t = page.get_text()
                 if t:
                     texts.append(t.strip())
             except Exception:
                 pass
         return "\n\n".join(texts)
     except Exception as e:
-        logger.debug("PyPDF2 解析失败: %s", e)
+        logger.debug("PyMuPDF 解析失败: %s", e)
         return ""
 
 
@@ -155,15 +154,13 @@ def _ocr_pdf(path: str) -> str:
         return ""
 
     try:
-        from PyPDF2 import PdfReader
-        import fitz  # PyMuPDF for rendering
-        reader = PdfReader(path)
+        import fitz
         doc = fitz.open(path)
         texts = []
 
-        for i, page in enumerate(reader.pages):
+        for i, page in enumerate(doc):
             # Check if page already has good text
-            page_text = (page.extract_text() or "").strip()
+            page_text = (page.get_text() or "").strip()
             if len(page_text) >= _OCR_FALLBACK_THRESHOLD:
                 texts.append(page_text)
                 continue

@@ -74,14 +74,18 @@ def _pick_portrait(candidates: List[bytes]) -> Optional[bytes]:
 
 
 def _extract_images_from_pdf(file_path: str) -> List[bytes]:
-    from PyPDF2 import PdfReader
+    import fitz
 
     images: List[bytes] = []
-    reader = PdfReader(file_path)
-    for page in reader.pages[:2]:
-        for image in getattr(page, "images", []):
-            if getattr(image, "data", None):
-                images.append(image.data)
+    doc = fitz.open(file_path)
+    for page in doc[:2]:
+        for img in page.get_images():
+            try:
+                base = doc.extract_image(img[0])
+                if base and base.get("image"):
+                    images.append(base["image"])
+            except Exception:
+                pass
     return images
 
 

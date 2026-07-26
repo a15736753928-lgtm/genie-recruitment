@@ -189,8 +189,8 @@ def extract_file_text(file_path: str) -> str:
             return ""
         ext = os.path.splitext(local)[1].lower()
         if ext == '.pdf':
-            from PyPDF2 import PdfReader
-            return "\n".join(page.extract_text() or "" for page in PdfReader(local).pages)
+            import fitz
+            return "\n".join(page.get_text() for page in fitz.open(local))
         elif ext in ('.docx', '.doc'):
             from docx import Document
             return "\n".join(p.text for p in Document(local).paragraphs)

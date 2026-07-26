@@ -55,10 +55,8 @@ def extract_text_from_file(file_path: str) -> Tuple[str, Optional[str]]:
         ext = os.path.splitext(resolved)[1].lower()
         try:
             if ext == ".pdf":
-                from PyPDF2 import PdfReader
-                reader = PdfReader(resolved)
-                pages = [page.extract_text() or "" for page in reader.pages]
-                text = "\n".join(pages).strip()
+                import fitz
+                text = "\n".join(page.get_text() for page in fitz.open(resolved)).strip()
                 if not text:
                     return "", "PDF 未提取到文本，可能是扫描件或图片简历，请上传可搜索文本的 PDF"
                 return text, None

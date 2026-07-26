@@ -109,35 +109,34 @@ def create_database_if_missing():
     target_db = params["dbname"]
 
     # 连接默认 postgres 库
-    import psycopg2
+    async def _create():
+        import asyncpg
 
-    try:
-        conn = psycopg2.connect(
-            host=params["host"],
-            port=params["port"],
-            user=params["user"],
-            password=params["password"],
-            dbname="postgres",
-        )
-        conn.autocommit = True
-        cur = conn.cursor()
+        try:
+            conn = await asyncpg.connect(
+                host=params["host"],
+                port=params["port"],
+                user=params["user"],
+                password=params["password"],
+                database="postgres",
+            )
+            try:
+                exists = await conn.fetchval(
+                    "SELECT 1 FROM pg_database WHERE datname = $1", target_db
+                )
+                if exists:
+                    print(f"✓ 数据库 '{target_db}' 已存在，跳过创建")
+                else:
+                    await conn.execute(f'CREATE DATABASE "{target_db}"')
+                    print(f"✓ 数据库 '{target_db}' 创建成功")
+            finally:
+                await conn.close()
+        except Exception as e:
+            print(f"[错误] 无法连接 PostgreSQL: {e}")
+            print("  请确保 PostgreSQL 已启动，且 .env 中连接信息正确")
+            sys.exit(1)
 
-        # 检查目标库是否存在
-        cur.execute(
-            "SELECT 1 FROM pg_database WHERE datname = %s", (target_db,)
-        )
-        if cur.fetchone():
-            print(f"✓ 数据库 '{target_db}' 已存在，跳过创建")
-        else:
-            cur.execute(f'CREATE DATABASE "{target_db}"')
-            print(f"✓ 数据库 '{target_db}' 创建成功")
-
-        cur.close()
-        conn.close()
-    except psycopg2.OperationalError as e:
-        print(f"[错误] 无法连接 PostgreSQL: {e}")
-        print("  请确保 PostgreSQL 已启动，且 .env 中连接信息正确")
-        sys.exit(1)
+    asyncio.run(_create())
 
 
 # ══════════════════════════════════════════════════════════════
@@ -247,7 +246,6 @@ def check_dependencies():
     missing = []
     for mod, pkg in [
         ("sqlalchemy", "sqlalchemy"),
-        ("psycopg2", "psycopg2-binary"),
         ("asyncpg", "asyncpg"),
         ("pydantic_settings", "pydantic-settings"),
         ("minio", "minio"),
