@@ -13,7 +13,7 @@ import asyncio
 from datetime import datetime, date
 from typing import Optional, List, AsyncGenerator, Any
 from fastapi import APIRouter, Depends, File, Form, Query, UploadFile, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc, func
 from sqlalchemy.orm import selectinload
@@ -24,6 +24,8 @@ from app.database import get_db, async_session_factory
 from app.utils.clock import iso_utc
 from app.models.agent_session import AgentProject, AgentSession, AgentMessage, AgentMaterial, AgentTask
 from app.models.recruitment import Candidate, Position
+from app.core.security import get_current_user, CurrentUser
+from app.core.permissions import WILDCARD_PERMISSION
 from app.agent.tools import create_langchain_tools
 from app.agent.graph import build_agent_graph, stream_agent_response, AgentResult
 from langgraph.errors import GraphRecursionError
@@ -204,12 +206,52 @@ async def _verify_executor(tool_name: str, params: dict) -> str:
         return f"验证查询失败: {e}"
 
 
+def _can_see_all(current: CurrentUser) -> bool:
+    """admin 凭 system:manage 通配可见全部对话（运维/审计）。其他人只见自己。"""
+    return WILDCARD_PERMISSION in current.permissions
+
+
+async def _get_owned_session(
+    db: AsyncSession, session_id: str, current: CurrentUser
+) -> AgentSession | None:
+    """取会话并校验归属。不属本人且非 admin → None（端点据此返 404，不返 403 防探测）。"""
+    try:
+        sid = uuid.UUID(session_id)
+    except (ValueError, TypeError):
+        return None
+    result = await db.execute(select(AgentSession).where(AgentSession.id == sid))
+    session = result.scalar_one_or_none()
+    if session is None:
+        return None
+    if session.owner_id is not None and session.owner_id != current.id and not _can_see_all(current):
+        return None
+    return session
+
+
+async def _get_owned_project(
+    db: AsyncSession, project_id: str, current: CurrentUser
+) -> AgentProject | None:
+    """取会话文件夹并校验归属。不属本人且非 admin → None。"""
+    try:
+        pid = uuid.UUID(project_id)
+    except (ValueError, TypeError):
+        return None
+    result = await db.execute(select(AgentProject).where(AgentProject.id == pid))
+    project = result.scalar_one_or_none()
+    if project is None:
+        return None
+    if project.owner_id is not None and project.owner_id != current.id and not _can_see_all(current):
+        return None
+    return project
+
+
 def serialize_session(s: AgentSession) -> dict:
     return {
         "id": str(s.id),
         "title": s.title or "新对话",
         "agentId": s.agent_id,
         "projectId": str(s.project_id) if s.project_id else None,
+        "ownerId": str(s.owner_id) if s.owner_id else None,
         "createdAt": iso_utc(s.created_at),
         "updatedAt": iso_utc(s.updated_at),
     }
@@ -220,6 +262,7 @@ def serialize_project(p: AgentProject, session_count: int = 0) -> dict:
         "id": str(p.id),
         "name": p.name,
         "sessionCount": session_count,
+        "ownerId": str(p.owner_id) if p.owner_id else None,
         "createdAt": iso_utc(p.created_at),
         "updatedAt": iso_utc(p.updated_at),
     }
@@ -229,8 +272,12 @@ def serialize_project(p: AgentProject, session_count: int = 0) -> dict:
 #  API Endpoints
 # ═══════════════════════════════════════════════════════════
 
-async def _build_global_overview(db: AsyncSession) -> dict:
-    """Workspace overview for all projects (global recruitment stats)."""
+async def _build_global_overview(db: AsyncSession, current: CurrentUser) -> dict:
+    """Workspace overview for all projects (global recruitment stats).
+
+    业务统计数字（待筛简历等）保持全局；active_task 收窄到 current 可见会话范围，
+    避免把别人的进行中任务显示在工作台。
+    """
     pending_screen = (await db.execute(
         select(func.count()).select_from(Candidate).where(
             Candidate.status.in_(["new", "parsed", "pending_screen", "pending_materials"])
@@ -248,9 +295,12 @@ async def _build_global_overview(db: AsyncSession) -> dict:
     )).scalar() or 0
     position_count = (await db.execute(select(func.count()).select_from(Position))).scalar() or 0
 
-    task_result = await db.execute(
-        select(AgentTask).where(AgentTask.status == "running").limit(1)
-    )
+    task_q = select(AgentTask).where(AgentTask.status == "running")
+    if not _can_see_all(current):
+        task_q = task_q.join(
+            AgentSession, AgentSession.id == AgentTask.session_id
+        ).where(AgentSession.owner_id == current.id)
+    task_result = await db.execute(task_q.limit(1))
     active_task = task_result.scalar_one_or_none()
 
     return {
@@ -292,11 +342,14 @@ async def _build_global_overview(db: AsyncSession) -> dict:
     }
 
 
-async def _build_project_overview(db: AsyncSession, project_id: str) -> dict | None:
+async def _build_project_overview(db: AsyncSession, project_id: str, current: CurrentUser) -> dict | None:
     """Workspace overview scoped to one project folder."""
     result = await db.execute(select(AgentProject).where(AgentProject.id == project_id))
     project = result.scalar_one_or_none()
     if not project:
+        return None
+    # 项目归属校验——非本人且非 admin 视为不存在（同 session 一律 404 防探测）
+    if project.owner_id is not None and project.owner_id != current.id and not _can_see_all(current):
         return None
 
     session_rows = await db.execute(
@@ -342,7 +395,7 @@ async def _build_project_overview(db: AsyncSession, project_id: str) -> dict | N
         )
         active_task = task_result.scalar_one_or_none()
 
-    base = await _build_global_overview(db)
+    base = await _build_global_overview(db, current)
     base["projectId"] = str(project.id)
     base["projectName"] = project.name
     base["workflowSteps"] = [
@@ -380,20 +433,24 @@ async def _build_project_overview(db: AsyncSession, project_id: str) -> dict | N
 async def get_ai_agent_overview(
     projectId: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(get_current_user),
 ):
     """Workspace overview, optionally scoped to a project folder."""
     if projectId:
-        data = await _build_project_overview(db, projectId)
+        data = await _build_project_overview(db, projectId, current)
         if data is None:
             return not_found("项目不存在")
     else:
-        data = await _build_global_overview(db)
+        data = await _build_global_overview(db, current)
 
     return ok(data)
 
 
 @router.get("/ai-agent/welcome-prompts")
-async def get_welcome_prompts(db: AsyncSession = Depends(get_db)):
+async def get_welcome_prompts(
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(get_current_user),
+):
     """欢迎页快捷入口推荐（只读缓存，对用户无感）。
 
     推荐由后台定时任务默默刷新（见 app lifespan 中的 welcome_prompts job），
@@ -408,12 +465,16 @@ async def get_welcome_prompts(db: AsyncSession = Depends(get_db)):
 @router.get("/ai-agent/sessions")
 async def list_sessions(
     db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(get_current_user),
 ):
-    result = await db.execute(
+    q = (
         select(AgentSession)
         .order_by(desc(AgentSession.updated_at))
         .limit(50)
     )
+    if not _can_see_all(current):
+        q = q.where(AgentSession.owner_id == current.id)
+    result = await db.execute(q)
     sessions = result.scalars().all()
     return ok([serialize_session(s) for s in sessions])
 
@@ -421,24 +482,31 @@ async def list_sessions(
 @router.get("/ai-agent/projects")
 async def list_projects(
     db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(get_current_user),
 ):
     """List agent conversation projects with session counts."""
     from sqlalchemy import func
 
+    see_all = _can_see_all(current)
     count_subq = (
         select(
             AgentSession.project_id.label("project_id"),
             func.count(AgentSession.id).label("session_count"),
         )
         .where(AgentSession.project_id.isnot(None))
-        .group_by(AgentSession.project_id)
-        .subquery()
     )
-    result = await db.execute(
+    if not see_all:
+        count_subq = count_subq.where(AgentSession.owner_id == current.id)
+    count_subq = count_subq.group_by(AgentSession.project_id).subquery()
+
+    q = (
         select(AgentProject, count_subq.c.session_count)
         .outerjoin(count_subq, AgentProject.id == count_subq.c.project_id)
         .order_by(desc(AgentProject.updated_at))
     )
+    if not see_all:
+        q = q.where(AgentProject.owner_id == current.id)
+    result = await db.execute(q)
     rows = result.all()
     return ok([
           serialize_project(project, int(session_count or 0))
@@ -454,6 +522,7 @@ class CreateProjectRequest(BaseModel):
 async def create_project(
     body: CreateProjectRequest,
     db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(get_current_user),
 ):
     name = (body.name or "").strip()
     if not name:
@@ -461,7 +530,7 @@ async def create_project(
     if len(name) > 64:
         return fail(400, "项目名称过长（最多 64 字）")
 
-    project = AgentProject(name=name)
+    project = AgentProject(name=name, owner_id=current.id)
     db.add(project)
     await db.flush()
     await db.refresh(project)
@@ -477,6 +546,7 @@ async def rename_project(
     project_id: str,
     body: RenameProjectRequest,
     db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(get_current_user),
 ):
     name = (body.name or "").strip()
     if not name:
@@ -484,10 +554,7 @@ async def rename_project(
     if len(name) > 64:
         return fail(400, "项目名称过长（最多 64 字）")
 
-    result = await db.execute(
-        select(AgentProject).where(AgentProject.id == project_id)
-    )
-    project = result.scalar_one_or_none()
+    project = await _get_owned_project(db, project_id, current)
     if not project:
         return not_found("项目不存在")
 
@@ -501,11 +568,9 @@ async def rename_project(
 async def delete_project(
     project_id: str,
     db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(get_current_user),
 ):
-    result = await db.execute(
-        select(AgentProject).where(AgentProject.id == project_id)
-    )
-    project = result.scalar_one_or_none()
+    project = await _get_owned_project(db, project_id, current)
     if not project:
         return not_found("项目不存在")
 
@@ -522,14 +587,12 @@ class CreateSessionRequest(BaseModel):
 async def create_session(
     body: Optional[CreateSessionRequest] = None,
     db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(get_current_user),
 ):
     """Create a new empty chat session."""
     project_id = None
     if body and body.projectId:
-        proj_result = await db.execute(
-            select(AgentProject).where(AgentProject.id == body.projectId)
-        )
-        project = proj_result.scalar_one_or_none()
+        project = await _get_owned_project(db, body.projectId, current)
         if not project:
             return not_found("项目不存在")
         project_id = project.id
@@ -538,6 +601,7 @@ async def create_session(
         title="新对话",
         agent_id="genie",
         project_id=project_id,
+        owner_id=current.id,
     )
     db.add(session)
     await db.flush()
@@ -555,19 +619,15 @@ async def create_session(
 async def delete_session(
     session_id: str,
     db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(get_current_user),
 ):
-    result = await db.execute(
-        select(AgentSession).where(
-            AgentSession.id == session_id,
-        )
-    )
-    session = result.scalar_one_or_none()
+    session = await _get_owned_session(db, session_id, current)
     if not session:
         return not_found("对话不存在")
 
     # Clean up MinIO objects for the session's materials before cascade delete
     mat_result = await db.execute(
-        select(AgentMaterial).where(AgentMaterial.session_id == session_id)
+        select(AgentMaterial).where(AgentMaterial.session_id == session.id)
     )
     for mat in mat_result.scalars().all():
         if mat.file_path and not (os.path.isabs(mat.file_path)):
@@ -587,12 +647,10 @@ async def patch_session(
     session_id: str,
     body: PatchSessionRequest,
     db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(get_current_user),
 ):
     """更新对话名称或所属项目。"""
-    result = await db.execute(
-        select(AgentSession).where(AgentSession.id == session_id)
-    )
-    session = result.scalar_one_or_none()
+    session = await _get_owned_session(db, session_id, current)
     if not session:
         return not_found("对话不存在")
 
@@ -608,10 +666,8 @@ async def patch_session(
         if body.projectId == "":
             session.project_id = None
         else:
-            proj_result = await db.execute(
-                select(AgentProject).where(AgentProject.id == body.projectId)
-            )
-            project = proj_result.scalar_one_or_none()
+            # 移入的文件夹必须也属本人/admin，否则对方能把对话塞进别人文件夹
+            project = await _get_owned_project(db, body.projectId, current)
             if not project:
                 return not_found("项目不存在")
             session.project_id = project.id
@@ -626,10 +682,15 @@ async def patch_session(
 async def get_session_messages(
     session_id: str,
     db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(get_current_user),
 ):
+    session = await _get_owned_session(db, session_id, current)
+    if not session:
+        return not_found("对话不存在")
+
     result = await db.execute(
         select(AgentMessage)
-        .where(AgentMessage.session_id == session_id)
+        .where(AgentMessage.session_id == session.id)
         .order_by(AgentMessage.created_at)
     )
     messages = result.scalars().all()
@@ -651,11 +712,16 @@ async def get_session_messages(
 async def get_session_materials(
     session_id: str,
     db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(get_current_user),
 ):
     """会话已上传素材列表（页面刷新后恢复右栏文件区）。"""
+    session = await _get_owned_session(db, session_id, current)
+    if not session:
+        return not_found("对话不存在")
+
     result = await db.execute(
         select(AgentMaterial)
-        .where(AgentMaterial.session_id == session_id)
+        .where(AgentMaterial.session_id == session.id)
         .order_by(AgentMaterial.uploaded_at)
     )
     materials = result.scalars().all()
@@ -675,11 +741,16 @@ async def get_session_materials(
 async def get_session_tasks(
     session_id: str,
     db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(get_current_user),
 ):
     """会话任务列表（右栏工作状态：最近任务与进行中任务）。"""
+    session = await _get_owned_session(db, session_id, current)
+    if not session:
+        return not_found("对话不存在")
+
     result = await db.execute(
         select(AgentTask)
-        .where(AgentTask.session_id == session_id)
+        .where(AgentTask.session_id == session.id)
         .order_by(desc(AgentTask.started_at))
         .limit(20)
     )
@@ -703,6 +774,7 @@ async def append_session_message(
     session_id: str,
     body: dict,
     db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(get_current_user),
 ):
     """Append a lightweight user/assistant notice (e.g. file-ingest progress) to a session."""
     role = (body.get("role") or "assistant").strip()
@@ -716,8 +788,12 @@ async def append_session_message(
         return fail(400, "sessionId 无效")
 
     session = await db.get(AgentSession, sid)
-    if not session:
-        session = AgentSession(id=sid, title="新对话", agent_id="genie")
+    if session:
+        # 已存在 → 校验归属（不属本人且非 admin 视为不存在）
+        if session.owner_id is not None and session.owner_id != current.id and not _can_see_all(current):
+            return not_found("对话不存在")
+    else:
+        session = AgentSession(id=sid, title="新对话", agent_id="genie", owner_id=current.id)
         db.add(session)
         await db.flush()
 
@@ -738,18 +814,24 @@ async def append_session_message(
 
 
 @router.post("/ai-agent/materials/from-candidates")
-async def materials_from_candidates(body: dict, db: AsyncSession = Depends(get_db)):
+async def materials_from_candidates(
+    body: dict,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(get_current_user),
+):
     """Attach already-ingested candidates as AgentMaterial for the active session."""
     candidate_ids = body.get("candidateIds") or []
     if not candidate_ids:
         return fail(400, "请提供 candidateIds")
 
-    session_result = await db.execute(
-        select(AgentSession).order_by(desc(AgentSession.updated_at)).limit(1)
-    )
+    # 取"最新会话"必须收窄到本人，否则会把材料挂到别人的会话上
+    session_q = select(AgentSession).order_by(desc(AgentSession.updated_at)).limit(1)
+    if not _can_see_all(current):
+        session_q = session_q.where(AgentSession.owner_id == current.id)
+    session_result = await db.execute(session_q)
     session = session_result.scalar_one_or_none()
     if not session:
-        session = AgentSession(title="新对话", agent_id="recruit")
+        session = AgentSession(title="新对话", agent_id="recruit", owner_id=current.id)
         db.add(session)
         await db.flush()
 
@@ -799,7 +881,11 @@ async def materials_from_candidates(body: dict, db: AsyncSession = Depends(get_d
 
 
 @router.post("/ai-agent/materials/ingest-batch")
-async def ingest_materials_batch(body: dict, db: AsyncSession = Depends(get_db)):
+async def ingest_materials_batch(
+    body: dict,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(get_current_user),
+):
     """Ingest previously staged session attachments (agent/* keys) into resume DB.
 
     并发度 3：每个待入库文件走独立 DB session 并行处理，互不阻塞。
@@ -812,9 +898,13 @@ async def ingest_materials_batch(body: dict, db: AsyncSession = Depends(get_db))
     from app.api.recruitment.resume_upload import _upload_one_resume, _load_candidate
     import os
 
-    result = await db.execute(
-        select(AgentMaterial).where(AgentMaterial.id.in_(material_ids))
-    )
+    # 材料经 session 间接归属——非 admin 仅能取到本人会话下的材料，别人的 material_id 静默跳过
+    mat_q = select(AgentMaterial).where(AgentMaterial.id.in_(material_ids))
+    if not _can_see_all(current):
+        mat_q = mat_q.join(
+            AgentSession, AgentSession.id == AgentMaterial.session_id
+        ).where(AgentSession.owner_id == current.id)
+    result = await db.execute(mat_q)
     by_id = {str(m.id): m for m in result.scalars().all()}
 
     # ── Phase 1: classify — fast-path vs need-processing ──────────
@@ -1012,6 +1102,7 @@ async def upload_material(
     autoIngest: str = Form("true"),
     sessionId: str = Form(None),
     db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(get_current_user),
 ):
     """Upload a material (resume/document/knowledge) for the current session.
 
@@ -1031,13 +1122,17 @@ async def upload_material(
             session = await db.get(AgentSession, uuid.UUID(sessionId))
         except ValueError:
             session = None
+        # 显式 sessionId 必须属本人/admin，否则视为不存在
+        if session and session.owner_id is not None and session.owner_id != current.id and not _can_see_all(current):
+            return not_found("对话不存在")
     if not session:
-        session_result = await db.execute(
-            select(AgentSession).order_by(desc(AgentSession.updated_at)).limit(1)
-        )
+        session_q = select(AgentSession).order_by(desc(AgentSession.updated_at)).limit(1)
+        if not _can_see_all(current):
+            session_q = session_q.where(AgentSession.owner_id == current.id)
+        session_result = await db.execute(session_q)
         session = session_result.scalar_one_or_none()
     if not session:
-        session = AgentSession(title="新对话", agent_id="recruit")
+        session = AgentSession(title="新对话", agent_id="recruit", owner_id=current.id)
         db.add(session)
         await db.flush()
 
@@ -1292,6 +1387,7 @@ async def upload_material(
 async def trigger_suggestion(
     suggestion_id: str,
     db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(get_current_user),
 ):
     return ok()
 
@@ -1300,6 +1396,7 @@ async def trigger_suggestion(
 async def agent_chat(
     request: Request,
     body: dict,
+    current: CurrentUser = Depends(get_current_user),
 ):
     """Main SSE streaming chat endpoint.
 
@@ -1405,6 +1502,12 @@ async def agent_chat(
                 session = result.scalar_one_or_none()
             except Exception:
                 session = None
+            # 显式 sessionId 必须属本人/admin；属他人 → 404 防探测
+            if session and session.owner_id is not None and session.owner_id != current.id and not _can_see_all(current):
+                return JSONResponse(
+                    status_code=404,
+                    content={"code": 404, "message": "对话不存在", "data": None},
+                )
 
         if not session:
             is_new_session = True
@@ -1418,6 +1521,7 @@ async def agent_chat(
                 id=client_sid or uuid.uuid4(),
                 title="新对话",
                 agent_id="genie",
+                owner_id=current.id,
             )
             db.add(session)
             await db.flush()
@@ -1546,7 +1650,7 @@ async def agent_chat(
             # No intent gating. The ReAct loop picks the right tool and can
             # self-correct across turns; tool descriptions carry the
             # disambiguation that keyword gating used to enforce.
-            langchain_tools = create_langchain_tools(agent_id)
+            langchain_tools = create_langchain_tools(agent_id, current)
 
             _INGEST_UPLOAD_TOOLS = frozenset({
                 "upload_resume", "batch_parse_resumes",

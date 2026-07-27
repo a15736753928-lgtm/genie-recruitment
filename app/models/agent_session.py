@@ -19,6 +19,13 @@ class AgentProject(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     name = Column(String(64), nullable=False)
+    # 会话文件夹归属用户——对话隔离用。admin 凭 system:manage 通配可见全部。
+    owner_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -35,6 +42,14 @@ class AgentSession(Base):
         UUID(as_uuid=True),
         ForeignKey("agent_projects.id", ondelete="SET NULL"),
         nullable=True,
+    )
+    # 会话归属用户——对话隔离的核心字段。子表(messages/materials/tasks)
+    # 不直接挂 owner，经 session_id 间接归属，查询/删除前先校验 session 所有权。
+    owner_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

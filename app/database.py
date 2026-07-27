@@ -189,6 +189,7 @@ def _ensure_agent_projects_table(connection) -> None:
         "CREATE TABLE agent_projects ("
         "  id UUID PRIMARY KEY,"
         "  name VARCHAR(64) NOT NULL,"
+        "  owner_id UUID,"
         "  created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW(),"
         "  updated_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()"
         ")"
@@ -252,6 +253,15 @@ def _run_migrations(connection):
     _migrate_v16_candidate_status_vocabulary(connection)
 
     _migrate_v17_confirmation_override(connection)
+    # v18: Agent 对话工作台归属隔离——projects/sessions 新增 owner_id
+    _add_column_if_missing(connection, "agent_projects", "owner_id", "UUID NULL")
+    _add_column_if_missing(connection, "agent_sessions", "owner_id", "UUID NULL")
+    _ensure_index_if_missing(
+        connection, "ix_agent_projects_owner_id", "agent_projects", "owner_id"
+    )
+    _ensure_index_if_missing(
+        connection, "ix_agent_sessions_owner_id", "agent_sessions", "owner_id"
+    )
 
 
 def _migrate_v17_confirmation_override(connection) -> None:

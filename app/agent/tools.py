@@ -897,7 +897,76 @@ TOOL_REGISTRY = {
 GENERAL_TOOL_NAMES = tuple(TOOL_REGISTRY.keys())
 
 
-def get_tools_for_agent(agent_id: str = "genie") -> List[dict]:
+# ── 工具→权限点映射（对话工具层权限隔离）─────────────────────
+# 价值：get_tools_for_agent 据此过滤"模型可见的工具集"（第一道），
+#       tool_executor.execute_tool_call 据此在 dispatch 前二次校验（第二道，防御纵深）。
+# 规则：
+#   - 写/敏感工具映射到 app/core/permissions.py 已有权限点；
+#   - 涉及业务数据查看的敏感读工具（简历/绩效/试用期/系统设置）也挂权限；
+#   - 未列出的工具（list_positions/get_position/rag_search/知识库读/运营看板/排行榜等）
+#     视为所有登录用户可用的公共只读工具。
+#   - admin 凭 system:manage 通配放行（CurrentUser.has() 内含 WILDCARD）。
+# 同步新增工具时：若属写/敏感操作，记得在此登记，否则默认所有人可见可调。
+TOOL_PERMISSIONS: dict[str, str] = {
+    # ── 简历（读+写，hr/interviewer/manager 可见）──
+    "list_resumes": "resume:view",
+    "get_resume": "resume:view",
+    "update_resume": "resume:decide",
+    "upload_resume": "resume:decide",
+    "batch_parse_resumes": "resume:decide",
+    "reanalyze_resume": "resume:decide",
+    "delete_resume": "resume:decide",
+    # ── 岗位增删改（读公开：list_positions/get_position 未列入）──
+    "create_position": "position:manage",
+    "update_position": "position:manage",
+    "delete_position": "position:manage",
+    # ── 面试出题/评分 ──
+    "save_position_questions": "interview:manage",
+    "generate_questions": "interview:manage",
+    "save_questions": "interview:manage",
+    "replace_question": "interview:manage",
+    "get_position_questions": "interview:score",
+    "get_questions": "interview:score",
+    "get_evaluation": "interview:score",
+    "ai_score_question": "interview:score",
+    "save_evaluation": "interview:score",
+    "submit_evaluation": "interview:score",
+    # ── 试用期（管理类；employee 有 probation:submit 但无对应自助工具）──
+    "list_probation": "probation:manage",
+    "get_probation_stats": "probation:manage",
+    "get_probation_employee": "probation:manage",
+    "create_probation_employee": "probation:manage",
+    "create_probation_task": "probation:manage",
+    "update_probation_task": "probation:manage",
+    "ai_evaluate_probation": "probation:manage",
+    "update_probation_status": "probation:manage",
+    "manual_review_probation": "probation:manage",
+    # ── 绩效（敏感数据，talent:view / salary:view）──
+    "list_performance": "talent:view",
+    "get_performance_stats": "talent:view",
+    "get_department_performance": "talent:view",
+    "get_grade_distribution": "talent:view",
+    "get_quarter_trends": "talent:view",
+    "initiate_appraisal": "talent:manage",
+    "get_bonus_info": "salary:view",
+    "update_bonus": "salary:view",
+    # ── 知识库写管理（admin 专属；读 list_knowledge/rag_search 等未列入=公共）──
+    "upload_knowledge_file": "system:manage",
+    "create_knowledge_item": "system:manage",
+    "update_knowledge_item": "system:manage",
+    "delete_knowledge_item": "system:manage",
+    "create_knowledge_base": "system:manage",
+    "update_knowledge_base": "system:manage",
+    "delete_knowledge_base": "system:manage",
+    "upload_document": "system:manage",
+    "delete_document": "system:manage",
+    # ── 系统设置 ──
+    "get_settings": "system:manage",
+    "update_settings": "system:manage",
+}
+
+
+def get_tools_for_agent(agent_id: str = "genie", current_user=None) -> List[dict]:
     """Get the list of tool definitions for a specific agent type.
 
     系统只剩一个全能 agent（"genie"），它拿到全部工具。旧的 4 个分组
@@ -905,8 +974,19 @@ def get_tools_for_agent(agent_id: str = "genie") -> List[dict]:
     —— 那份清单早已与 TOOL_REGISTRY 脱节，且没有任何调用方还在传这些 id。
     任何未知 agent_id 一律退回全量工具（与 genie 相同），保证不会因为
     传错 id 就把工具集悄悄裁掉。
+
+    权限隔离：传入 current_user 时，按其 permissions 过滤掉无权调用的工具
+    （admin 凭 system:manage 通配放行，has() 内含 WILDCARD）。未传时退回全量，
+    仅用于 quality_guard 的只读验证路径与内部调用——这些路径不应被权限收窄影响。
     """
-    return [TOOL_REGISTRY[name] for name in GENERAL_TOOL_NAMES]
+    tool_defs = [TOOL_REGISTRY[name] for name in GENERAL_TOOL_NAMES]
+    if current_user is None:
+        return tool_defs
+    return [
+        td for td in tool_defs
+        if not TOOL_PERMISSIONS.get(td["name"])
+        or current_user.has(TOOL_PERMISSIONS[td["name"]])
+    ]
 
 
 # ── LangChain / LangGraph Tool Conversion ────────────────
@@ -948,7 +1028,7 @@ def _build_pydantic_model(tool_name: str, params_schema: dict) -> type:
     return create_model(model_name, **fields)
 
 
-async def _execute_tool_sync(tool_name: str, **kwargs) -> str:
+async def _execute_tool_sync(tool_name: str, *, current_user=None, **kwargs) -> str:
     """Execute a tool with an auto-created DB session (for LangGraph context).
 
     Uses lazy import to avoid circular dependency with app.routers.ai_agent.
@@ -957,8 +1037,17 @@ async def _execute_tool_sync(tool_name: str, **kwargs) -> str:
     so that when the SSE streaming client disconnects mid-tool-call, the
     asyncpg connection is always returned to the pool instead of being left
     dangling for the garbage collector.
+
+    current_user：由 tool_func 闭包透传。在此 set 到 contextvar，供 handler 内
+    get_current_user_for_tools() 做写操作二次权限校验（防御纵深）。即便可见集
+    过滤被绕过（新增工具忘挂 require_permission），关键写工具仍能挡住。
+    走 quality_guard 验证路径时不传 current_user → contextvar 为 None → 校验跳过。
     """
-    from app.api.ai.tool_executor import execute_tool_call  # lazy import
+    from app.api.ai.tool_executor import (
+        execute_tool_call,
+        set_current_user_for_tools,
+        _current_user_ctx,
+    )  # lazy import
     import asyncio as _asyncio
 
     # Remove None values (unset optional params)
@@ -971,6 +1060,8 @@ async def _execute_tool_sync(tool_name: str, **kwargs) -> str:
     # calling a delete_* tool. No runtime permission engine.
 
     db = async_session_factory()
+    # 注入当前用户到 contextvar（shield 调用前 set，同 task 的 await 链路可见）
+    _ctx_token = set_current_user_for_tools(current_user)
     try:
         result = await _asyncio.shield(execute_tool_call(tool_name, params, db))
         await db.commit()
@@ -979,19 +1070,22 @@ async def _execute_tool_sync(tool_name: str, **kwargs) -> str:
         await db.rollback()
         raise
     finally:
+        # 还原 contextvar，避免跨请求串号
+        _current_user_ctx.reset(_ctx_token)
         # Shield close() so the connection ALWAYS goes back to the pool,
         # even when CancelledError fires during the finally block itself.
         await _asyncio.shield(db.close())
 
 
-def create_langchain_tools(agent_id: str = "genie") -> list:
+def create_langchain_tools(agent_id: str = "genie", current_user=None) -> list:
     """Convert the tool registry into LangChain StructuredTool objects.
 
     Returns a list of tools compatible with LangGraph's ToolNode.
+    current_user 用于按权限过滤可见工具集 + 注入 contextvar 供 handler 二次校验。
     """
     from langchain_core.tools import StructuredTool
 
-    tool_defs = get_tools_for_agent(agent_id)
+    tool_defs = get_tools_for_agent(agent_id, current_user)
     lc_tools = []
 
     for td in tool_defs:
@@ -1002,9 +1096,11 @@ def create_langchain_tools(agent_id: str = "genie") -> list:
         # Build Pydantic args model from JSON Schema
         args_model = _build_pydantic_model(tool_name, params_schema)
 
-        # Create the async tool function bound to this tool_name
-        async def tool_func(tool_name=tool_name, **kwargs) -> str:
-            return await _execute_tool_sync(tool_name, **kwargs)
+        # Create the async tool function bound to this tool_name.
+        # current_user 作为默认参数捕获进闭包，透传给 _execute_tool_sync，
+        # 后者 set 到 contextvar 供 handler 内 get_current_user_for_tools() 读取。
+        async def tool_func(tool_name=tool_name, current_user=current_user, **kwargs) -> str:
+            return await _execute_tool_sync(tool_name, current_user=current_user, **kwargs)
 
         # Attach proper signature for LangChain
         tool_func.__name__ = tool_name
