@@ -24,6 +24,8 @@ from app.models.phase1 import (
     Interview, InterviewerScore, InterviewMedia, AIInterviewReport,
     OfferApproval,
 )
+# 第一期 AI 产物表
+from app.models.phase1_ai import PositionAIArtifact
 # 第二期业务表
 from app.models.phase2 import (
     ProbationPlan, ProbationWeekReview, ConfirmationReview,
@@ -54,6 +56,7 @@ __all__ = [
     "ResumeScore",
     "Interview", "InterviewerScore", "InterviewMedia", "AIInterviewReport",
     "OfferApproval",
+    "PositionAIArtifact",
     "ProbationPlan", "ProbationWeekReview", "ConfirmationReview",
     "TrainingCourse", "EmployeeTrainingProgress", "MentorRecord",
     "WorkTask", "TaskAcceptance", "PointRecord", "RewardPenaltyRecord", "Appeal",

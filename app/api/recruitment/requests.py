@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
 from app.models.recruitment import Position, Department
 from app.models.phase1 import RecruitmentRequest, PositionCompetency
+from app.models.phase1_ai import PositionAIArtifact, ARTIFACT_TYPES
 from app.models.settings import SystemSetting
 from app.models.auth import User
 from app.core.security import get_current_user, require_permission, CurrentUser
@@ -56,61 +57,94 @@ def _parse_uuid(value: str | None) -> uuid.UUID | None:
 
 
 def _format_ai_outputs(draft: Any) -> dict | None:
-    """把 ai_draft 规范成前端 aiOutputs 展示结构。"""
+    """把 ai_draft 规范成前端 aiOutputs 展示结构。
+
+    保留完整的结构化数据（description, sampleQuestions, phases 等），
+    不再扁平化为纯文本，让前端可以丰富渲染。
+    """
     if not isinstance(draft, dict) or not draft:
         return None
 
-    def dims(key_a: str, key_b: str) -> list[str]:
-        raw = draft.get(key_a) or draft.get(key_b) or []
-        if isinstance(raw, list):
-            out: list[str] = []
-            for item in raw:
-                if isinstance(item, dict):
-                    name = str(item.get("dimension") or item.get("name") or "").strip()
-                    score = item.get("score")
-                    out.append(f"{name}（{score}）" if name and score is not None else name or str(item))
-                else:
-                    text = str(item).strip()
-                    if text:
-                        out.append(text)
-            return out
+    def normalize_dims(raw: Any) -> list[dict]:
+        """将面试维度/能力模型列表规范化为结构化数组。"""
+        if not isinstance(raw, list):
+            return []
+        out = []
+        for item in raw:
+            if isinstance(item, dict):
+                out.append({
+                    "dimension": str(item.get("dimension") or item.get("name") or "").strip(),
+                    "weight": int(item.get("weight") or item.get("score") or 0),
+                    "description": str(item.get("description") or "").strip(),
+                    "sampleQuestions": item.get("sampleQuestions") or [],
+                })
+            elif isinstance(item, str) and item.strip():
+                out.append({"dimension": item.strip(), "weight": 0, "description": "", "sampleQuestions": []})
+        return out
+
+    def normalize_framework(raw: Any) -> dict:
+        """将试用期考核框架规范化。"""
+        if isinstance(raw, dict):
+            phases = raw.get("phases")
+            if isinstance(phases, list):
+                return {"phases": [
+                    {
+                        "name": str(p.get("name") or ""),
+                        "duration": str(p.get("duration") or ""),
+                        "goals": p.get("goals") or [],
+                        "criteria": p.get("criteria") or "",
+                        "evaluationMethod": str(p.get("evaluationMethod") or p.get("evaluation_method") or ""),
+                    } for p in phases if isinstance(p, dict)
+                ]}
+            # 兼容旧格式 {week1: ..., weeks24: ...}
+            return {"phases": [
+                {"name": "第1周", "duration": "1周", "goals": [str(raw.get("week1", ""))], "evaluationMethod": ""},
+                {"name": "第2-4周", "duration": "3周", "goals": [str(raw.get("weeks24", ""))], "evaluationMethod": ""},
+            ]}
         if isinstance(raw, str) and raw.strip():
-            return [raw.strip()]
-        return []
+            return {"phases": [{"name": "试用期", "duration": "", "goals": [raw.strip()], "evaluationMethod": ""}]}
+        return {"phases": []}
+
+    def normalize_training(raw: Any) -> list[dict]:
+        """将培训内容建议规范化。"""
+        if not isinstance(raw, list):
+            if isinstance(raw, str) and raw.strip():
+                return [{"title": raw.strip(), "duration": "", "content": "", "objectives": [], "method": ""}]
+            return []
+        out = []
+        for item in raw:
+            if isinstance(item, dict):
+                out.append({
+                    "title": str(item.get("title") or ""),
+                    "duration": str(item.get("duration") or ""),
+                    "content": str(item.get("content") or ""),
+                    "objectives": item.get("objectives") or [],
+                    "method": str(item.get("method") or ""),
+                })
+            elif isinstance(item, str) and item.strip():
+                out.append({"title": item.strip(), "duration": "", "content": "", "objectives": [], "method": ""})
+        return out
 
     rules = draft.get("resumeScoringRules")
     if isinstance(rules, dict):
-        rules_text = "、".join(f"{k} {v}%" for k, v in rules.items())
+        # 保留完整结构，同时提供预览文本
+        rules_normalized = {k: int(v) for k, v in rules.items() if isinstance(v, (int, float))}
+        rules_preview = "、".join(f"{k} {v}%" for k, v in rules.items())
     else:
-        rules_text = str(rules or "")
-
-    framework = draft.get("probationFramework")
-    if isinstance(framework, dict):
-        framework_text = "；".join(f"{k}: {v}" for k, v in framework.items() if v)
-    else:
-        framework_text = str(framework or "")
-
-    training = draft.get("trainingSuggestions") or []
-    if isinstance(training, str):
-        training = [training] if training.strip() else []
-    elif not isinstance(training, list):
-        training = []
+        rules_normalized = {}
+        rules_preview = str(rules or "")
 
     competencies = draft.get("competencyModel") or []
-    if not isinstance(competencies, list):
-        competencies = []
 
     return {
         "jobDescription": str(draft.get("jobDescription") or ""),
-        "competencyModel": [
-            {"dimension": str(c.get("dimension") or ""), "weight": int(c.get("weight") or 0)}
-            for c in competencies if isinstance(c, dict)
-        ],
-        "resumeScoringRules": rules_text,
-        "round1Dimensions": dims("round1Dimensions", "interviewDimensionsR1"),
-        "round2Dimensions": dims("round2Dimensions", "interviewDimensionsR2"),
-        "probationFramework": framework_text,
-        "trainingSuggestions": [str(x).strip() for x in training if str(x).strip()],
+        "competencyModel": normalize_dims(competencies),
+        "resumeScoringRules": rules_normalized,
+        "resumeScoringRulesPreview": rules_preview,
+        "round1Dimensions": normalize_dims(draft.get("interviewDimensionsR1") or draft.get("round1Dimensions")),
+        "round2Dimensions": normalize_dims(draft.get("interviewDimensionsR2") or draft.get("round2Dimensions")),
+        "probationFramework": normalize_framework(draft.get("probationFramework")),
+        "trainingPlan": normalize_training(draft.get("trainingPlan") or draft.get("trainingSuggestions")),
     }
 
 
@@ -282,27 +316,66 @@ async def ai_generate(
 
     try:
         from app.services.ai import llm_chat
+        import logging
+        _log = logging.getLogger(__name__)
         prompt = (
-            f"你是专业 HR 顾问。请根据以下招聘需求,生成 7 件结构化产品,以 JSON 格式返回。\n"
-            f"岗位: {req.position_name}\n"
-            f"岗位描述: {req.job_description}\n工作职责: {req.job_responsibilities}\n"
-            f"任职要求: {req.job_requirements}\n工作经验要求: {req.work_experience}\n"
-            f"学历要求: {req.education_requirement}\n加分项: {req.bonus_items}\n"
-            f"核心任务: {req.core_tasks}\n必备技能: {req.required_skills}\n\n"
-            "返回 JSON 结构:\n"
-            '{"jobDescription":"...","competencyModel":[{"dimension":"...","weight":30}],'
-            '"resumeScoringRules":{"skillMatch":25,"projectMatch":20,"positionExp":15,'
-            '"achievement":15,"industryExp":10,"learning":5,"stability":5,"bonusSkill":5},'
-            '"interviewDimensionsR1":[{"dimension":"...","score":15}],'
-            '"interviewDimensionsR2":[{"dimension":"...","score":20}],'
-            '"probationFramework":{"week1":"...","weeks24":"..."},'
-            '"trainingSuggestions":["..."]}'
+            f"你是资深 HR 顾问和岗位设计专家。请根据以下招聘需求，生成 7 件结构化产品，以 JSON 格式返回。\n\n"
+            f"## 招聘需求\n"
+            f"- 岗位名称: {req.position_name}\n"
+            f"- 部门: {req.department_id or '待定'}\n"
+            f"- 招聘人数: {req.headcount}\n"
+            f"- 岗位描述: {req.job_description}\n"
+            f"- 工作职责: {req.job_responsibilities}\n"
+            f"- 任职要求: {req.job_requirements}\n"
+            f"- 工作经验要求: {req.work_experience}\n"
+            f"- 学历要求: {req.education_requirement}\n"
+            f"- 加分项: {req.bonus_items}\n"
+            f"- 核心任务: {req.core_tasks}\n"
+            f"- 必备技能: {', '.join(req.required_skills or [])}\n"
+            f"- 优先技能: {', '.join(req.preferred_skills or [])}\n"
+            f"- 薪资范围: {req.salary_range}\n"
+            f"- 试用期目标: {req.probation_goal}\n"
+            f"- 淘汰条件: {req.elimination_criteria}\n\n"
+            "## 返回 JSON 结构（请务必返回完整、详细的 JSON）\n"
+            "{\n"
+            '  "jobDescription": "详细的岗位说明书，包含岗位定位、核心价值、发展路径等（至少300字）",\n'
+            '  "competencyModel": [\n'
+            '    {"dimension": "专业技能", "weight": 30, "description": "评估标准描述"},\n'
+            '    {"dimension": "项目经验", "weight": 20, "description": "评估标准描述"}\n'
+            "  ],\n"
+            '  "resumeScoringRules": {\n'
+            '    "skillMatch": 25, "projectMatch": 20, "positionExp": 15,\n'
+            '    "achievement": 15, "industryExp": 10, "learning": 5, "stability": 5, "bonusSkill": 5\n'
+            "  },\n"
+            '  "interviewDimensionsR1": [\n'
+            '    {"dimension": "经历真实性", "weight": 15, "description": "评估要点", "sampleQuestions": ["问题1", "问题2"]}\n'
+            "  ],\n"
+            '  "interviewDimensionsR2": [\n'
+            '    {"dimension": "专业能力", "weight": 25, "description": "评估要点", "sampleQuestions": ["问题1"]}\n'
+            "  ],\n"
+            '  "probationFramework": {\n'
+            '    "phases": [\n'
+            '      {"name": "第1周", "duration": "1周", "goals": ["目标1"], "evaluationMethod": "评估方式"}\n'
+            "    ]\n"
+            "  },\n"
+            '  "trainingPlan": [\n'
+            '    {"title": "培训模块", "duration": "2小时", "content": "培训内容", "objectives": ["目标"], "method": "方式"}\n'
+            "  ]\n"
+            "}"
         )
-        resp_text = await llm_chat([{"role": "user", "content": prompt}])
+        resp_text = await llm_chat(
+            [{"role": "user", "content": prompt}],
+            max_tokens=2048,
+        )
+        _log.info("AI 生成招聘需求原始响应长度: %d", len(resp_text or ""))
+        _log.debug("AI 生成招聘需求原始响应: %s", resp_text[:500] if resp_text else "(空)")
         ai_draft = extract_json_object(resp_text)
         if ai_draft is None:
-            raise ValueError("模型未返回可解析的 JSON")
+            _log.error("AI 返回内容无法解析为 JSON: %s", resp_text[:300] if resp_text else "(空)")
+            raise ValueError("模型未返回可解析的 JSON，请重试")
+        _log.info("AI 生成招聘需求成功，包含字段: %s", list(ai_draft.keys()))
     except Exception as e:
+        _log.exception("AI 生成招聘需求失败")
         return fail(500, f"AI 生成失败，请重试: {e}")
 
     # 状态迁移放在赋值之前：迁移失败要整单拒绝，否则 ai_draft 会被静默提交
@@ -315,6 +388,38 @@ async def ai_generate(
             await db.rollback()
             return fail(409, e.message)
     req.ai_draft = ai_draft
+
+    # 将 7 项 AI 产物分别写入 position_ai_artifacts 表，供下游复用
+    artifact_mapping = {
+        "job_description": ai_draft.get("jobDescription"),
+        "competency_model": ai_draft.get("competencyModel"),
+        "resume_scoring_rules": ai_draft.get("resumeScoringRules"),
+        "interview_r1": ai_draft.get("interviewDimensionsR1") or ai_draft.get("interviewDimensionsR1"),
+        "interview_r2": ai_draft.get("interviewDimensionsR2") or ai_draft.get("interviewDimensionsR2"),
+        "probation_framework": ai_draft.get("probationFramework"),
+        "training_plan": ai_draft.get("trainingPlan") or ai_draft.get("trainingSuggestions"),
+    }
+    for artifact_type, content in artifact_mapping.items():
+        if content is None:
+            continue
+        # 如果已存在同类型记录，更新版本
+        existing = await db.execute(
+            select(PositionAIArtifact).where(
+                PositionAIArtifact.recruitment_request_id == req.id,
+                PositionAIArtifact.artifact_type == artifact_type,
+            )
+        )
+        existing_record = existing.scalar_one_or_none()
+        if existing_record:
+            existing_record.content = content
+            existing_record.version = (existing_record.version or 1) + 1
+        else:
+            db.add(PositionAIArtifact(
+                recruitment_request_id=req.id,
+                artifact_type=artifact_type,
+                content=content,
+            ))
+
     await write_audit(db, actor=current.username, action="AI 生成招聘草稿", section="recruitment")
     return ok(_serialize_req(req, current))
 
@@ -515,6 +620,16 @@ async def publish_request(
             db.add(PositionCompetency(position_id=position.id, dimension=dim, weight=weight, locked=True))
 
     req.position_id = position.id
+
+    # 将所有 AI 产物关联到新创建的岗位
+    artifacts_result = await db.execute(
+        select(PositionAIArtifact).where(
+            PositionAIArtifact.recruitment_request_id == req.id
+        )
+    )
+    for artifact in artifacts_result.scalars().all():
+        artifact.position_id = position.id
+
     await transition(db, "recruitment_request", req, "published",
                      actor_id=current.id, actor_name=current.username, skip_block_check=True)
     await write_audit(db, actor=current.username, action=f"发布招聘需求 → 岗位: {req.position_name}", section="recruitment")
@@ -569,3 +684,114 @@ async def list_departments(
         {"id": str(d.id), "name": d.name, "description": d.description}
         for d in rows
     ])
+
+
+# ═══════════════════════════════════════════════
+# AI 产物接口
+# ═══════════════════════════════════════════════
+
+def _serialize_artifact(a: PositionAIArtifact) -> dict:
+    return {
+        "id": str(a.id),
+        "recruitmentRequestId": str(a.recruitment_request_id),
+        "positionId": str(a.position_id) if a.position_id else None,
+        "artifactType": a.artifact_type,
+        "content": a.content,
+        "version": a.version,
+        "createdAt": iso_utc(a.created_at),
+        "updatedAt": iso_utc(a.updated_at),
+    }
+
+
+@router.get("/recruitment-requests/{req_id}/ai-artifacts")
+async def list_ai_artifacts(
+    req_id: str,
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """获取指定招聘需求的所有 AI 产物。"""
+    try:
+        rid = uuid.UUID(req_id)
+    except ValueError:
+        return not_found("招聘需求不存在")
+    rows = await db.execute(
+        select(PositionAIArtifact).where(
+            PositionAIArtifact.recruitment_request_id == rid
+        ).order_by(PositionAIArtifact.artifact_type)
+    )
+    artifacts = rows.scalars().all()
+    return ok([_serialize_artifact(a) for a in artifacts])
+
+
+@router.get("/recruitment-requests/{req_id}/ai-artifacts/{artifact_type}")
+async def get_ai_artifact(
+    req_id: str,
+    artifact_type: str,
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """获取指定招聘需求的某一类 AI 产物。"""
+    if artifact_type not in ARTIFACT_TYPES:
+        return fail(400, f"无效的产物类型: {artifact_type}，可选: {', '.join(ARTIFACT_TYPES)}")
+    try:
+        rid = uuid.UUID(req_id)
+    except ValueError:
+        return not_found("招聘需求不存在")
+    row = await db.execute(
+        select(PositionAIArtifact).where(
+            PositionAIArtifact.recruitment_request_id == rid,
+            PositionAIArtifact.artifact_type == artifact_type,
+        )
+    )
+    artifact = row.scalar_one_or_none()
+    if artifact is None:
+        return not_found("未找到该类型的 AI 产物")
+    return ok(_serialize_artifact(artifact))
+
+
+# ── 按岗位 ID 获取 AI 产物（供面试/试用期等下游模块） ────────
+
+@router.get("/positions/{position_id}/ai-artifacts")
+async def list_position_ai_artifacts(
+    position_id: str,
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """获取指定岗位的所有 AI 产物（岗位发布后使用）。"""
+    try:
+        pid = uuid.UUID(position_id)
+    except ValueError:
+        return not_found("岗位不存在")
+    rows = await db.execute(
+        select(PositionAIArtifact).where(
+            PositionAIArtifact.position_id == pid
+        ).order_by(PositionAIArtifact.artifact_type)
+    )
+    artifacts = rows.scalars().all()
+    return ok([_serialize_artifact(a) for a in artifacts])
+
+
+@router.get("/positions/{position_id}/ai-artifacts/{artifact_type}")
+async def get_position_ai_artifact(
+    position_id: str,
+    artifact_type: str,
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """获取指定岗位的某一类 AI 产物。"""
+    if artifact_type not in ARTIFACT_TYPES:
+        return fail(400, f"无效的产物类型: {artifact_type}，可选: {', '.join(ARTIFACT_TYPES)}")
+    try:
+        pid = uuid.UUID(position_id)
+    except ValueError:
+        return not_found("岗位不存在")
+    row = await db.execute(
+        select(PositionAIArtifact).where(
+            PositionAIArtifact.position_id == pid,
+            PositionAIArtifact.artifact_type == artifact_type,
+        )
+    )
+    artifact = row.scalar_one_or_none()
+    if artifact is None:
+        return not_found("未找到该类型的 AI 产物")
+    return ok(_serialize_artifact(artifact))
