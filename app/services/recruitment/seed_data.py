@@ -142,24 +142,8 @@ async def seed_all():
         if not result.scalar_one_or_none():
             db.add(SystemSetting(key="global", value=DEFAULT_SETTINGS))
 
-        # ── PDF 业务规则默认值(各模块从此读取,不硬编码)──
-        BUSINESS_RULE_DEFAULTS = {
-            "resume_grade_thresholds": {"A": 85, "B": 70, "C": 60},   # D<60
-            "ai_confidence_threshold": 0.6,
-            "interviewer_score_gap": 20,
-            "r1_conclusion_thresholds": {"priority": 85, "advance": 75, "review": 65},
-            "conversion_thresholds": {"excellent": 85, "normal": 75, "conditional": 65},
-            "offer_thresholds": {"priority": 85, "recommend": 75, "conditional": 65, "reserve": 55},
-            "standard_question_min_ratio": 0.6,
-            "major_penalty_threshold": 200,
-            "task_level_points": {
-                "S": [500, 1000], "A": [200, 500], "B": [80, 200], "C": [20, 80], "D": [5, 20]
-            },
-        }
-        for key, value in BUSINESS_RULE_DEFAULTS.items():
-            existing = await db.execute(select(SystemSetting).where(SystemSetting.key == key))
-            if not existing.scalar_one_or_none():
-                db.add(SystemSetting(key=key, value=value))
+        # 业务规则阈值已并入 DEFAULT_SETTINGS 的 global dict（见 system_settings.py），
+        # 不再单独播种独立行——那套存储与设置页的 PUT /settings 互不相通。
 
         await _ensure_positions_seeded_flag(db)
         await db.commit()

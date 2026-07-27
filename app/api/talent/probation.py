@@ -15,6 +15,8 @@ from app.services.ai import get_llm_client
 from app.services.talent.probation_sync import ensure_employee_for_candidate, sync_onboarding_candidates
 from app.core.state_machine import transition, StateError
 from app.utils.clock import iso_utc
+from app.utils.responses import ok, fail, not_found, conflict
+from app.utils.llm_json import extract_json_object
 
 router = APIRouter(tags=["试用期"])
 settings = get_settings()
@@ -117,10 +119,7 @@ async def get_probation_stats(db: AsyncSession = Depends(get_db)):
     passed = (await db.execute(passed_query)).scalar() or 0
     failed = (await db.execute(failed_query)).scalar() or 0
 
-    return {
-        "code": 0, "message": "ok",
-        "data": {"total": total, "assessing": assessing, "passed": passed, "failed": failed},
-    }
+    return ok({"total": total, "assessing": assessing, "passed": passed, "failed": failed})
 
 
 @router.get("/probation")
@@ -150,13 +149,10 @@ async def list_probation(
     result = await db.execute(query)
     employees = result.unique().scalars().all()
 
-    return {
-        "code": 0, "message": "ok",
-        "data": {
-            "list": [serialize_employee(e) for e in employees],
-            "total": total, "page": page, "pageSize": pageSize,
-        },
-    }
+    return ok({
+          "list": [serialize_employee(e) for e in employees],
+          "total": total, "page": page, "pageSize": pageSize,
+      })
 
 
 @router.get("/probation/{employee_id}")
@@ -170,8 +166,8 @@ async def get_probation_employee(employee_id: str, db: AsyncSession = Depends(ge
     )
     emp = result.scalar_one_or_none()
     if not emp:
-        return {"code": 404, "message": "员工不存在", "data": None}
-    return {"code": 0, "message": "ok", "data": serialize_employee(emp)}
+        return not_found("员工不存在")
+    return ok(serialize_employee(emp))
 
 
 # ── Employee management ──
@@ -213,7 +209,7 @@ async def create_employee(
                     emp.mentor_id = req.mentorId
                 await db.flush()
                 await db.refresh(emp, attribute_names=["tasks", "position"])
-                return {"code": 0, "message": "ok", "data": serialize_employee(emp)}
+                return ok(serialize_employee(emp))
 
     join_date = date.fromisoformat(req.joinDate) if req.joinDate else date.today()
     if req.probationEnd:
@@ -253,7 +249,7 @@ async def create_employee(
 
     await db.flush()
     await db.refresh(emp)
-    return {"code": 0, "message": "ok", "data": serialize_employee(emp)}
+    return ok(serialize_employee(emp))
 
 
 # ── Tasks ──
@@ -274,7 +270,7 @@ async def create_probation_task(
     )
     emp = result.scalar_one_or_none()
     if not emp:
-        return {"code": 404, "message": "员工不存在", "data": None}
+        return not_found("员工不存在")
 
     task = ProbationTask(
         employee_id=employee_id,
@@ -295,7 +291,7 @@ async def create_probation_task(
     )
     db.add(task)
     await db.flush()
-    return {"code": 0, "message": "ok", "data": serialize_task(task, emp.name or "")}
+    return ok(serialize_task(task, emp.name or ""))
 
 
 @router.put("/probation/tasks/{task_id}")
@@ -309,7 +305,22 @@ async def update_probation_task(
     )
     task = result.scalar_one_or_none()
     if not task:
-        return {"code": 404, "message": "任务不存在", "data": None}
+        return not_found("任务不存在")
+
+    # 状态迁移放在字段编辑之前：迁移失败要整单拒绝。若放在后面，前面 setattr 的
+    # 评审意见/评分已被 autoflush 刷进事务，而 get_db 只在抛异常时回滚，正常 return
+    # 会把这半截改动静默提交（表现为「提示状态不合法，但评分已经写进去了」）。
+    if "status" in body and body["status"]:
+        try:
+            await transition(db, "probation_task", task, body["status"], skip_block_check=True)
+        except StateError as e:
+            await db.rollback()
+            return conflict(e.message)
+        # 状态流转打时间戳
+        if task.status == "pending_review" and task.submitted_at is None:
+            task.submitted_at = datetime.utcnow()
+        if task.status == "passed":
+            task.reviewed_at = datetime.utcnow()
 
     # camelCase(前端) → snake_case(ORM) 映射
     # 注意：status 不在这个通用映射里 —— 状态变更必须走 transition()校验合法迁移，
@@ -335,20 +346,9 @@ async def update_probation_task(
     if "deadline" in body and body["deadline"]:
         task.deadline = date.fromisoformat(body["deadline"])
 
-    if "status" in body and body["status"]:
-        try:
-            await transition(db, "probation_task", task, body["status"], skip_block_check=True)
-        except StateError as e:
-            return {"code": 409, "message": e.message, "data": None}
-        # 状态流转打时间戳
-        if task.status == "pending_review" and task.submitted_at is None:
-            task.submitted_at = datetime.utcnow()
-        if task.status == "passed":
-            task.reviewed_at = datetime.utcnow()
-
     await db.flush()
     emp_name = task.employee.name if task.employee else ""
-    return {"code": 0, "message": "ok", "data": serialize_task(task, emp_name or "")}
+    return ok(serialize_task(task, emp_name or ""))
 
 
 # ── AI Evaluate ──
@@ -360,7 +360,7 @@ async def ai_evaluate_probation(employee_id: str, db: AsyncSession = Depends(get
     )
     emp = result.scalar_one_or_none()
     if not emp:
-        return {"code": 404, "message": "员工不存在", "data": None}
+        return not_found("员工不存在")
 
     tasks = [{"title": t.title, "status": t.status, "week": t.week_number}
              for t in (emp.tasks or [])]
@@ -369,8 +369,8 @@ async def ai_evaluate_probation(employee_id: str, db: AsyncSession = Depends(get
 
 员工:{emp.name}
 部门:{emp.department or '未指定'}
-入职日期:{emp.join_date}
-试用期截止:{emp.probation_end}
+入职日期:{emp.onboard_date}
+试用期截止:{emp.probation_end_date}
 
 任务数据:{json.dumps(tasks, ensure_ascii=False)}
 
@@ -389,20 +389,18 @@ async def ai_evaluate_probation(employee_id: str, db: AsyncSession = Depends(get
             temperature=0.3,
             max_tokens=512,
         )
-        content = response.choices[0].message.content.strip()
-        if content.startswith("```json"):
-            content = content[7:]
-        if content.endswith("```"):
-            content = content[:-3]
-        ai_result = json.loads(content.strip())
+        ai_result = extract_json_object(response.choices[0].message.content or "")
+        if ai_result is None:
+            raise ValueError("模型未返回可解析的 JSON")
 
         emp.ai_score = ai_result.get("score")
         emp.ai_result = ai_result.get("result")
         await db.flush()
 
-        return {"code": 0, "message": "ok", "data": ai_result}
+        return ok(ai_result)
     except Exception as e:
-        return {"code": 500, "message": f"AI评估失败: {str(e)}", "data": None}
+        await db.rollback()
+        return fail(500, f"AI评估失败: {str(e)}")
 
 
 @router.put("/probation/{employee_id}/status")
@@ -416,16 +414,16 @@ async def update_probation_status(
     )
     emp = result.scalar_one_or_none()
     if not emp:
-        return {"code": 404, "message": "员工不存在", "data": None}
+        return not_found("员工不存在")
 
     new_status = body.get("status")
     if new_status and new_status != emp.status:
         try:
             await transition(db, "employee", emp, new_status, skip_block_check=True)
         except StateError as e:
-            return {"code": 409, "message": e.message, "data": None}
+            return conflict(e.message)
     await db.flush()
-    return {"code": 0, "message": "ok", "data": None}
+    return ok()
 
 
 @router.put("/probation/{employee_id}/review")
@@ -439,10 +437,10 @@ async def manual_review(
     )
     emp = result.scalar_one_or_none()
     if not emp:
-        return {"code": 404, "message": "员工不存在", "data": None}
+        return not_found("员工不存在")
 
     emp.ai_score = body.get("aiScore", emp.ai_score)
     emp.ai_result = body.get("aiResult", emp.ai_result)
     await db.flush()
     await db.refresh(emp)
-    return {"code": 0, "message": "ok", "data": serialize_employee(emp)}
+    return ok(serialize_employee(emp))

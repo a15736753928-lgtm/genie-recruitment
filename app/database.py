@@ -251,6 +251,19 @@ def _run_migrations(connection):
     # 同表混存，见 app/core/state_machine.py TRANSITIONS["candidate"] 的注释。
     _migrate_v16_candidate_status_vocabulary(connection)
 
+    _migrate_v17_confirmation_override(connection)
+
+
+def _migrate_v17_confirmation_override(connection) -> None:
+    """v17: 转正结论人工覆盖留痕（谁、何时、为什么改）。
+
+    前端一直在收集「覆盖 AI 建议的原因」，但后端既无字段也不在白名单里，
+    合规链路上等于走了个形式。这里补三列，纯 ADD COLUMN，不动存量数据。
+    """
+    _add_column_if_missing(connection, "confirmation_reviews", "override_reason", "TEXT")
+    _add_column_if_missing(connection, "confirmation_reviews", "override_by", "UUID")
+    _add_column_if_missing(connection, "confirmation_reviews", "override_at", "TIMESTAMP")
+
 
 def _migrate_v15_direct_manager_name(connection) -> None:
     """v15: 招聘需求直属负责人支持手填姓名；direct_manager_id 改为可空。"""

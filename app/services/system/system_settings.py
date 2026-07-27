@@ -42,6 +42,22 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "exportFormat": "xlsx",
     "webhookEnabled": False,
     "webhookUrl": "",
+    # ── 业务规则阈值 ──
+    # 这些曾被 seed_data.py 写成一 key 一行的独立 SystemSetting 记录，由 3 个各写一份的
+    # 私有 helper 直接查表读取；而管理员在设置页保存时走的是 PUT /settings，只会更新
+    # key="global" 这一行的 dict。两套存储互不相通，导致「阈值改了永远不生效」。
+    # 现统一并入 global dict，全部经 get_system_setting() 读取。
+    "resume_grade_thresholds": {"A": 85, "B": 70, "C": 60},   # D < 60
+    "ai_confidence_threshold": 0.6,
+    "interviewer_score_gap": 20,
+    "r1_conclusion_thresholds": {"priority": 85, "advance": 75, "review": 65},
+    "conversion_thresholds": {"excellent": 85, "normal": 75, "conditional": 65},
+    "offer_thresholds": {"priority": 85, "recommend": 75, "conditional": 65, "reserve": 55},
+    "standard_question_min_ratio": 0.6,
+    "major_penalty_threshold": 200,
+    "task_level_points": {
+        "S": [500, 1000], "A": [200, 500], "B": [80, 200], "C": [20, 80], "D": [5, 20]
+    },
 }
 
 _CACHE: dict[str, Any] = {"data": None, "expires_at": 0.0}

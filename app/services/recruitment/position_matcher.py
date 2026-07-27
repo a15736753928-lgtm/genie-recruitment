@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.models.recruitment import Position
 from app.services.ai import get_llm_client
+from app.utils.llm_json import extract_json_object
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -93,13 +94,9 @@ async def match_position_for_resume(
             max_tokens=1024,
         )
         content = (resp.choices[0].message.content or "").strip()
-        if content.startswith("```json"):
-            content = content[7:]
-        if content.startswith("```"):
-            content = content[3:]
-        if content.endswith("```"):
-            content = content[:-3]
-        data = json.loads(content.strip())
+        data = extract_json_object(content)
+        if data is None:
+            raise ValueError("模型未返回可解析的 JSON")
     except json.JSONDecodeError as e:
         logger.warning("position_matcher 返回非法 JSON: %s", e)
         return None, None, f"AI 返回格式错误: {e}"

@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-import json
-
-from sqlalchemy import text as sa_text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.field_profiles import (
@@ -82,62 +79,76 @@ async def _get_position(params: dict, db: AsyncSession) -> str:
 
 
 async def _create_position(params: dict, db: AsyncSession) -> str:
-    columns = []
-    values = {}
-    for camel_key, value in params.items():
-        col = _COL_MAP.get(camel_key)
-        if col and value is not None:
-            columns.append(col)
-            values[col] = value
-    if not columns:
-        return "创建失败：没有提供有效字段"
-    placeholders = ", ".join(f":{c}" for c in columns)
-    cols_str = ", ".join(columns)
-    sql = (
-        f"INSERT INTO positions (id, {cols_str}) "
-        f"VALUES (gen_random_uuid(), {placeholders}) RETURNING id"
+    """走正规路由函数：保留重名查重（conflict）与字段白名单校验。
+
+    注意 CreatePositionRequest 只覆盖基础字段，评分标准/试用期计划等
+    只在 UpdatePositionRequest 里；若模型一次性传了这些，创建成功后
+    再补一次 update_position。
+    """
+    from app.api.recruitment.positions import (
+        create_position as fn,
+        update_position as update_fn,
+        CreatePositionRequest,
+        UpdatePositionRequest,
     )
-    result = await db.execute(sa_text(sql), values)
-    row = result.fetchone()
-    new_id = str(row[0]) if row else "?"
-    await db.flush()
-    return f"已创建岗位「{params.get('name', '未命名')}」(ID: {new_id})"
+
+    known = {k: v for k, v in params.items() if k in _COL_MAP and v is not None}
+    if not known:
+        return "创建岗位失败：没有提供有效字段"
+    if not known.get("name"):
+        return "创建岗位失败：缺少岗位名称 name"
+
+    create_fields = set(CreatePositionRequest.model_fields) | {
+        f.alias for f in CreatePositionRequest.model_fields.values() if f.alias
+    }
+    base = {k: v for k, v in known.items() if k in create_fields}
+    extra = {k: v for k, v in known.items() if k not in create_fields}
+
+    result = await fn(req=CreatePositionRequest(**base), db=db)
+    if result.get("code") != 0:
+        return f"创建岗位失败：{result.get('message', '')}"
+    new_id = (result.get("data") or {}).get("id", "?")
+
+    if extra:
+        upd = await update_fn(
+            position_id=new_id,
+            req=UpdatePositionRequest(**extra),
+            db=db,
+        )
+        if upd.get("code") != 0:
+            return (
+                f"已创建岗位「{known['name']}」(ID: {new_id})，"
+                f"但补充字段写入失败：{upd.get('message', '')}"
+            )
+    return f"已创建岗位「{known['name']}」(ID: {new_id})"
 
 
 async def _update_position(params: dict, db: AsyncSession) -> str:
-    fields = params.get("fields", {})
-    position_id = params["id"]
-    set_clauses = []
-    values = {"id": position_id}
-    for camel_key, value in fields.items():
-        col = _COL_MAP.get(camel_key)
-        if col and value is not None:
-            set_clauses.append(f"{col} = :{col}")
-            if isinstance(value, dict):
-                values[col] = json.dumps(value, ensure_ascii=False)
-            else:
-                values[col] = value
-    if not set_clauses:
-        return "没有可更新的字段（提供的字段名可能不正确）"
-    sql = f"UPDATE positions SET {', '.join(set_clauses)} WHERE id = :id"
-    result = await db.execute(sa_text(sql), values)
-    await db.flush()
-    rowcount = result.rowcount
-    verify_cols = ", ".join(_COL_MAP[c] for c in fields if c in _COL_MAP)
+    """走正规路由函数：岗位不存在会返回 404，不再出现「影响 0 行」被判成功。"""
+    from app.api.recruitment.positions import (
+        update_position as fn,
+        UpdatePositionRequest,
+    )
+
+    fields = params.get("fields") or {}
+    known = {k: v for k, v in fields.items() if k in _COL_MAP and v is not None}
+    if not known:
+        return "更新岗位失败：没有可更新的字段（提供的字段名可能不正确）"
+
+    result = await fn(
+        position_id=params["id"],
+        req=UpdatePositionRequest(**known),
+        db=db,
+    )
+    if result.get("code") != 0:
+        return f"更新岗位失败：{result.get('message', '')}"
+
+    data = result.get("data") or {}
     previews = []
-    if verify_cols:
-        verify = await db.execute(
-            sa_text(f"SELECT {verify_cols} FROM positions WHERE id = :id"),
-            {"id": position_id},
-        )
-        row = verify.fetchone()
-        if row:
-            for i, col_name in enumerate(verify_cols.split(", ")):
-                val = row[i]
-                preview = (str(val) or "")[:80]
-                previews.append(f"{col_name}={preview}")
-    preview_text = "; ".join(previews) if previews else "ok"
-    return f"已更新岗位，影响 {rowcount} 行。回读验证: {preview_text}"
+    for key in known:
+        val = data.get(key)
+        previews.append(f"{key}={str(val)[:80]}")
+    return f"已更新岗位 {params['id']}。回读验证: {'; '.join(previews)}"
 
 
 async def _delete_position(params: dict, db: AsyncSession) -> str:

@@ -9,6 +9,7 @@ from app.models.performance import PerformanceRecord, PerformanceQuarter
 from app.models.probation import Employee
 from app.config import get_settings
 from app.services.system.system_settings import get_system_setting
+from app.utils.responses import ok, not_found
 
 router = APIRouter(tags=["绩效"])
 settings = get_settings()
@@ -50,25 +51,18 @@ async def get_performance_stats(quarter: Optional[str] = Query(None), db: AsyncS
 
     participants = len(records)
     if participants == 0:
-        return {
-            "code": 0, "message": "ok",
-            "data": {"participants": 0, "avgScore": 0, "excellentCount": 0, "needsImprovement": 0},
-        }
+        return ok({"participants": 0, "avgScore": 0, "excellentCount": 0, "needsImprovement": 0})
 
     avg_score = round(sum(r.total_score or 0 for r in records) / participants, 1)
     excellent_count = sum(1 for r in records if (r.grade or "") in ("S", "A"))
     needs_improvement = sum(1 for r in records if (r.grade or "") == "C")
 
-    return {
-        "code": 0,
-        "message": "ok",
-        "data": {
-            "participants": participants,
-            "avgScore": avg_score,
-            "excellentCount": excellent_count,
-            "needsImprovement": needs_improvement,
-        },
-    }
+    return ok({
+          "participants": participants,
+          "avgScore": avg_score,
+          "excellentCount": excellent_count,
+          "needsImprovement": needs_improvement,
+      })
 
 
 @router.get("/performance")
@@ -92,16 +86,12 @@ async def list_performance(
     result = await db.execute(query)
     records = result.unique().scalars().all()
 
-    return {
-        "code": 0,
-        "message": "ok",
-        "data": {
-            "list": [serialize_record(r) for r in records],
-            "total": total,
-            "page": page,
-            "pageSize": pageSize,
-        },
-    }
+    return ok({
+          "list": [serialize_record(r) for r in records],
+          "total": total,
+          "page": page,
+          "pageSize": pageSize,
+      })
 
 
 @router.get("/performance/departments")
@@ -127,7 +117,7 @@ async def get_department_performance(quarter: Optional[str] = Query(None), db: A
     ]
     data.sort(key=lambda x: x["score"], reverse=True)
 
-    return {"code": 0, "message": "ok", "data": data}
+    return ok(data)
 
 
 @router.get("/performance/grades")
@@ -154,7 +144,7 @@ async def get_grade_distribution(quarter: Optional[str] = Query(None), db: Async
         for g in grade_order
     ]
 
-    return {"code": 0, "message": "ok", "data": data}
+    return ok(data)
 
 
 @router.get("/performance/bonus")
@@ -166,23 +156,16 @@ async def get_bonus_info(quarter: Optional[str] = Query(None), db: AsyncSession 
     pq = pq_result.scalar_one_or_none()
 
     if not pq:
-        return {
-            "code": 0, "message": "ok",
-            "data": {"totalPool": 0, "distributed": 0, "pending": 0},
-        }
+        return ok({"totalPool": 0, "distributed": 0, "pending": 0})
 
     total_pool = float(pq.bonus_pool or 0)
     distributed = float(pq.distributed or 0)
 
-    return {
-        "code": 0,
-        "message": "ok",
-        "data": {
-            "totalPool": total_pool,
-            "distributed": distributed,
-            "pending": total_pool - distributed,
-        },
-    }
+    return ok({
+          "totalPool": total_pool,
+          "distributed": distributed,
+          "pending": total_pool - distributed,
+      })
 
 
 @router.get("/performance/trends")
@@ -211,7 +194,7 @@ async def get_quarter_trends(db: AsyncSession = Depends(get_db)):
     if data:
         data[-1]["isCurrent"] = True
 
-    return {"code": 0, "message": "ok", "data": data}
+    return ok(data)
 
 
 @router.post("/performance/initiate")
@@ -268,7 +251,7 @@ async def initiate_appraisal(
     except Exception:
         pass
 
-    return {"code": 0, "message": "ok", "data": {"quarter": quarter}}
+    return ok({"quarter": quarter})
 
 
 @router.put("/performance/{employee_id}/bonus")
@@ -287,8 +270,8 @@ async def update_bonus(
     )
     record = result.scalar_one_or_none()
     if not record:
-        return {"code": 404, "message": "绩效记录不存在", "data": None}
+        return not_found("绩效记录不存在")
 
     record.bonus = bonus
     await db.flush()
-    return {"code": 0, "message": "ok", "data": None}
+    return ok()

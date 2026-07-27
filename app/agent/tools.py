@@ -40,7 +40,7 @@ TOOL_REGISTRY = {
                 "id": {"type": "string", "description": "候选人 UUID（必须是 list_resumes 返回的真实 id）"},
                 "view": {
                     "type": "string",
-                    "description": "summary|core|detail|contact|screening|interview|full，默认 detail",
+                    "description": "summary|core|detail|contact|screening|file|full，默认 detail",
                 },
                 "fields": {
                     "type": "array",
@@ -323,6 +323,7 @@ TOOL_REGISTRY = {
             "type": "object",
             "properties": {
                 "category": {"type": "string", "enum": ["first_result", "second_result"]},
+                "limit": {"type": "integer", "description": "返回名次数量，默认20"},
             },
             "required": ["category"],
         },
@@ -383,11 +384,21 @@ TOOL_REGISTRY = {
     },
     "submit_evaluation": {
         "name": "submit_evaluation",
-        "description": "提交候选人面试评定（将已评分题目状态置为 scored）。",
+        "description": (
+            "提交候选人某一轮面试评定（把已评分题目置为 scored）。"
+            "⚠️ 有副作用：会按加权总分（Q&A 80% + 自我介绍 10% + 反问 10%）与合格分数线"
+            "**自动推进或淘汰候选人**——一面通过→round2，二面通过→pending_offer，"
+            "未达线→rejected（淘汰）。属于破坏性操作，执行前必须先向用户说明并取得确认。"
+        ),
         "parameters": {
             "type": "object",
             "properties": {
                 "candidateId": {"type": "string"},
+                "round": {
+                    "type": "string",
+                    "description": "面试轮次：first=一面 / second=二面，默认 first。传错轮次会推进到错误状态。",
+                    "enum": ["first", "second"],
+                },
             },
             "required": ["candidateId"],
         },
@@ -412,7 +423,19 @@ TOOL_REGISTRY = {
             "type": "object",
             "properties": {
                 "department": {"type": "string"},
-                "status": {"type": "string", "description": "assessing/passed/failed"},
+                "status": {
+                    "type": "string",
+                    "enum": [
+                        "all", "pending_onboard", "training", "probation",
+                        "pending_confirmation", "formal", "transferred", "resigned",
+                    ],
+                    "description": (
+                        "员工状态：pending_onboard=待入职, training=培训中, probation=试用期中, "
+                        "pending_confirmation=待转正审批, formal=已转正, transferred=已调岗, "
+                        "resigned=已离职；all=不筛选"
+                    ),
+                },
+                "limit": {"type": "integer", "description": "返回数量限制，默认10"},
             },
         },
     },
@@ -424,14 +447,19 @@ TOOL_REGISTRY = {
     "get_probation_employee": {
         "name": "get_probation_employee",
         "description": (
-            "获取试用期员工信息。按意图选字段，默认 core（日期/导师/周考/转正/AI分）。"
-            "view: summary|core|tasks|week1|conversion|full；或 fields 指定字段。"
+            "获取试用期员工信息。按意图选字段，默认 core（入职/试用截止日、导师、进度、AI 结论）。"
+            "view: summary|core|tasks|full；或 fields 指定字段。"
+            "周考细节看 tasks（任务自带 weekNumber），转正结论看 core 的 aiScore/aiResult/overallScore。"
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "id": {"type": "string", "description": "员工ID"},
-                "view": {"type": "string", "description": "summary|core|tasks|week1|conversion|full"},
+                "view": {
+                    "type": "string",
+                    "enum": ["summary", "core", "tasks", "full"],
+                    "description": "summary|core|tasks|full",
+                },
                 "fields": {"type": "array", "items": {"type": "string"}, "description": "精确字段列表"},
                 "purpose": {"type": "string", "description": "本轮用户意图摘要"},
             },
@@ -474,12 +502,20 @@ TOOL_REGISTRY = {
     },
     "update_probation_task": {
         "name": "update_probation_task",
-        "description": "更新试用期任务（状态/标题/描述/评审意见）。",
+        "description": (
+            "更新试用期任务（状态/标题/描述/评审意见）。"
+            "status 合法值只有：draft / pending_confirm / in_progress / pending_review / "
+            "passed / rework / closed —— 完成用 passed，**不要用 completed/done/finished**，"
+            "非法值或非法迁移会被状态机拒绝（409）。"
+        ),
         "parameters": {
             "type": "object",
             "properties": {
                 "taskId": {"type": "string"},
-                "fields": {"type": "object", "description": "title/status/description/reviewNotes/weekNumber/deadline"},
+                "fields": {"type": "object", "description": (
+                    "title/description/reviewNotes/objective/deliverables 等；"
+                    "status 只能取 draft/pending_confirm/in_progress/pending_review/passed/rework/closed"
+                )},
             },
             "required": ["taskId", "fields"],
         },
@@ -502,7 +538,18 @@ TOOL_REGISTRY = {
             "type": "object",
             "properties": {
                 "employeeId": {"type": "string"},
-                "status": {"type": "string", "description": "assessing/passed/failed"},
+                "status": {
+                    "type": "string",
+                    "enum": [
+                        "pending_onboard", "training", "probation",
+                        "pending_confirmation", "formal", "transferred", "resigned",
+                    ],
+                    "description": (
+                        "目标状态：pending_onboard=待入职, training=培训中, probation=试用期中, "
+                        "pending_confirmation=待转正审批, formal=已转正, transferred=已调岗, "
+                        "resigned=已离职。非法迁移会被状态机拒绝（409）。"
+                    ),
+                },
             },
             "required": ["employeeId", "status"],
         },
@@ -529,6 +576,7 @@ TOOL_REGISTRY = {
             "type": "object",
             "properties": {
                 "quarter": {"type": "string", "description": "如：2026-Q3"},
+                "limit": {"type": "integer", "description": "返回数量限制，默认10"},
             },
             "required": ["quarter"],
         },
@@ -634,6 +682,7 @@ TOOL_REGISTRY = {
             "properties": {
                 "categoryKey": {"type": "string"},
                 "keyword": {"type": "string"},
+                "limit": {"type": "integer", "description": "返回数量限制，默认10"},
             },
         },
     },
@@ -649,7 +698,11 @@ TOOL_REGISTRY = {
     },
     "upload_knowledge_file": {
         "name": "upload_knowledge_file",
-        "description": "上传知识库素材文件到 MinIO，返回 object key。fileKey 必须由前端「添加资料」上传后获得。",
+        "description": (
+            "确认知识库素材文件已就绪（本工具**不做任何上传**：文件在用户点「添加资料」时"
+            "就已经进了 MinIO，这里只是回显 object key 并提示进入下一步）。"
+            "调用后必须接着调 create_knowledge_item 才算真正入库。"
+        ),
         "parameters": {
             "type": "object",
             "properties": {
@@ -775,6 +828,8 @@ TOOL_REGISTRY = {
             "type": "object",
             "properties": {
                 "kbId": {"type": "string"},
+                "status": {"type": "string", "description": "按入库状态过滤，留空表示不过滤"},
+                "limit": {"type": "integer", "description": "返回数量限制，默认20"},
             },
         },
     },
@@ -807,13 +862,17 @@ TOOL_REGISTRY = {
         "name": "get_settings",
         "description": (
             "获取系统设置。按意图选字段，默认 core。"
-            "view: summary|core|scoring|ai|notify|full；或 fields 指定 key。"
+            "view: summary|core|scoring|ai|knowledge|notify|full；或 fields 指定 key。"
             "修改前先 get 再 update_settings，key 必须与返回的 [字段: xxx] 一致。"
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "view": {"type": "string", "description": "summary|core|scoring|ai|notify|full"},
+                "view": {
+                    "type": "string",
+                    "enum": ["summary", "core", "scoring", "ai", "knowledge", "notify", "full"],
+                    "description": "summary|core|scoring|ai|knowledge|notify|full",
+                },
                 "fields": {"type": "array", "items": {"type": "string"}, "description": "精确设置 key 列表"},
                 "purpose": {"type": "string", "description": "本轮用户意图摘要"},
             },
@@ -838,62 +897,16 @@ TOOL_REGISTRY = {
 GENERAL_TOOL_NAMES = tuple(TOOL_REGISTRY.keys())
 
 
-def get_tools_for_agent(agent_id: str = "recruit") -> List[dict]:
+def get_tools_for_agent(agent_id: str = "genie") -> List[dict]:
     """Get the list of tool definitions for a specific agent type.
 
-    The system now defaults to a single omnipotent agent ("genie") that has
-    access to ALL tools. The legacy 4-agent IDs (recruit/interview/training/
-    performance) are kept for backward compatibility and still return a
-    scoped subset, but the frontend is expected to use the "genie" agent.
+    系统只剩一个全能 agent（"genie"），它拿到全部工具。旧的 4 个分组
+    （recruit/interview/training/performance）连同它们过时的工具清单已删除
+    —— 那份清单早已与 TOOL_REGISTRY 脱节，且没有任何调用方还在传这些 id。
+    任何未知 agent_id 一律退回全量工具（与 genie 相同），保证不会因为
+    传错 id 就把工具集悄悄裁掉。
     """
-    # The omnipotent agent gets general-safe tools (excludes db_* unless database intent).
-    if agent_id in ("genie", "all", "omnipotent"):
-        return [TOOL_REGISTRY[name] for name in GENERAL_TOOL_NAMES]
-
-    # Legacy scoped subsets (kept for backward compat / @-mention routing).
-    recruit_tools = [
-        "list_resumes", "get_resume", "list_positions", "get_position",
-        "update_resume", "upload_resume", "batch_parse_resumes",
-        "reanalyze_resume", "delete_resume", "rag_search",
-    ]
-    interview_tools = [
-        "get_questions", "save_questions", "generate_questions", "replace_question",
-        "get_evaluation", "save_evaluation", "submit_evaluation",
-        "ai_score_question", "get_leaderboard", "get_rankings", "rag_search",
-    ]
-    training_tools = [
-        "list_probation", "get_probation_stats", "get_probation_employee",
-        "create_probation_employee",
-        "create_probation_task", "update_probation_task",
-        "ai_evaluate_probation", "update_probation_status", "manual_review_probation",
-        "rag_search",
-    ]
-    performance_tools = [
-        "list_performance", "get_performance_stats", "get_department_performance",
-        "get_grade_distribution", "get_bonus_info", "get_quarter_trends",
-        "initiate_appraisal", "update_bonus", "rag_search",
-    ]
-
-    tool_map = {
-        "recruit": recruit_tools,
-        "interview": interview_tools,
-        "training": training_tools,
-        "performance": performance_tools,
-    }
-
-    # All agents get some common tools
-    common = [
-        "get_operations_dashboard",
-        "get_settings", "update_settings",
-        "list_knowledge", "get_knowledge_stats", "get_knowledge_categories",
-        "create_knowledge_item", "update_knowledge_item", "delete_knowledge_item",
-        "recall_test", "upload_knowledge_file",
-        "list_knowledge_bases", "create_knowledge_base", "update_knowledge_base",
-        "delete_knowledge_base", "upload_document", "list_documents", "delete_document",
-    ]
-    names = tool_map.get(agent_id, recruit_tools) + common
-
-    return [TOOL_REGISTRY[name] for name in names if name in TOOL_REGISTRY]
+    return [TOOL_REGISTRY[name] for name in GENERAL_TOOL_NAMES]
 
 
 # ── LangChain / LangGraph Tool Conversion ────────────────
@@ -971,7 +984,7 @@ async def _execute_tool_sync(tool_name: str, **kwargs) -> str:
         await _asyncio.shield(db.close())
 
 
-def create_langchain_tools(agent_id: str = "recruit") -> list:
+def create_langchain_tools(agent_id: str = "genie") -> list:
     """Convert the tool registry into LangChain StructuredTool objects.
 
     Returns a list of tools compatible with LangGraph's ToolNode.

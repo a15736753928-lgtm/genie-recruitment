@@ -155,7 +155,11 @@ class EquityRecord(Base):
 # ═══════════════════════════════════════════════
 
 class Project(Base):
-    """项目需求 —— AI 按技能匹配人才,项目负责人确认组队。"""
+    """业务项目需求 —— AI 按技能匹配人才，项目负责人确认组队。
+
+    注意与 `app/models/agent_session.py::AgentProject` 区分：那个是 AI 对话工作台的
+    会话文件夹，跟人员组队毫无关系。
+    """
     __tablename__ = "projects"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)

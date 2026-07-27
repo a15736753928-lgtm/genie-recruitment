@@ -23,7 +23,7 @@ from app.config import get_settings
 settings = get_settings()
 
 
-# ── 评分维度（固定 4 个，与前端 SELF_INTRO_DIMENSION_NAMES 完全一致）──────────
+# ── 自我介绍环节评分维度（固定 4 个）──────────────────────────────
 SELF_INTRO_DIMENSIONS: List[str] = ["内容完整度", "表达清晰度", "岗位匹配度", "亮点真实性"]
 
 # 每个维度的评分量表（rubric），供 Agent 保持评分一致性。

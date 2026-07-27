@@ -160,9 +160,28 @@ async def _save_evaluation(params: dict, db: AsyncSession) -> str:
 
 
 async def _submit_evaluation(params: dict, db: AsyncSession) -> str:
-    from app.api.talent.interview import submit_evaluation as fn
-    result = await fn(candidate_id=params["candidateId"], db=db)
-    return f"已提交候选人 {params['candidateId']} 的面试评定" if result["code"] == 0 else f"提交失败：{result.get('message', '')}"
+    from app.api.talent.interview import submit_evaluation as fn, normalize_interview_round
+
+    # 路由参数名是 round_（alias="round"）且带 Query 默认值：直调必须显式传 round_，
+    # 否则拿到的是 Query 对象，`round_ == "second"` 恒为 False，二面分支永远走不到。
+    round_key = normalize_interview_round(params.get("round") or "first")
+    round_label = _round_label(round_key)
+    result = await fn(candidate_id=params["candidateId"], round_=round_key, db=db)
+    if result.get("code") != 0:
+        return f"提交失败：{result.get('message', '')}"
+    d = result.get("data") or {}
+    final_score = d.get("finalScore")
+    passed = d.get("passed")
+    if passed is True:
+        outcome = "已推进到二面" if round_key == "first" else "已推进到待发 Offer"
+    elif passed is False:
+        outcome = "候选人已被标记为未通过（rejected）"
+    else:
+        outcome = "候选人状态未变更"
+    return (
+        f"已提交候选人 {params['candidateId']} 的{round_label}评定，"
+        f"加权总分 {final_score}（合格线 {d.get('passThreshold', '—')}）。{outcome}。"
+    )
 
 
 async def _get_rankings(params: dict, db: AsyncSession) -> str:

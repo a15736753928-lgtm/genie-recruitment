@@ -26,6 +26,7 @@ from app.services.rag.ingest_service import ingest_file_async
 from app.services.rag.utils import (
     validate_kb_id, check_extension, check_size, SUPPORTED_EXTENSIONS,
 )
+from app.utils.responses import ok, fail, not_found, conflict
 
 router = APIRouter(prefix="/api/v1/rag", tags=["RAG 知识库"])
 settings = get_settings()
@@ -59,27 +60,23 @@ async def list_knowledge_bases(
     result = await db.execute(query)
     kbs = result.scalars().all()
 
-    return {
-        "code": 200,
-        "message": "success",
-        "data": {
-            "list": [
-                {
-                    "id": kb.id,
-                    "name": kb.name,
-                    "description": kb.description or "",
-                    "docCount": kb.doc_count or 0,
-                    "chunkCount": kb.chunk_count or 0,
-                    "createdAt": kb.created_at,
-                    "updatedAt": kb.updated_at,
-                }
-                for kb in kbs
-            ],
-            "total": total,
-            "page": page,
-            "pageSize": page_size,
-        },
-    }
+    return ok({
+          "list": [
+              {
+                  "id": kb.id,
+                  "name": kb.name,
+                  "description": kb.description or "",
+                  "docCount": kb.doc_count or 0,
+                  "chunkCount": kb.chunk_count or 0,
+                  "createdAt": kb.created_at,
+                  "updatedAt": kb.updated_at,
+              }
+              for kb in kbs
+          ],
+          "total": total,
+          "page": page,
+          "pageSize": page_size,
+      }, message="success")
 
 
 @router.post("/knowledge-bases")
@@ -90,14 +87,14 @@ async def create_knowledge_base(
     """Create a new knowledge base."""
     name = body.get("name", "").strip()
     if not name:
-        return {"code": 400, "message": "知识库名称不能为空", "data": None}
+        return fail(400, "知识库名称不能为空")
 
     # Check uniqueness
     existing = await db.execute(
         select(KnowledgeBase).where(KnowledgeBase.name == name)
     )
     if existing.scalar_one_or_none():
-        return {"code": 409, "message": "知识库名称已存在", "data": None}
+        return conflict("知识库名称已存在")
 
     kb = KnowledgeBase(
         id=_short_uuid("kb"),
@@ -111,19 +108,15 @@ async def create_knowledge_base(
     await db.flush()
     await db.refresh(kb)
 
-    return {
-        "code": 200,
-        "message": "success",
-        "data": {
-            "id": kb.id,
-            "name": kb.name,
-            "description": kb.description or "",
-            "docCount": 0,
-            "chunkCount": 0,
-            "createdAt": kb.created_at,
-            "updatedAt": kb.updated_at,
-        },
-    }
+    return ok({
+          "id": kb.id,
+          "name": kb.name,
+          "description": kb.description or "",
+          "docCount": 0,
+          "chunkCount": 0,
+          "createdAt": kb.created_at,
+          "updatedAt": kb.updated_at,
+      }, message="success")
 
 
 @router.get("/knowledge-bases/{kb_id}")
@@ -137,21 +130,17 @@ async def get_knowledge_base(
     )
     kb = result.scalar_one_or_none()
     if not kb:
-        return {"code": 404, "message": "知识库不存在", "data": None}
+        return not_found("知识库不存在")
 
-    return {
-        "code": 200,
-        "message": "success",
-        "data": {
-            "id": kb.id,
-            "name": kb.name,
-            "description": kb.description or "",
-            "docCount": kb.doc_count or 0,
-            "chunkCount": kb.chunk_count or 0,
-            "createdAt": kb.created_at,
-            "updatedAt": kb.updated_at,
-        },
-    }
+    return ok({
+          "id": kb.id,
+          "name": kb.name,
+          "description": kb.description or "",
+          "docCount": kb.doc_count or 0,
+          "chunkCount": kb.chunk_count or 0,
+          "createdAt": kb.created_at,
+          "updatedAt": kb.updated_at,
+      }, message="success")
 
 
 @router.put("/knowledge-bases/{kb_id}")
@@ -166,7 +155,7 @@ async def update_knowledge_base(
     )
     kb = result.scalar_one_or_none()
     if not kb:
-        return {"code": 404, "message": "知识库不存在", "data": None}
+        return not_found("知识库不存在")
 
     if "name" in body:
         kb.name = body["name"]
@@ -177,7 +166,7 @@ async def update_knowledge_base(
     await db.flush()
     await db.refresh(kb)
 
-    return {"code": 200, "message": "已更新", "data": None}
+    return ok(message="已更新")
 
 
 @router.delete("/knowledge-bases/{kb_id}")
@@ -194,7 +183,7 @@ async def delete_knowledge_base(
     )
     kb = result.scalar_one_or_none()
     if not kb:
-        return {"code": 404, "message": "知识库不存在", "data": None}
+        return not_found("知识库不存在")
 
     # Get milvus PKs for all chunks in this KB
     from app.infrastructure.milvus_manager import delete_by_ids
@@ -220,7 +209,7 @@ async def delete_knowledge_base(
     if milvus_pks:
         await asyncio.to_thread(delete_by_ids, milvus_pks)
 
-    return {"code": 200, "message": "已删除", "data": None}
+    return ok(message="已删除")
 
 
 # ── Document Management ─────────────────────────────────
@@ -243,22 +232,14 @@ async def upload_document(
     """
     # Validate kb_id format
     if not validate_kb_id(kb_id):
-        return {
-            "code": 400,
-            "message": f"无效的知识库 ID 格式: {kb_id[:20]}...",
-            "data": None,
-        }
+        return fail(400, f"无效的知识库 ID 格式: {kb_id[:20]}...")
 
     filename = file.filename or "unknown"
 
     # Validate file extension
     if file.filename and not check_extension(file.filename):
         supported = ", ".join(sorted(SUPPORTED_EXTENSIONS))
-        return {
-            "code": 400,
-            "message": f"不支持的文件格式。支持: {supported}",
-            "data": None,
-        }
+        return fail(400, f"不支持的文件格式。支持: {supported}")
 
     # Reject duplicate filename within the same knowledge base
     existing_doc = await db.execute(
@@ -268,20 +249,12 @@ async def upload_document(
         ).limit(1)
     )
     if existing_doc.scalar_one_or_none():
-        return {
-            "code": 409,
-            "message": f"知识库中已存在同名文件「{filename}」，请先删除后再上传",
-            "data": None,
-        }
+        return conflict(f"知识库中已存在同名文件「{filename}」，请先删除后再上传")
 
     # Validate file size
     content = await file.read()
     if not check_size(len(content)):
-        return {
-            "code": 413,
-            "message": f"文件过大: {len(content)} > {settings.max_file_size} 字节",
-            "data": None,
-        }
+        return fail(413, f"文件过大: {len(content)} > {settings.max_file_size} 字节")
 
     # Save file to MinIO (object key: rag/<uuid>.<ext>)
     file_ext = os.path.splitext(file.filename or "document")[1] or ".txt"
@@ -295,7 +268,7 @@ async def upload_document(
             "application/octet-stream",
         )
     except Exception as e:
-        return {"code": 500, "message": f"文件存储失败: {e}", "data": None}
+        return fail(500, f"文件存储失败: {e}")
 
     # Start async ingestion (downloads from MinIO inside the worker thread)
     try:
@@ -306,18 +279,14 @@ async def upload_document(
             file_size=len(content),
         )
     except ValueError as e:
-        return {"code": 400, "message": str(e), "data": None}
+        return fail(400, str(e))
 
-    return {
-        "code": 200,
-        "message": "上传成功，正在后台处理",
-        "data": {
-            "docId": doc_id,
-            "taskId": task_id,
-            "fileName": file.filename,
-            "fileSize": len(content),
-        },
-    }
+    return ok({
+          "docId": doc_id,
+          "taskId": task_id,
+          "fileName": file.filename,
+          "fileSize": len(content),
+      }, message="上传成功，正在后台处理")
 
 
 @router.get("/documents")
@@ -363,30 +332,26 @@ async def list_documents(
         dt = datetime.utcfromtimestamp(ms / 1000)
         return dt.strftime("%Y-%m-%d %H:%M")
 
-    return {
-        "code": 200,
-        "message": "success",
-        "data": {
-            "list": [
-                {
-                    "id": d.id,
-                    "kbId": d.kb_id,
-                    "kbName": kb_map.get(d.kb_id, ""),
-                    "fileName": d.file_name,
-                    "fileType": d.file_type,
-                    "fileSize": d.file_size,
-                    "chunkCount": d.chunk_count or 0,
-                    "status": d.status,
-                    "ingestedAt": _format_ts(d.uploaded_at),
-                    "createdAt": d.created_at,
-                }
-                for d in docs
-            ],
-            "total": total,
-            "page": page,
-            "pageSize": page_size,
-        },
-    }
+    return ok({
+          "list": [
+              {
+                  "id": d.id,
+                  "kbId": d.kb_id,
+                  "kbName": kb_map.get(d.kb_id, ""),
+                  "fileName": d.file_name,
+                  "fileType": d.file_type,
+                  "fileSize": d.file_size,
+                  "chunkCount": d.chunk_count or 0,
+                  "status": d.status,
+                  "ingestedAt": _format_ts(d.uploaded_at),
+                  "createdAt": d.created_at,
+              }
+              for d in docs
+          ],
+          "total": total,
+          "page": page,
+          "pageSize": page_size,
+      }, message="success")
 
 
 @router.get("/documents/{doc_id}")
@@ -400,7 +365,7 @@ async def get_document(
     )
     doc = result.scalar_one_or_none()
     if not doc:
-        return {"code": 404, "message": "文档不存在", "data": None}
+        return not_found("文档不存在")
 
     kb_result = await db.execute(
         select(KnowledgeBase).where(KnowledgeBase.id == doc.kb_id)
@@ -412,22 +377,18 @@ async def get_document(
             return ""
         return datetime.utcfromtimestamp(ms / 1000).strftime("%Y-%m-%d %H:%M")
 
-    return {
-        "code": 200,
-        "message": "success",
-        "data": {
-            "id": doc.id,
-            "kbId": doc.kb_id,
-            "kbName": kb.name if kb else "",
-            "fileName": doc.file_name,
-            "fileType": doc.file_type,
-            "fileSize": doc.file_size,
-            "fileHash": doc.file_hash,
-            "chunkCount": doc.chunk_count or 0,
-            "status": doc.status,
-            "ingestedAt": _format_ts(doc.uploaded_at),
-        },
-    }
+    return ok({
+          "id": doc.id,
+          "kbId": doc.kb_id,
+          "kbName": kb.name if kb else "",
+          "fileName": doc.file_name,
+          "fileType": doc.file_type,
+          "fileSize": doc.file_size,
+          "fileHash": doc.file_hash,
+          "chunkCount": doc.chunk_count or 0,
+          "status": doc.status,
+          "ingestedAt": _format_ts(doc.uploaded_at),
+      }, message="success")
 
 
 @router.get("/documents/{doc_id}/file")
@@ -447,7 +408,7 @@ async def get_document_file(
     if not doc or not doc.object_key:
         return JSONResponse(
             status_code=404,
-            content={"code": 404, "message": "文档或原始文件不存在", "data": None},
+            content=not_found("文档或原始文件不存在"),
         )
 
     from starlette.responses import StreamingResponse, FileResponse
@@ -486,11 +447,7 @@ async def get_document_file(
     if not minio_storage.object_exists(stored):
         return JSONResponse(
             status_code=404,
-            content={
-                "code": 404,
-                "message": "原始文件不存在或已被清理，请重新上传该文档",
-                "data": None,
-            },
+            content=not_found("原始文件不存在或已被清理，请重新上传该文档"),
         )
 
     try:
@@ -498,7 +455,7 @@ async def get_document_file(
     except Exception as e:
         return JSONResponse(
             status_code=500,
-            content={"code": 500, "message": f"读取文件失败: {e}", "data": None},
+            content=fail(500, f"读取文件失败: {e}"),
         )
 
     def _iter():
@@ -537,7 +494,7 @@ async def delete_document(
     doc = result.scalar_one_or_none()
     if not doc:
         log.warning("删除文档：文档不存在 doc_id=%s", doc_id)
-        return {"code": 404, "message": "文档不存在", "data": None}
+        return not_found("文档不存在")
 
     log.info(
         "删除文档 doc_id=%s file=%s kb=%s source_type=%s source_id=%s",
@@ -556,7 +513,7 @@ async def delete_document(
         await db.flush()
 
     log.info("删除文档完成 doc_id=%s", doc_id)
-    return {"code": 200, "message": "已删除", "data": None}
+    return ok(message="已删除")
 
 
 @router.get("/documents/{doc_id}/chunks")
@@ -573,7 +530,7 @@ async def get_document_chunks(
     )
     doc = doc_result.scalar_one_or_none()
     if not doc:
-        return {"code": 404, "message": "文档不存在", "data": None}
+        return not_found("文档不存在")
 
     count_result = await db.execute(
         select(func.count()).select_from(KnowledgeChunk)
@@ -590,24 +547,20 @@ async def get_document_chunks(
     )
     chunks = result.scalars().all()
 
-    return {
-        "code": 200,
-        "message": "success",
-        "data": {
-            "list": [
-                {
-                    "id": c.milvus_pk,
-                    "chunkIndex": c.chunk_index,
-                    "text": c.chunk_text,
-                    "charCount": len(c.chunk_text),
-                }
-                for c in chunks
-            ],
-            "total": total,
-            "page": page,
-            "pageSize": page_size,
-        },
-    }
+    return ok({
+          "list": [
+              {
+                  "id": c.milvus_pk,
+                  "chunkIndex": c.chunk_index,
+                  "text": c.chunk_text,
+                  "charCount": len(c.chunk_text),
+              }
+              for c in chunks
+          ],
+          "total": total,
+          "page": page,
+          "pageSize": page_size,
+      }, message="success")
 
 
 # ── Ingestion Task Tracking ─────────────────────────────
@@ -623,24 +576,20 @@ async def get_ingest_task(
     )
     task = result.scalar_one_or_none()
     if not task:
-        return {"code": 404, "message": "任务不存在", "data": None}
+        return not_found("任务不存在")
 
-    return {
-        "code": 200,
-        "message": "success",
-        "data": {
-            "id": task.id,
-            "docId": task.doc_id,
-            "kbId": task.kb_id,
-            "fileName": task.file_name,
-            "fileSize": task.file_size,
-            "status": task.status,
-            "progress": task.progress,
-            "message": task.message,
-            "createdAt": task.created_at,
-            "updatedAt": task.updated_at,
-        },
-    }
+    return ok({
+          "id": task.id,
+          "docId": task.doc_id,
+          "kbId": task.kb_id,
+          "fileName": task.file_name,
+          "fileSize": task.file_size,
+          "status": task.status,
+          "progress": task.progress,
+          "message": task.message,
+          "createdAt": task.created_at,
+          "updatedAt": task.updated_at,
+      }, message="success")
 
 
 # ── Search / Retrieval ──────────────────────────────────
@@ -664,7 +613,7 @@ async def search_query(
     """
     query_text = body.get("query", "")
     if not query_text or not query_text.strip():
-        return {"code": 400, "message": "请提供查询文本", "data": []}
+        return fail(400, "请提供查询文本", [])
 
     kb_ids = body.get("kb_ids")
     from app.services.system.kb_settings import get_kb_runtime_settings
@@ -695,13 +644,9 @@ async def search_query(
         )
     except Exception as e:
         print(f"[Search] Error: {e}")
-        return {"code": 500, "message": f"检索失败: {str(e)}", "data": []}
+        return fail(500, f"检索失败: {str(e)}", [])
 
-    return {
-        "code": 200,
-        "message": "success",
-        "data": results,
-    }
+    return ok(results, message="success")
 
 
 @router.get("/search/chunk-content")
@@ -711,8 +656,8 @@ async def get_chunk(
     """Get full chunk text by its Milvus primary key."""
     result = await get_chunk_content(milvus_pk)
     if not result:
-        return {"code": 404, "message": "分片不存在", "data": None}
-    return {"code": 200, "message": "success", "data": result}
+        return not_found("分片不存在")
+    return ok(result, message="success")
 
 
 # ── Dashboard Stats ─────────────────────────────────────
@@ -775,28 +720,24 @@ async def get_dashboard_stats(
             return ""
         return datetime.utcfromtimestamp(ms / 1000).strftime("%Y-%m-%d %H:%M")
 
-    return {
-        "code": 200,
-        "message": "success",
-        "data": {
-            "kbCount": kb_total,
-            "documentCount": doc_total,
-            "chunkCount": chunk_total,
-            "vectorCount": vector_count,
-            "recentDocuments": [
-                {
-                    "id": d.id,
-                    "fileName": d.file_name,
-                    "fileType": d.file_type,
-                    "kbName": kb_map.get(d.kb_id, ""),
-                    "chunkCount": d.chunk_count or 0,
-                    "status": d.status,
-                    "ingestedAt": _format_ts(d.uploaded_at),
-                }
-                for d in recent_docs
-            ],
-        },
-    }
+    return ok({
+          "kbCount": kb_total,
+          "documentCount": doc_total,
+          "chunkCount": chunk_total,
+          "vectorCount": vector_count,
+          "recentDocuments": [
+              {
+                  "id": d.id,
+                  "fileName": d.file_name,
+                  "fileType": d.file_type,
+                  "kbName": kb_map.get(d.kb_id, ""),
+                  "chunkCount": d.chunk_count or 0,
+                  "status": d.status,
+                  "ingestedAt": _format_ts(d.uploaded_at),
+              }
+              for d in recent_docs
+          ],
+      }, message="success")
 
 
 @router.get("/dashboard/distribution")
@@ -821,4 +762,4 @@ async def get_distribution(
         })
 
     distribution.sort(key=lambda x: x["docCount"], reverse=True)
-    return {"code": 200, "message": "success", "data": distribution}
+    return ok(distribution, message="success")

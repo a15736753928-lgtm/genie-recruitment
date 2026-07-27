@@ -105,26 +105,28 @@ async def _get_resume(params: dict, db: AsyncSession) -> str:
     return format_projected(flat, selected, RESUME_FIELDS, title=title, max_text=1200, max_json=900)
 
 
+# 中文口语 → 状态机词表(state_machine.py TRANSITIONS["candidate"])的英文 key。
+# 注意：不提供"已入职/入职"别名 —— hired 只能由 Offer 审批通过后自动生成
+# （见 app/api/talent/offer.py），不允许对话侧直接把候选人改成 hired。
+# 模块级导出：app/agent_os/quality/verifier.py 做写后回读值比对时要复用同一张表。
+STATUS_ALIASES = {
+    "淘汰": "rejected",
+    "未通过": "rejected",
+    "一面未通过": "rejected",
+    "二面未通过": "rejected",
+    "初筛不通过": "rejected",
+    "求职中": "pending_screen",
+    "待筛选": "pending_screen",
+    "初筛通过": "invited",
+    "一面中": "round1",
+    "二面中": "round2",
+    "待发offer": "pending_offer",
+    "待发Offer": "pending_offer",
+}
+
+
 async def _update_resume(params: dict, db: AsyncSession) -> str:
     from app.api.recruitment.resumes import update_resume as fn
-
-    # 中文口语 → 状态机词表(state_machine.py TRANSITIONS["candidate"])的英文 key。
-    # 注意：不提供"已入职/入职"别名 —— hired 只能由 Offer 审批通过后自动生成
-    # （见 app/api/talent/offer.py），不允许对话侧直接把候选人改成 hired。
-    STATUS_ALIASES = {
-        "淘汰": "rejected",
-        "未通过": "rejected",
-        "一面未通过": "rejected",
-        "二面未通过": "rejected",
-        "初筛不通过": "rejected",
-        "求职中": "pending_screen",
-        "待筛选": "pending_screen",
-        "初筛通过": "invited",
-        "一面中": "round1",
-        "二面中": "round2",
-        "待发offer": "pending_offer",
-        "待发Offer": "pending_offer",
-    }
 
     fields = dict(params.get("fields") or {})
     if "status" in params:

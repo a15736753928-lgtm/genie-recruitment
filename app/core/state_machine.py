@@ -33,7 +33,9 @@ TRANSITIONS: dict[str, dict[str, list[str | None]]] = {
         # to_status: [合法 from_status, ...] (None=初始)
         "new":              [None],
         "parsed":           ["new"],
-        "pending_screen":   ["parsed"],
+        # AI 评分是解析与初筛的合并动作，简历入库后可能直接从 new 打分进筛选池，
+        # 不一定先落 parsed。只允许 parsed 会让候选人永远卡在 new，整条筛选链断掉。
+        "pending_screen":   ["new", "parsed"],
         "pending_materials":["pending_screen", "pending_materials"],
         "invited":          ["pending_screen", "pending_materials"],
         "round1":           ["invited"],
@@ -53,7 +55,9 @@ TRANSITIONS: dict[str, dict[str, list[str | None]]] = {
         # 完整生命周期(第二期会用全部迁移)
         "pending_onboard":       [None, "talent_pool"],
         "training":              ["pending_onboard"],
-        "probation":             ["training"],
+        # pending_confirmation → probation 是「转正未通过、延长试用期」的正规回退路径。
+        # 缺了它会让 phase2.approve_confirmation 的拒绝分支 100% 失败。
+        "probation":             ["training", "pending_confirmation"],
         "pending_confirmation":  ["probation"],
         "formal":                ["pending_confirmation"],
         "transferred":           ["formal", "probation"],

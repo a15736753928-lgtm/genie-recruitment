@@ -23,13 +23,14 @@ from app.database import get_db
 from app.models.recruitment import Candidate, Position
 from app.models.phase1 import Interview, OfferApproval, ResumeScore
 from app.models.probation import Employee
-from app.core.security import get_current_user, require_permission, CurrentUser
+from app.core.security import get_current_user, require_permission, CurrentUser, PermissionError_
 from app.core.state_machine import transition, StateError
 from app.utils.responses import ok, fail, not_found
 from app.utils.audit import write_audit
 from app.utils.clock import iso_utc
 from app.services.ai import llm_chat
 import logging
+from app.utils.llm_json import extract_json_object
 
 logger = logging.getLogger("genie.offer")
 router = APIRouter(tags=["录用审批"])
@@ -37,10 +38,32 @@ router = APIRouter(tags=["录用审批"])
 
 # ── Serializer ───────────────────────────────────────────────
 
+_LIST_SEPARATORS = "、\n\r;；,，"
+
+
+def _as_list(value) -> list[str]:
+    """把 Text 字段(顿号/换行/分号/逗号分隔的自由文本)统一成字符串数组。
+
+    strengths / capability_gaps / risks_note 在模型里都是 Column(Text)，
+    前端却按数组用(.join()/.map())，直接给字符串会白屏。空值返回 []。
+    """
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return [str(v).strip() for v in value if str(v).strip()]
+    text = str(value)
+    for sep in _LIST_SEPARATORS[1:]:
+        text = text.replace(sep, _LIST_SEPARATORS[0])
+    return [seg.strip() for seg in text.split(_LIST_SEPARATORS[0]) if seg.strip()]
+
+
 def serialize_offer(offer: OfferApproval, viewer=None) -> dict:
     show_salary = viewer is not None and (
         hasattr(viewer, "has") and viewer.has("salary:view")
     )
+    strengths = _as_list(offer.strengths)
+    gaps = _as_list(offer.capability_gaps)
+    risks = _as_list(offer.risks_note)
     return {
         "id": str(offer.id),
         "candidateId": str(offer.candidate_id),
@@ -52,9 +75,16 @@ def serialize_offer(offer: OfferApproval, viewer=None) -> dict:
         "teamScore": float(offer.team_score) if offer.team_score is not None else None,
         "finalScore": float(offer.final_score) if offer.final_score is not None else None,
         "aiAdvice": offer.ai_advice,
-        "strengths": offer.strengths,
-        "capabilityGaps": offer.capability_gaps,
-        "risksNote": offer.risks_note,
+        # 三个自由文本字段统一以数组输出；同时给出前端在用的别名 gaps / risks。
+        "strengths": strengths,
+        "capabilityGaps": gaps,
+        "gaps": gaps,
+        "risksNote": risks,
+        "risks": risks,
+        # 原始文本(编辑表单回填 textarea 用，PUT /offers/{id} 收的仍是字符串)
+        "strengthsText": offer.strengths,
+        "capabilityGapsText": offer.capability_gaps,
+        "risksNoteText": offer.risks_note,
         "suggestedSalary": offer.suggested_salary if show_salary else None,
         "salaryMasked": not show_salary,
         "probationGoal": offer.probation_goal,
@@ -161,13 +191,9 @@ async def _build_ai_advice(candidate: Candidate, offer: OfferApproval) -> Option
     try:
         raw_text = await llm_chat([{"role": "user", "content": prompt}])
         raw_text = raw_text.strip()
-        if raw_text.startswith("```json"):
-            raw_text = raw_text[7:]
-        elif raw_text.startswith("```"):
-            raw_text = raw_text[3:]
-        if raw_text.endswith("```"):
-            raw_text = raw_text[:-3]
-        raw_dict = json.loads(raw_text.strip())
+        raw_dict = extract_json_object(raw_text)
+        if raw_dict is None:
+            raise ValueError("模型未返回可解析的 JSON")
 
         evidence = raw_dict.get("evidence", [])
         if not evidence:
@@ -465,12 +491,26 @@ async def approve_offer(
 
 # ── GET /api/offers ───────────────────────────────────────────
 
+async def _require_offer_read(current: CurrentUser = Depends(get_current_user)) -> CurrentUser:
+    """录用审批单的只读权限（any-of）。
+
+    列表原先要求 `offer:approve`（只有 ceo/manager 有），导致 HR 打开招聘看板时
+    「待录用审批」恒为 0 —— 403 被前端静默降级成空数据，看不出是权限问题。
+    招聘链路上 HR 需要看到审批进度，故放开只读；写操作仍要 offer:approve。
+    注意 require_permission(*keys) 是 AND 语义，这里要的是 OR，只能自己写。
+    """
+    for key in ("offer:approve", "resume:view", "recruitment_request:confirm"):
+        if current.has(key):
+            return current
+    raise PermissionError_("无权限: 查看录用审批")
+
+
 @router.get("/offers")
 async def list_offers(
     page: int = Query(1, ge=1),
     pageSize: int = Query(20, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("offer:approve")),
+    current: CurrentUser = Depends(_require_offer_read),
 ):
     offset = (page - 1) * pageSize
 

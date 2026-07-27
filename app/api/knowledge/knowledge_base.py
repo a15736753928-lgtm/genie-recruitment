@@ -14,6 +14,7 @@ from app.database import get_db
 from app.models.knowledge import KnowledgeCategory, KnowledgeItem
 from app.config import get_settings
 from app.infrastructure import minio_storage
+from app.utils.responses import ok, fail, not_found
 
 router = APIRouter(tags=["知识库"])
 settings = get_settings()
@@ -231,14 +232,10 @@ async def get_knowledge_stats(db: AsyncSession = Depends(get_db)):
     )
     new_count = new_result.scalar() or 0
 
-    return {
-        "code": 0,
-        "message": "ok",
-        "data": {
-            "total": total,
-            "newThisMonth": new_count,
-        },
-    }
+    return ok({
+          "total": total,
+          "newThisMonth": new_count,
+      })
 
 
 @router.get("/knowledge/categories")
@@ -247,11 +244,7 @@ async def get_categories(db: AsyncSession = Depends(get_db)):
         select(KnowledgeCategory).options(selectinload(KnowledgeCategory.items))
     )
     categories = result.scalars().all()
-    return {
-        "code": 0,
-        "message": "ok",
-        "data": build_category_tree(categories),
-    }
+    return ok(build_category_tree(categories))
 
 
 @router.get("/knowledge")
@@ -280,28 +273,24 @@ async def list_knowledge(
     result = await db.execute(query)
     items = result.scalars().all()
 
-    return {
-        "code": 0,
-        "message": "ok",
-        "data": {
-            "list": [
-                {
-                    "id": str(item.id),
-                    "name": item.name,
-                    "category": item.category_key or "",
-                    "categoryPath": item.category_path or "",
-                    "type": item.type,
-                    "recallCount": item.recall_count or 0,
-                    "updateTime": item.updated_at.strftime("%Y-%m-%d %H:%M") if item.updated_at else "",
-                    "content": item.content,
-                }
-                for item in items
-            ],
-            "total": total,
-            "page": page,
-            "pageSize": pageSize,
-        },
-    }
+    return ok({
+          "list": [
+              {
+                  "id": str(item.id),
+                  "name": item.name,
+                  "category": item.category_key or "",
+                  "categoryPath": item.category_path or "",
+                  "type": item.type,
+                  "recallCount": item.recall_count or 0,
+                  "updateTime": item.updated_at.strftime("%Y-%m-%d %H:%M") if item.updated_at else "",
+                  "content": item.content,
+              }
+              for item in items
+          ],
+          "total": total,
+          "page": page,
+          "pageSize": pageSize,
+      })
 
 
 @router.post("/knowledge/upload")
@@ -314,17 +303,13 @@ async def upload_knowledge_file(file: UploadFile = File(...)):
             minio_storage.upload_bytes, object_key, content, "application/octet-stream"
         )
     except Exception as e:
-        return {"code": 500, "message": f"文件存储失败: {e}", "data": None}
+        return fail(500, f"文件存储失败: {e}")
 
-    return {
-        "code": 0,
-        "message": "ok",
-        "data": {
-            "fileId": object_key,
-            "fileName": file.filename or "unknown",
-            "size": len(content),
-        },
-    }
+    return ok({
+          "fileId": object_key,
+          "fileName": file.filename or "unknown",
+          "size": len(content),
+      })
 
 
 @router.post("/knowledge")
@@ -366,19 +351,15 @@ async def create_knowledge_item(
 
     await db.refresh(item)
 
-    return {
-        "code": 0,
-        "message": "ok",
-        "data": {
-            "id": str(item.id),
-            "name": item.name,
-            "category": item.category_key or "",
-            "categoryPath": item.category_path or "",
-            "type": item.type,
-            "recallCount": item.recall_count or 0,
-            "updateTime": item.updated_at.strftime("%Y-%m-%d %H:%M") if item.updated_at else "",
-        },
-    }
+    return ok({
+          "id": str(item.id),
+          "name": item.name,
+          "category": item.category_key or "",
+          "categoryPath": item.category_path or "",
+          "type": item.type,
+          "recallCount": item.recall_count or 0,
+          "updateTime": item.updated_at.strftime("%Y-%m-%d %H:%M") if item.updated_at else "",
+      })
 
 
 @router.put("/knowledge/{item_id}")
@@ -390,30 +371,27 @@ async def update_knowledge_item(
     result = await db.execute(select(KnowledgeItem).where(KnowledgeItem.id == item_id))
     item = result.scalar_one_or_none()
     if not item:
-        return {"code": 404, "message": "素材不存在", "data": None}
+        return not_found("素材不存在")
 
-    for field in ["name", "categoryPath", "type"]:
+    # camelCase(请求) → snake_case(ORM)。ORM 实例允许任意 setattr，写错列名不会报错，
+    # 只是 flush 时不落库、refresh 后被旧值刷掉——必须显式映射，不能裸 setattr。
+    field_map = {"name": "name", "type": "type",
+                 "categoryPath": "category_path", "category": "category_key"}
+    for field, column in field_map.items():
         if field in body:
-            setattr(item, field, body[field])
-
-    if "category" in body:
-        item.category_key = body["category"]
+            setattr(item, column, body[field])
 
     await db.flush()
     await db.refresh(item)
-    return {
-        "code": 0,
-        "message": "ok",
-        "data": {
-            "id": str(item.id),
-            "name": item.name,
-            "category": item.category_key or "",
-            "categoryPath": item.category_path or "",
-            "type": item.type,
-            "recallCount": item.recall_count or 0,
-            "updateTime": item.updated_at.strftime("%Y-%m-%d %H:%M") if item.updated_at else "",
-        },
-    }
+    return ok({
+          "id": str(item.id),
+          "name": item.name,
+          "category": item.category_key or "",
+          "categoryPath": item.category_path or "",
+          "type": item.type,
+          "recallCount": item.recall_count or 0,
+          "updateTime": item.updated_at.strftime("%Y-%m-%d %H:%M") if item.updated_at else "",
+      })
 
 
 @router.delete("/knowledge/{item_id}")
@@ -424,7 +402,7 @@ async def delete_knowledge_item(
     result = await db.execute(select(KnowledgeItem).where(KnowledgeItem.id == item_id))
     item = result.scalar_one_or_none()
     if not item:
-        return {"code": 404, "message": "素材不存在", "data": None}
+        return not_found("素材不存在")
 
     # Delete from Milvus
     delete_from_milvus(str(item.id))
@@ -440,14 +418,14 @@ async def delete_knowledge_item(
             await asyncio.to_thread(minio_storage.delete_object, item.file_path)
 
     await db.delete(item)
-    return {"code": 0, "message": "ok", "data": None}
+    return ok()
 
 
 @router.post("/knowledge/recall-test")
 async def recall_test(body: dict, db: AsyncSession = Depends(get_db)):
     query = body.get("query", "")
     if not query:
-        return {"code": 400, "message": "请提供查询文本", "data": []}
+        return fail(400, "请提供查询文本", [])
 
     from app.services.system.system_settings import get_system_setting
     threshold = float(await get_system_setting(db, "recallThreshold", 0.75) or 0.75)
@@ -469,4 +447,4 @@ async def recall_test(body: dict, db: AsyncSession = Depends(get_db)):
                 # Update recall count
                 item.recall_count = (item.recall_count or 0) + 1
 
-    return {"code": 0, "message": "ok", "data": results, "threshold": threshold}
+    return ok({"list": results, "threshold": threshold})

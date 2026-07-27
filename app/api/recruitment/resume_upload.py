@@ -326,7 +326,9 @@ async def _run_parse(
         overall = analysis.get("overallScore")
     if overall is None:
         overall = candidate.score
-    if isinstance(overall, (int, float)):
+    # 解析阶段的粗估分。若之后跑过「AI 简历评分」（scoring.py 的 8 维加权），
+    # 那边写入的才是权威值，不能被重新解析时的粗估覆盖。
+    if isinstance(overall, (int, float)) and candidate.screening_ai_score is None:
         candidate.screening_ai_score = int(overall)
         candidate.score = int(overall)
         _ = min_score

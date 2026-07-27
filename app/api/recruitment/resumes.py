@@ -47,6 +47,7 @@ from app.api.recruitment.resume_upload import (
     _extract_and_parse as extract_and_parse_resume,
     fill_candidate_from_parsed,
 )
+from app.utils.responses import ok, fail, not_found, conflict
 
 router = APIRouter(tags=["简历"])
 settings = get_settings()
@@ -161,16 +162,12 @@ async def query_candidate_list(
     result = await db.execute(query)
     candidates = result.unique().scalars().all()
 
-    return {
-        "code": 0,
-        "message": "ok",
-        "data": {
-            "list": [serialize_candidate(c) for c in candidates],
-            "total": total,
-            "page": page,
-            "pageSize": page_size,
-        },
-    }
+    return ok({
+          "list": [serialize_candidate(c) for c in candidates],
+          "total": total,
+          "page": page,
+          "pageSize": page_size,
+      })
 
 
 # ── Endpoints ───────────────────────────────────────────
@@ -211,7 +208,7 @@ async def get_resume_file(resume_id: str, db: AsyncSession = Depends(get_db)):
     if not candidate or not candidate.resume_file:
         return JSONResponse(
             status_code=404,
-            content={"code": 404, "message": "简历文件不存在", "data": None},
+            content=not_found("简历文件不存在"),
         )
 
     stored = candidate.resume_file
@@ -237,7 +234,7 @@ async def get_resume_file(resume_id: str, db: AsyncSession = Depends(get_db)):
     except Exception as e:
         return JSONResponse(
             status_code=404,
-            content={"code": 404, "message": f"简历文件不存在: {e}", "data": None},
+            content=not_found(f"简历文件不存在: {e}"),
         )
 
     ext = os.path.splitext(filename)[1].lower()
@@ -267,8 +264,8 @@ async def get_resume(resume_id: str, db: AsyncSession = Depends(get_db)):
     )
     candidate = result.scalar_one_or_none()
     if not candidate:
-        return {"code": 404, "message": "候选人不存在", "data": None}
-    return {"code": 0, "message": "ok", "data": serialize_candidate(candidate)}
+        return not_found("候选人不存在")
+    return ok(serialize_candidate(candidate))
 
 
 @router.post("/resumes/upload")
@@ -291,13 +288,8 @@ async def upload_resume(
 
     if result["status"] == "success":
         response_data = result["data"]
-        return {"code": 0, "message": result["message"], "data": response_data}
-    else:
-        return {
-            "code": result["statusCode"],
-            "message": result["message"],
-            "data": result.get("data"),
-        }
+        return ok(response_data, message=result["message"])
+    return fail(result["statusCode"], result["message"], result.get("data"))
 
 
 @router.post("/resumes/batch-upload")
@@ -439,7 +431,7 @@ async def batch_upload_resumes(
 async def batch_parse(body: dict, db: AsyncSession = Depends(get_db)):
     ids = body.get("ids", [])
     if not ids:
-        return {"code": 400, "message": "请提供候选人 ID 列表", "data": None}
+        return fail(400, "请提供候选人 ID 列表")
 
     for cid in ids:
         result = await db.execute(
@@ -457,7 +449,7 @@ async def batch_parse(body: dict, db: AsyncSession = Depends(get_db)):
         if error:
             logger.warning("Batch parse error for %s: %s", cid, error)
 
-    return {"code": 0, "message": "ok", "data": None}
+    return ok()
 
 
 @router.patch("/resumes/{resume_id}")
@@ -478,24 +470,28 @@ async def update_resume(
     )
     candidate = result.scalar_one_or_none()
     if not candidate:
-        return {"code": 404, "message": "候选人不存在", "data": None}
+        return not_found("候选人不存在")
+
+    # 状态迁移放在所有字段编辑之前：迁移失败要整单拒绝，若放在后面，
+    # 前面 setattr 的字段已被 autoflush 刷进事务，而 get_db 只在抛异常时回滚，
+    # 正常 return 会把这半截改动静默提交（表现为「报错了但人名已经被改掉」）。
+    if "status" in body and body["status"] and body["status"] != candidate.status:
+        # hired 只能由「录用审批通过」自动生成（见 offer.py），此通用编辑端点
+        # 禁止直接把候选人改成 hired，否则会绕开审批必填字段/审批人记录，
+        # 与 offer.py 形成第二条并行入职通道。
+        if body["status"] == "hired":
+            return fail(400, "无法直接将候选人标记为已录用：请通过「录用审批」流程操作。")
+        try:
+            await transition(db, "candidate", candidate, body["status"], skip_block_check=True)
+        except StateError as e:
+            await db.rollback()
+            return conflict(e.message)
 
     # Simple fields（status 不在此列——状态变更必须走 transition() 校验合法迁移，
     # 不能像其他字段一样裸 setattr，见 app/core/state_machine.py）
     for field in ["name", "gender", "age", "education", "experience", "phone", "email", "ethnicity"]:
         if field in body:
             setattr(candidate, field, body[field])
-
-    if "status" in body and body["status"] and body["status"] != candidate.status:
-        # hired 只能由「录用审批通过」自动生成（见 offer.py），此通用编辑端点
-        # 禁止直接把候选人改成 hired，否则会绕开审批必填字段/审批人记录，
-        # 与 offer.py 形成第二条并行入职通道。
-        if body["status"] == "hired":
-            return {"code": 400, "message": "无法直接将候选人标记为已录用：请通过「录用审批」流程操作。", "data": None}
-        try:
-            await transition(db, "candidate", candidate, body["status"], skip_block_check=True)
-        except StateError as e:
-            return {"code": 409, "message": e.message, "data": None}
 
     if "ethnicity" in body:
         candidate.ethnicity = normalize_ethnicity(candidate.ethnicity)
@@ -555,7 +551,7 @@ async def update_resume(
     # 注：hired 已在上面被禁止直接设置，故此处不再需要 ensure_employee_for_candidate
     # 兜底调用——员工记录只应由 offer.py 的录用审批流程产生。
 
-    return {"code": 0, "message": "ok", "data": serialize_candidate(candidate)}
+    return ok(serialize_candidate(candidate))
 
 
 @router.post("/resumes/{resume_id}/reanalyze")
@@ -567,22 +563,22 @@ async def reanalyze_resume(resume_id: str, db: AsyncSession = Depends(get_db)):
     )
     candidate = result.scalar_one_or_none()
     if not candidate:
-        return {"code": 404, "message": "候选人不存在", "data": None}
+        return not_found("候选人不存在")
 
     if not candidate.resume_file:
-        return {"code": 400, "message": "该候选人没有上传简历文件", "data": None}
+        return fail(400, "该候选人没有上传简历文件")
 
     error = await run_resume_parse(
         candidate, candidate.position.name if candidate.position else "", db
     )
     if error and not is_candidate_parsed(candidate):
-        return {"code": 500, "message": f"解析失败: {error}", "data": None}
+        return fail(500, f"解析失败: {error}")
 
     await db.flush()
     candidate = await load_candidate(db, resume_id)
     if not candidate:
-        return {"code": 500, "message": "候选人加载失败", "data": None}
-    return {"code": 0, "message": "ok", "data": serialize_candidate(candidate)}
+        return fail(500, "候选人加载失败")
+    return ok(serialize_candidate(candidate))
 
 
 @router.delete("/resumes/{resume_id}")
@@ -600,5 +596,5 @@ async def delete_resume(
     logger.info("删除候选人开始 candidate_id=%s", resume_id)
     deleted = await cascade_delete_by_candidate(db, resume_id, delete_resume_file=True)
     if not deleted:
-        return {"code": 404, "message": "候选人不存在", "data": None}
-    return {"code": 0, "message": "ok", "data": None}
+        return not_found("候选人不存在")
+    return ok()

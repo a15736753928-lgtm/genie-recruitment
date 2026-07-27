@@ -42,6 +42,7 @@ settings = get_settings()
 
 # ── Write-verification guard (read-after-write only) ───────────
 from app.agent_os.quality.guard import QualityGuard
+from app.utils.responses import ok, fail, not_found
 
 _quality_guard = QualityGuard()
 
@@ -230,9 +231,9 @@ def serialize_project(p: AgentProject, session_count: int = 0) -> dict:
 
 async def _build_global_overview(db: AsyncSession) -> dict:
     """Workspace overview for all projects (global recruitment stats)."""
-    job_hunting = (await db.execute(
+    pending_screen = (await db.execute(
         select(func.count()).select_from(Candidate).where(
-            Candidate.status.in_(["new", "parsed", "pending_screen"])
+            Candidate.status.in_(["new", "parsed", "pending_screen", "pending_materials"])
         )
     )).scalar() or 0
     interview_count = (await db.execute(
@@ -240,8 +241,10 @@ async def _build_global_overview(db: AsyncSession) -> dict:
             Candidate.status.in_(["invited", "round1", "round2"])
         )
     )).scalar() or 0
-    passed_count = (await db.execute(
-        select(func.count()).select_from(Candidate).where(Candidate.status == "invited")
+    # 「待发 offer」必须统计 pending_offer；此前统计的是 invited（刚邀约面试），
+    # 首页那个数字一直是错的。
+    pending_offer = (await db.execute(
+        select(func.count()).select_from(Candidate).where(Candidate.status == "pending_offer")
     )).scalar() or 0
     position_count = (await db.execute(select(func.count()).select_from(Position))).scalar() or 0
 
@@ -263,15 +266,15 @@ async def _build_global_overview(db: AsyncSession) -> dict:
             for aid, cfg in AGENT_CONFIGS.items()
         ],
         "workflowSteps": [
-            {"key": "recruit", "label": "筛选", "count": int(job_hunting), "active": True, "badgeTone": "green"},
+            {"key": "recruit", "label": "筛选", "count": int(pending_screen), "active": True, "badgeTone": "green"},
             {"key": "interview", "label": "面试", "count": int(interview_count), "active": interview_count > 0, "badgeTone": "blue"},
             {"key": "training", "label": "试用", "count": 0, "active": False, "badgeTone": "gray"},
             {"key": "performance", "label": "绩效", "count": 0, "active": False, "badgeTone": "gray"},
         ],
         "stats": [
-            {"key": "resumes", "label": "待处理简历", "value": int(job_hunting), "hint": "求职中", "hintTone": "up"},
+            {"key": "resumes", "label": "待处理简历", "value": int(pending_screen), "hint": "待筛选", "hintTone": "up"},
             {"key": "interviews", "label": "待面试", "value": int(interview_count), "hint": "流程中", "hintTone": "default"},
-            {"key": "offers", "label": "待发offer", "value": int(passed_count), "hint": "已通过", "hintTone": "default"},
+            {"key": "offers", "label": "待发offer", "value": int(pending_offer), "hint": "二面已通过", "hintTone": "default"},
             {"key": "positions", "label": "在招岗位", "value": int(position_count), "hint": "持续招聘", "hintTone": "up"},
         ],
         "suggestions": [
@@ -382,15 +385,11 @@ async def get_ai_agent_overview(
     if projectId:
         data = await _build_project_overview(db, projectId)
         if data is None:
-            return {"code": 404, "message": "项目不存在", "data": None}
+            return not_found("项目不存在")
     else:
         data = await _build_global_overview(db)
 
-    return {
-        "code": 0,
-        "message": "ok",
-        "data": data,
-    }
+    return ok(data)
 
 
 @router.get("/ai-agent/welcome-prompts")
@@ -403,11 +402,7 @@ async def get_welcome_prompts(db: AsyncSession = Depends(get_db)):
     from app.services.ai.welcome_prompt_recommender import get_cached_welcome_prompts
 
     prompts = await get_cached_welcome_prompts(db)
-    return {
-        "code": 0,
-        "message": "ok",
-        "data": prompts,
-    }
+    return ok(prompts)
 
 
 @router.get("/ai-agent/sessions")
@@ -420,11 +415,7 @@ async def list_sessions(
         .limit(50)
     )
     sessions = result.scalars().all()
-    return {
-        "code": 0,
-        "message": "ok",
-        "data": [serialize_session(s) for s in sessions],
-    }
+    return ok([serialize_session(s) for s in sessions])
 
 
 @router.get("/ai-agent/projects")
@@ -449,14 +440,10 @@ async def list_projects(
         .order_by(desc(AgentProject.updated_at))
     )
     rows = result.all()
-    return {
-        "code": 0,
-        "message": "ok",
-        "data": [
-            serialize_project(project, int(session_count or 0))
-            for project, session_count in rows
-        ],
-    }
+    return ok([
+          serialize_project(project, int(session_count or 0))
+          for project, session_count in rows
+      ])
 
 
 class CreateProjectRequest(BaseModel):
@@ -470,19 +457,15 @@ async def create_project(
 ):
     name = (body.name or "").strip()
     if not name:
-        return {"code": 400, "message": "项目名称不能为空", "data": None}
+        return fail(400, "项目名称不能为空")
     if len(name) > 64:
-        return {"code": 400, "message": "项目名称过长（最多 64 字）", "data": None}
+        return fail(400, "项目名称过长（最多 64 字）")
 
     project = AgentProject(name=name)
     db.add(project)
     await db.flush()
     await db.refresh(project)
-    return {
-        "code": 0,
-        "message": "ok",
-        "data": serialize_project(project, 0),
-    }
+    return ok(serialize_project(project, 0))
 
 
 class RenameProjectRequest(BaseModel):
@@ -497,25 +480,21 @@ async def rename_project(
 ):
     name = (body.name or "").strip()
     if not name:
-        return {"code": 400, "message": "项目名称不能为空", "data": None}
+        return fail(400, "项目名称不能为空")
     if len(name) > 64:
-        return {"code": 400, "message": "项目名称过长（最多 64 字）", "data": None}
+        return fail(400, "项目名称过长（最多 64 字）")
 
     result = await db.execute(
         select(AgentProject).where(AgentProject.id == project_id)
     )
     project = result.scalar_one_or_none()
     if not project:
-        return {"code": 404, "message": "项目不存在", "data": None}
+        return not_found("项目不存在")
 
     project.name = name
     project.updated_at = datetime.utcnow()
     await db.flush()
-    return {
-        "code": 0,
-        "message": "ok",
-        "data": serialize_project(project),
-    }
+    return ok(serialize_project(project))
 
 
 @router.delete("/ai-agent/projects/{project_id}")
@@ -528,11 +507,11 @@ async def delete_project(
     )
     project = result.scalar_one_or_none()
     if not project:
-        return {"code": 404, "message": "项目不存在", "data": None}
+        return not_found("项目不存在")
 
     # Sessions become ungrouped; FK ondelete=SET NULL also handles this.
     await db.delete(project)
-    return {"code": 0, "message": "ok", "data": None}
+    return ok()
 
 
 class CreateSessionRequest(BaseModel):
@@ -552,7 +531,7 @@ async def create_session(
         )
         project = proj_result.scalar_one_or_none()
         if not project:
-            return {"code": 404, "message": "项目不存在", "data": None}
+            return not_found("项目不存在")
         project_id = project.id
 
     session = AgentSession(
@@ -569,11 +548,7 @@ async def create_session(
         if proj:
             proj.updated_at = datetime.utcnow()
 
-    return {
-        "code": 0,
-        "message": "ok",
-        "data": serialize_session(session),
-    }
+    return ok(serialize_session(session))
 
 
 @router.delete("/ai-agent/sessions/{session_id}")
@@ -588,7 +563,7 @@ async def delete_session(
     )
     session = result.scalar_one_or_none()
     if not session:
-        return {"code": 404, "message": "对话不存在", "data": None}
+        return not_found("对话不存在")
 
     # Clean up MinIO objects for the session's materials before cascade delete
     mat_result = await db.execute(
@@ -599,7 +574,7 @@ async def delete_session(
             await asyncio.to_thread(minio_storage.delete_object, mat.file_path)
 
     await db.delete(session)
-    return {"code": 0, "message": "ok", "data": None}
+    return ok()
 
 
 class PatchSessionRequest(BaseModel):
@@ -619,14 +594,14 @@ async def patch_session(
     )
     session = result.scalar_one_or_none()
     if not session:
-        return {"code": 404, "message": "对话不存在", "data": None}
+        return not_found("对话不存在")
 
     if body.title is not None:
         new_title = body.title.strip()
         if not new_title:
-            return {"code": 400, "message": "对话名称不能为空", "data": None}
+            return fail(400, "对话名称不能为空")
         if len(new_title) > 100:
-            return {"code": 400, "message": "对话名称过长（最多 100 字）", "data": None}
+            return fail(400, "对话名称过长（最多 100 字）")
         session.title = new_title
 
     if body.projectId is not None:
@@ -638,17 +613,13 @@ async def patch_session(
             )
             project = proj_result.scalar_one_or_none()
             if not project:
-                return {"code": 404, "message": "项目不存在", "data": None}
+                return not_found("项目不存在")
             session.project_id = project.id
             project.updated_at = datetime.utcnow()
 
     session.updated_at = datetime.utcnow()
     await db.flush()
-    return {
-        "code": 0,
-        "message": "ok",
-        "data": serialize_session(session),
-    }
+    return ok(serialize_session(session))
 
 
 @router.get("/ai-agent/sessions/{session_id}/messages")
@@ -662,22 +633,18 @@ async def get_session_messages(
         .order_by(AgentMessage.created_at)
     )
     messages = result.scalars().all()
-    return {
-        "code": 0,
-        "message": "ok",
-        "data": [
-            {
-                "id": str(m.id),
-                "sessionId": str(m.session_id),
-                "role": m.role,
-                "content": m.content,
-                "meta": m.handoffs if m.role == "user" and isinstance(m.handoffs, dict) else None,
-                "toolBlocks": m.tool_blocks if isinstance(m.tool_blocks, list) else None,
-                "createdAt": iso_utc(m.created_at),
-            }
-            for m in messages
-        ],
-    }
+    return ok([
+          {
+              "id": str(m.id),
+              "sessionId": str(m.session_id),
+              "role": m.role,
+              "content": m.content,
+              "meta": m.handoffs if m.role == "user" and isinstance(m.handoffs, dict) else None,
+              "toolBlocks": m.tool_blocks if isinstance(m.tool_blocks, list) else None,
+              "createdAt": iso_utc(m.created_at),
+          }
+          for m in messages
+      ])
 
 
 @router.get("/ai-agent/sessions/{session_id}/materials")
@@ -692,20 +659,16 @@ async def get_session_materials(
         .order_by(AgentMaterial.uploaded_at)
     )
     materials = result.scalars().all()
-    return {
-        "code": 0,
-        "message": "ok",
-        "data": [
-            {
-                "id": str(m.id),
-                "name": m.name,
-                "type": m.type,
-                "ingested": bool(m.file_path and m.file_path.startswith("resumes/")),
-                "uploadedAt": iso_utc(m.uploaded_at),
-            }
-            for m in materials
-        ],
-    }
+    return ok([
+          {
+              "id": str(m.id),
+              "name": m.name,
+              "type": m.type,
+              "ingested": bool(m.file_path and m.file_path.startswith("resumes/")),
+              "uploadedAt": iso_utc(m.uploaded_at),
+          }
+          for m in materials
+      ])
 
 
 @router.get("/ai-agent/sessions/{session_id}/tasks")
@@ -721,22 +684,18 @@ async def get_session_tasks(
         .limit(20)
     )
     tasks = result.scalars().all()
-    return {
-        "code": 0,
-        "message": "ok",
-        "data": [
-            {
-                "id": str(t.id),
-                "title": t.title or "",
-                "description": t.description or "",
-                "progress": t.progress or 0,
-                "status": t.status or "",
-                "startedAt": iso_utc(t.started_at),
-                "finishedAt": iso_utc(t.finished_at),
-            }
-            for t in tasks
-        ],
-    }
+    return ok([
+          {
+              "id": str(t.id),
+              "title": t.title or "",
+              "description": t.description or "",
+              "progress": t.progress or 0,
+              "status": t.status or "",
+              "startedAt": iso_utc(t.started_at),
+              "finishedAt": iso_utc(t.finished_at),
+          }
+          for t in tasks
+      ])
 
 
 @router.post("/ai-agent/sessions/{session_id}/messages")
@@ -749,12 +708,12 @@ async def append_session_message(
     role = (body.get("role") or "assistant").strip()
     content = (body.get("content") or "").strip()
     if role not in ("user", "assistant") or not content:
-        return {"code": 400, "message": "请提供 role 与 content", "data": None}
+        return fail(400, "请提供 role 与 content")
 
     try:
         sid = uuid.UUID(session_id)
     except ValueError:
-        return {"code": 400, "message": "sessionId 无效", "data": None}
+        return fail(400, "sessionId 无效")
 
     session = await db.get(AgentSession, sid)
     if not session:
@@ -768,18 +727,14 @@ async def append_session_message(
     await db.commit()
     await db.refresh(msg)
 
-    return {
-        "code": 0,
-        "message": "ok",
-        "data": {
-            "id": str(msg.id),
-            "sessionId": str(msg.session_id),
-            "role": msg.role,
-            "content": msg.content,
-            "meta": None,
-            "createdAt": iso_utc(msg.created_at),
-        },
-    }
+    return ok({
+          "id": str(msg.id),
+          "sessionId": str(msg.session_id),
+          "role": msg.role,
+          "content": msg.content,
+          "meta": None,
+          "createdAt": iso_utc(msg.created_at),
+      })
 
 
 @router.post("/ai-agent/materials/from-candidates")
@@ -787,7 +742,7 @@ async def materials_from_candidates(body: dict, db: AsyncSession = Depends(get_d
     """Attach already-ingested candidates as AgentMaterial for the active session."""
     candidate_ids = body.get("candidateIds") or []
     if not candidate_ids:
-        return {"code": 400, "message": "请提供 candidateIds", "data": None}
+        return fail(400, "请提供 candidateIds")
 
     session_result = await db.execute(
         select(AgentSession).order_by(desc(AgentSession.updated_at)).limit(1)
@@ -840,7 +795,7 @@ async def materials_from_candidates(body: dict, db: AsyncSession = Depends(get_d
             "skills": [s.skill for s in (candidate.skills or [])],
         })
 
-    return {"code": 0, "message": "ok", "data": out}
+    return ok(out)
 
 
 @router.post("/ai-agent/materials/ingest-batch")
@@ -852,7 +807,7 @@ async def ingest_materials_batch(body: dict, db: AsyncSession = Depends(get_db))
     """
     material_ids = body.get("materialIds") or []
     if not material_ids:
-        return {"code": 400, "message": "请提供 materialIds", "data": None}
+        return fail(400, "请提供 materialIds")
 
     from app.api.recruitment.resume_upload import _upload_one_resume, _load_candidate
     import os
@@ -1045,7 +1000,7 @@ async def ingest_materials_batch(body: dict, db: AsyncSession = Depends(get_db))
         out.append(r["item"])
 
     await db.commit()
-    return {"code": 0, "message": "ok", "data": out}
+    return ok(out)
 
 
 @router.post("/ai-agent/materials")
@@ -1096,14 +1051,11 @@ async def upload_material(
         db.add(material)
         await db.flush()
         await db.refresh(material)
-        return {
-            "code": 0, "message": "ok",
-            "data": {
-                "id": str(material.id), "name": material.name, "type": material.type,
-                "uploadedAt": iso_utc(material.uploaded_at),
-                "analysis": None,
-            },
-        }
+        return ok({
+              "id": str(material.id), "name": material.name, "type": material.type,
+              "uploadedAt": iso_utc(material.uploaded_at),
+              "analysis": None,
+          })
 
     # ── File upload: detect whether this is a real resume ───
     filename = file.filename or "material"
@@ -1163,7 +1115,7 @@ async def upload_material(
                 minio_storage.upload_bytes, object_key, content, "application/octet-stream"
             )
         except Exception as e:
-            return {"code": 500, "message": f"简历存储失败: {e}", "data": None}
+            return fail(500, f"简历存储失败: {e}")
 
         # 2) AI position matching
         from app.models.recruitment import Candidate, Position
@@ -1206,14 +1158,8 @@ async def upload_material(
                 await asyncio.to_thread(minio_storage.delete_object, object_key)
             except Exception:
                 pass
-            return {
-                "code": 400,
-                "message": (
-                    f"AI 未能判断该简历的应聘岗位：{match_reason or '无匹配'}。"
-                    "请手动选择岗位后重新上传。"
-                ),
-                "data": None,
-            }
+            return fail(400, f"AI 未能判断该简历的应聘岗位：{match_reason or '无匹配'}。"
+                    "请手动选择岗位后重新上传。")
 
         # 3) Create Candidate record
         candidate = Candidate(
@@ -1278,18 +1224,14 @@ async def upload_material(
         await db.flush()
         await db.refresh(material)
 
-        return {
-            "code": 0,
-            "message": "简历已入库",
-            "data": {
-                "id": str(material.id),
-                "name": material.name,
-                "type": "resume",
-                "uploadedAt": iso_utc(material.uploaded_at),
-                "ingested": True,
-                **resp_data,
-            },
-        }
+        return ok({
+              "id": str(material.id),
+              "name": material.name,
+              "type": "resume",
+              "uploadedAt": iso_utc(material.uploaded_at),
+              "ingested": True,
+              **resp_data,
+          }, message="简历已入库")
 
     # ── Not a resume (or type=knowledge) → old attachment flow ──
     object_key = f"agent/{uuid.uuid4()}{file_ext}"
@@ -1298,7 +1240,7 @@ async def upload_material(
             minio_storage.upload_bytes, object_key, content, "application/octet-stream"
         )
     except Exception as e:
-        return {"code": 500, "message": f"资料存储失败: {e}", "data": None}
+        return fail(500, f"资料存储失败: {e}")
 
     material = AgentMaterial(
         session_id=session.id, name=filename, type=type,
@@ -1331,16 +1273,13 @@ async def upload_material(
         except Exception:
             pass
 
-    return {
-        "code": 0, "message": "ok",
-        "data": {
-            "id": str(material.id), "name": material.name, "type": material.type,
-            "knowledgeId": str(material.knowledge_id) if material.knowledge_id else None,
-            "uploadedAt": iso_utc(material.uploaded_at),
-            "ingested": False,
-            "analysis": analysis,
-        },
-    }
+    return ok({
+          "id": str(material.id), "name": material.name, "type": material.type,
+          "knowledgeId": str(material.knowledge_id) if material.knowledge_id else None,
+          "uploadedAt": iso_utc(material.uploaded_at),
+          "ingested": False,
+          "analysis": analysis,
+      })
 
 
 # ── Plan Generation Helper (removed) ──────────────────────
@@ -1354,7 +1293,7 @@ async def trigger_suggestion(
     suggestion_id: str,
     db: AsyncSession = Depends(get_db),
 ):
-    return {"code": 0, "message": "ok", "data": None}
+    return ok()
 
 
 @router.post("/ai-agent/chat")

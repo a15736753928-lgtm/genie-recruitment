@@ -18,6 +18,8 @@ from app.services.system.system_settings import get_system_setting
 from app.services.ai import get_llm_client
 from app.core.state_machine import transition, StateError
 import logging
+from app.utils.responses import ok, fail, not_found, conflict
+from app.utils.llm_json import extract_json_array, extract_json_object
 
 logger = logging.getLogger("genie.interview")
 router = APIRouter(tags=["面试"])
@@ -176,16 +178,13 @@ async def generate_questions_with_llm(
             temperature=0.7,
             max_tokens=4096,
         )
-        content = response.choices[0].message.content.strip()
-        if content.startswith("```json"):
-            content = content[7:]
-        if content.startswith("```"):
-            content = content[3:]
-        if content.endswith("```"):
-            content = content[:-3]
-        return json.loads(content.strip())
+        content = response.choices[0].message.content or ""
+        questions = extract_json_array(content)
+        if questions is None:
+            raise ValueError("模型未返回可解析的题目数组")
+        return questions
     except Exception as e:
-        print(f"Question generation error: {e}")
+        logger.warning("面试题生成失败，返回兜底题目: %s", e)
         # Return fallback questions
         return [
             {"category": "技术能力", "difficulty": "medium", "content": f"请介绍你在{position_name}领域的技术栈和项目经验。"},
@@ -256,47 +255,17 @@ def _strip_code_fence(content: str) -> str:
 
 
 def _extract_json_array(content: str) -> list:
-    """Best-effort extraction of a JSON array from an LLM response.
-
-    Handles: pure JSON, code-fenced JSON, JSON preceded/followed by prose.
-    Returns [] if no valid array can be recovered.
-    """
-    cleaned = _strip_code_fence(content)
-    # Fast path
-    try:
-        data = json.loads(cleaned)
-        if isinstance(data, dict):
-            data = [data]
-        return data if isinstance(data, list) else []
-    except json.JSONDecodeError:
-        pass
-    # Fallback: locate the first [...] block in the raw text
-    match = re.search(r"\[.*\]", content, re.DOTALL)
-    if match:
-        try:
-            data = json.loads(match.group(0))
-            return data if isinstance(data, list) else []
-        except json.JSONDecodeError:
-            return []
-    return []
+    """从 LLM 回复里抽取 JSON 数组；单个对象也接受（包成单元素数组）。取不到返回 []。"""
+    arr = extract_json_array(content)
+    if arr is not None:
+        return arr
+    obj = extract_json_object(content)
+    return [obj] if obj is not None else []
 
 
 def _extract_json_object(content: str) -> dict:
-    """Best-effort extraction of a JSON object from an LLM response."""
-    cleaned = _strip_code_fence(content)
-    try:
-        data = json.loads(cleaned)
-        return data if isinstance(data, dict) else {}
-    except json.JSONDecodeError:
-        pass
-    match = re.search(r"\{.*\}", content, re.DOTALL)
-    if match:
-        try:
-            data = json.loads(match.group(0))
-            return data if isinstance(data, dict) else {}
-        except json.JSONDecodeError:
-            return {}
-    return {}
+    """从 LLM 回复里抽取 JSON 对象；取不到返回 {}。"""
+    return extract_json_object(content) or {}
 
 
 async def extract_qa_from_transcript(transcript_text: str, position_name: str) -> List[dict]:
@@ -519,15 +488,11 @@ async def query_interview_questions(
     if difficulty:
         filtered = [q for q in filtered if (q.difficulty or "") == difficulty]
 
-    return {
-        "code": 0,
-        "message": "ok",
-        "data": {
-            "questions": [_question_to_dict(q) for q in filtered],
-            "stats": _build_question_stats(all_questions),
-            "filteredCount": len(filtered),
-        },
-    }
+    return ok({
+          "questions": [_question_to_dict(q) for q in filtered],
+          "stats": _build_question_stats(all_questions),
+          "filteredCount": len(filtered),
+      })
 
 
 async def query_interview_evaluation(
@@ -619,16 +584,12 @@ async def query_interview_evaluation(
         if transcript_row and transcript_row.assessment_report:
             assessment_report = transcript_row.assessment_report
 
-    return {
-        "code": 0,
-        "message": "ok",
-        "data": {
-            "questions": data,
-            "segments": segments,
-            "assessmentReport": assessment_report,
-            "transcriptId": str(target_tid) if target_tid else None,
-        },
-    }
+    return ok({
+          "questions": data,
+          "segments": segments,
+          "assessmentReport": assessment_report,
+          "transcriptId": str(target_tid) if target_tid else None,
+      })
 
 
 # ── Endpoints ───────────────────────────────────────────
@@ -906,7 +867,7 @@ async def save_questions(body: dict, db: AsyncSession = Depends(get_db)):
         db.add(q)
 
     await db.flush()
-    return {"code": 0, "message": "ok", "data": None}
+    return ok()
 
 
 @router.post("/interview/questions/regenerate")
@@ -925,15 +886,11 @@ async def regenerate_questions(body: dict, db: AsyncSession = Depends(get_db)):
 
     # Regenerate
     questions = await get_or_generate_questions(candidate_id, round, db)
-    return {
-        "code": 0,
-        "message": "ok",
-        "data": {
-            "questions": [_question_to_dict(q) for q in questions],
-            "stats": _build_question_stats(questions),
-            "filteredCount": len(questions),
-        },
-    }
+    return ok({
+          "questions": [_question_to_dict(q) for q in questions],
+          "stats": _build_question_stats(questions),
+          "filteredCount": len(questions),
+      })
 
 
 @router.post("/interview/questions/{question_id}/replace")
@@ -947,7 +904,7 @@ async def replace_question(question_id: str, body: dict, db: AsyncSession = Depe
     )
     candidate = cand_result.scalar_one_or_none()
     if not candidate:
-        return {"code": 404, "message": "候选人不存在", "data": None}
+        return not_found("候选人不存在")
 
     # 前端「手动添加题目」时会用 `{candidateId}-{round}-custom-{ts}` 这种非 UUID 的本地 id，
     # 这类题目从未落库；这里做一次 UUID 校验，避免 asyncpg 把非法 UUID 直接抛成 500。
@@ -1007,15 +964,11 @@ async def replace_question(question_id: str, body: dict, db: AsyncSession = Depe
     await db.flush()
 
     questions = await _fetch_pre_generated_questions(candidate_id, round, db)
-    return {
-        "code": 0,
-        "message": "ok",
-        "data": {
-            "questions": [_question_to_dict(q) for q in questions],
-            "stats": _build_question_stats(questions),
-            "filteredCount": len(questions),
-        },
-    }
+    return ok({
+          "questions": [_question_to_dict(q) for q in questions],
+          "stats": _build_question_stats(questions),
+          "filteredCount": len(questions),
+      })
 
 
 @router.post("/interview/questions/batch-delete")
@@ -1029,7 +982,7 @@ async def batch_delete_questions(body: dict, db: AsyncSession = Depends(get_db))
     round = body.get("round")
     raw_ids = body.get("questionIds") or []
     if not candidate_id or not round or not raw_ids:
-        return {"code": 400, "message": "candidateId / round / questionIds 不能为空", "data": None}
+        return fail(400, "candidateId / round / questionIds 不能为空")
 
     # 解析 UUID,过滤掉前端本地自定义题(非 UUID 的 id,从未落库)
     parsed_ids: list[uuid.UUID] = []
@@ -1089,16 +1042,12 @@ async def batch_delete_questions(body: dict, db: AsyncSession = Depends(get_db))
     db.expire_all()
     remaining = await _fetch_pre_generated_questions(candidate_id, round, db)
 
-    return {
-        "code": 0,
-        "message": "ok",
-        "data": {
-            "deletedCount": deleted_count,
-            "questions": [_question_to_dict(q) for q in remaining],
-            "stats": _build_question_stats(remaining),
-            "filteredCount": len(remaining),
-        },
-    }
+    return ok({
+          "deletedCount": deleted_count,
+          "questions": [_question_to_dict(q) for q in remaining],
+          "stats": _build_question_stats(remaining),
+          "filteredCount": len(remaining),
+      })
 
 
 @router.post("/interview/questions/append")
@@ -1113,14 +1062,14 @@ async def append_question(body: dict, db: AsyncSession = Depends(get_db)):
     candidate_id = body.get("candidateId")
     round = body.get("round")
     if not candidate_id or not round:
-        return {"code": 400, "message": "candidateId / round 不能为空", "data": None}
+        return fail(400, "candidateId / round 不能为空")
 
     cand_result = await db.execute(
         select(Candidate).options(selectinload(Candidate.position)).where(Candidate.id == candidate_id)
     )
     candidate = cand_result.scalar_one_or_none()
     if not candidate:
-        return {"code": 404, "message": "候选人不存在", "data": None}
+        return not_found("候选人不存在")
 
     prompt = (body.get("prompt") or "").strip()
     category = (body.get("category") or "技术能力").strip() or "技术能力"
@@ -1168,15 +1117,11 @@ async def append_question(body: dict, db: AsyncSession = Depends(get_db)):
     await db.flush()
 
     questions = await _fetch_pre_generated_questions(candidate_id, round, db)
-    return {
-        "code": 0,
-        "message": "ok",
-        "data": {
-            "questions": [_question_to_dict(q) for q in questions],
-            "stats": _build_question_stats(questions),
-            "filteredCount": len(questions),
-        },
-    }
+    return ok({
+          "questions": [_question_to_dict(q) for q in questions],
+          "stats": _build_question_stats(questions),
+          "filteredCount": len(questions),
+      })
 
 
 @router.get("/interview/evaluation/leaderboard")
@@ -1191,7 +1136,7 @@ async def get_leaderboard(
     }
     candidate_status = status_map.get(category)
     if not candidate_status:
-        return {"code": 400, "message": "无效的排行榜类型", "data": []}
+        return fail(400, "无效的排行榜类型", [])
 
     status_filter = Candidate.status == candidate_status
 
@@ -1282,7 +1227,7 @@ async def get_leaderboard(
             item["rank"] = i
             ranked_leaderboard.append(item)
 
-    return {"code": 0, "message": "ok", "data": ranked_leaderboard}
+    return ok(ranked_leaderboard)
 
 
 @router.get("/interview/evaluation/{candidate_id}")
@@ -1362,7 +1307,7 @@ async def save_evaluation(
             )
 
     await db.flush()
-    return {"code": 0, "message": "ok", "data": None}
+    return ok()
 
 
 async def _run_transcript_pipeline(
@@ -1710,7 +1655,7 @@ async def upload_transcript(
             minio_storage.upload_bytes, object_key, content, "application/octet-stream"
         )
     except Exception as e:
-        return {"code": 500, "message": f"转写文件存储失败: {e}", "data": None}
+        return fail(500, f"转写文件存储失败: {e}")
 
     # Extract text from the in-memory bytes via a temp file
     import tempfile
@@ -1726,7 +1671,7 @@ async def upload_transcript(
             pass
 
     if not transcript_text or not transcript_text.strip():
-        return {"code": 400, "message": "未能从文件中提取出文本，请检查文件内容或格式", "data": None}
+        return fail(400, "未能从文件中提取出文本，请检查文件内容或格式")
 
     # Save transcript —— 每次上传创建一条新的历史记录（不再覆盖），初始为 pending
     t = InterviewTranscript(
@@ -1749,15 +1694,11 @@ async def upload_transcript(
         candidate_id, round, transcript_id, audio_bytes=None, log_tag="upload_transcript",
     ))
 
-    return {
-        "code": 0,
-        "message": "ok",
-        "data": {
-            "transcriptId": str(transcript_id),
-            "filename": file.filename or "transcript",
-            "status": "pending",
-        },
-    }
+    return ok({
+          "transcriptId": str(transcript_id),
+          "filename": file.filename or "transcript",
+          "status": "pending",
+      })
 
 
 @router.get("/interview/evaluation/{candidate_id}/transcripts")
@@ -1789,20 +1730,16 @@ async def list_transcripts(
         )
         counts = {row[0]: row[1] for row in count_result.all()}
 
-    return {
-        "code": 0,
-        "message": "ok",
-        "data": [
-            {
-                "id": str(t.id),
-                "filename": t.filename or "transcript",
-                "source": t.source,
-                "createdAt": t.created_at.strftime("%Y-%m-%d %H:%M:%S") if t.created_at else "",
-                "qaCount": counts.get(t.id, 0),
-            }
-            for t in transcripts
-        ],
-    }
+    return ok([
+          {
+              "id": str(t.id),
+              "filename": t.filename or "transcript",
+              "source": t.source,
+              "createdAt": t.created_at.strftime("%Y-%m-%d %H:%M:%S") if t.created_at else "",
+              "qaCount": counts.get(t.id, 0),
+          }
+          for t in transcripts
+      ])
 
 
 @router.delete("/interview/evaluation/transcript/{transcript_id}")
@@ -1816,10 +1753,10 @@ async def delete_transcript(
     )
     t = t_result.scalar_one_or_none()
     if not t:
-        return {"code": 404, "message": "记录不存在", "data": None}
+        return not_found("记录不存在")
     await db.delete(t)
     await db.flush()
-    return {"code": 0, "message": "ok", "data": None}
+    return ok()
 
 
 @router.get("/interview/evaluation/transcript/{transcript_id}/status")
@@ -1833,19 +1770,15 @@ async def get_transcript_status(
     )
     t = t_result.scalar_one_or_none()
     if not t:
-        return {"code": 404, "message": "记录不存在", "data": None}
-    return {
-        "code": 0,
-        "message": "ok",
-        "data": {
-            "transcriptId": str(t.id),
-            "status": t.process_status or "completed",
-            "progress": t.process_progress if t.process_progress is not None else 100,
-            "stage": t.process_stage or "",
-            "message": t.process_message or "",
-            "assessmentReport": t.assessment_report if t.process_status == "completed" else None,
-        },
-    }
+        return not_found("记录不存在")
+    return ok({
+          "transcriptId": str(t.id),
+          "status": t.process_status or "completed",
+          "progress": t.process_progress if t.process_progress is not None else 100,
+          "stage": t.process_stage or "",
+          "message": t.process_message or "",
+          "assessmentReport": t.assessment_report if t.process_status == "completed" else None,
+      })
 
 
 @router.post("/interview/evaluation/{candidate_id}/transcribe")
@@ -1859,11 +1792,11 @@ async def transcribe_audio(
                 candidate_id, round, file.filename)
     allow_audio = await get_setting(db, "allowAudioUpload", True)
     if not allow_audio:
-        return {"code": 403, "message": "系统已关闭音频上传功能", "data": None}
+        return fail(403, "系统已关闭音频上传功能")
 
     audio_bytes = await file.read()
     if not audio_bytes:
-        return {"code": 400, "message": "音频文件为空", "data": None}
+        return fail(400, "音频文件为空")
 
     # 建一条 pending 转写记录（content 先空，转写完成后由后台任务回写），
     # 每次上传独立历史记录，可选择/删除，并关联本次抽取的题目与评定报告。
@@ -1897,15 +1830,11 @@ async def transcribe_audio(
         candidate_id, round, transcript_id, audio_bytes=audio_bytes, log_tag="transcribe_audio",
     ))
 
-    return {
-        "code": 0,
-        "message": "ok",
-        "data": {
-            "transcriptId": str(transcript_id),
-            "filename": file.filename or "audio",
-            "status": "pending",
-        },
-    }
+    return ok({
+          "transcriptId": str(transcript_id),
+          "filename": file.filename or "audio",
+          "status": "pending",
+      })
 
 
 @router.post("/interview/evaluation/{candidate_id}/assessment-report")
@@ -1926,23 +1855,23 @@ async def generate_assessment_report_endpoint(
         )
         target_tid = latest.scalar_one_or_none()
     if not target_tid:
-        return {"code": 404, "message": "未找到面试转写记录", "data": None}
+        return not_found("未找到面试转写记录")
 
     try:
         report = await _generate_and_save_assessment_report(
             db, candidate_id, round, target_tid
         )
         if not report:
-            return {"code": 400, "message": "无法生成评定报告", "data": None}
-        return {"code": 0, "message": "ok", "data": report}
+            return fail(400, "无法生成评定报告")
+        return ok(report)
     except Exception as exc:
-        return {"code": 500, "message": f"生成失败: {exc}", "data": None}
+        return fail(500, f"生成失败: {exc}")
 
 
 @router.post("/interview/evaluation/{candidate_id}/submit")
 async def submit_evaluation(
     candidate_id: str,
-    round: str = Query("first"),
+    round_: str = Query("first", alias="round"),
     db: AsyncSession = Depends(get_db),
 ):
     scoring_mode = await get_setting(db, "defaultScoringMode", "ai")
@@ -1951,7 +1880,7 @@ async def submit_evaluation(
     evals_result = await db.execute(
         select(InterviewEvaluation).where(and_(
             InterviewEvaluation.candidate_id == candidate_id,
-            InterviewEvaluation.round == round,
+            InterviewEvaluation.round == round_,
         ))
     )
     evals = list(evals_result.scalars().all())
@@ -1973,7 +1902,7 @@ async def submit_evaluation(
     seg_result = await db.execute(
         select(InterviewSegmentEvaluation).where(and_(
             InterviewSegmentEvaluation.candidate_id == candidate_id,
-            InterviewSegmentEvaluation.round == round,
+            InterviewSegmentEvaluation.round == round_,
         ))
     )
     seg_by_type = {s.segment_type: s for s in seg_result.scalars().all()}
@@ -2014,7 +1943,7 @@ async def submit_evaluation(
         # actor_name 用默认值"系统"。状态变更一律经状态机写入，不再直接赋值。
         try:
             if passed:
-                if round == "second":
+                if round_ == "second":
                     # 二面通过 → 待发 Offer，等候「录用审批」流程处理。
                     # 注意：员工记录只能由 offer.py 的录用审批通过后自动生成
                     # （见 CLAUDE.md「员工数据来源」）。这里过去会直接调用
@@ -2044,25 +1973,25 @@ async def submit_evaluation(
                                       reason=f"一面评定通过，加权总分 {final_score}")
             else:
                 await transition(db, "candidate", candidate, "rejected",
-                                  reason=f"{'二面' if round == 'second' else '一面'}评定未通过，加权总分 {final_score}")
+                                  reason=f"{'二面' if round_ == 'second' else '一面'}评定未通过，加权总分 {final_score}")
         except StateError as e:
-            return {"code": 409, "message": e.message, "data": None}
+            # 上面已把本轮所有评分记录标成 scored（autoflush 已刷进事务），
+            # 而 get_db 只在抛异常时回滚，正常 return 会把它们静默提交，
+            # 留下「评分显示已评定、候选人却还停在上一轮」的不一致。
+            await db.rollback()
+            return conflict(e.message)
 
     await db.flush()
-    return {
-        "code": 0,
-        "message": "ok",
-        "data": {
-            "avgScore": qa_avg,
-            "qaAvg": qa_avg,
-            "selfIntroScore": self_score,
-            "reverseScore": reverse_score,
-            "finalScore": final_score,
-            "passThreshold": pass_threshold,
-            "passed": passed,
-            "scoringMode": scoring_mode,
-        },
-    }
+    return ok({
+          "avgScore": qa_avg,
+          "qaAvg": qa_avg,
+          "selfIntroScore": self_score,
+          "reverseScore": reverse_score,
+          "finalScore": final_score,
+          "passThreshold": pass_threshold,
+          "passed": passed,
+          "scoringMode": scoring_mode,
+      })
 
 
 async def _score_question_with_llm(
@@ -2133,7 +2062,7 @@ async def ai_score_question(
     ai_scoring = await get_setting(db, "aiInterviewScoring", True)
     scoring_mode = await get_setting(db, "defaultScoringMode", "ai")
     if not ai_scoring or scoring_mode == "manual":
-        return {"code": 403, "message": "当前设置不允许 AI 评分", "data": None}
+        return fail(403, "当前设置不允许 AI 评分")
 
     answer = (body or {}).get("answer", "")
     question_result = await db.execute(
@@ -2141,7 +2070,7 @@ async def ai_score_question(
     )
     question = question_result.scalar_one_or_none()
     if not question:
-        return {"code": 404, "message": "题目不存在", "data": None}
+        return not_found("题目不存在")
 
     # 前端补评分时通常不带 answer——回答已在转写抽取阶段落库到
     # InterviewEvaluation.answer，这里回退读取，保证评分有回答上下文。
@@ -2156,7 +2085,7 @@ async def ai_score_question(
             answer = existing_eval.answer
 
     result = await _score_question_with_llm(question, answer, db)
-    return {"code": 0, "message": "ok", "data": result}
+    return ok(result)
 
 
 @router.get("/interview/rankings")
@@ -2171,7 +2100,7 @@ async def get_rankings(
     )
     candidate = result.scalar_one_or_none()
     if not candidate or not candidate.position_id:
-        return {"code": 0, "message": "ok", "data": []}
+        return ok([])
 
     # Get all candidates in the same position
     all_result = await db.execute(
@@ -2193,6 +2122,6 @@ async def get_rankings(
             "isCurrent": str(c.id) == candidateId,
         })
 
-    return {"code": 0, "message": "ok", "data": rankings}
+    return ok(rankings)
 
 

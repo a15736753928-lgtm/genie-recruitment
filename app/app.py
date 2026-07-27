@@ -203,6 +203,7 @@ app.add_middleware(
 
 
 from app.core.security import AuthError, PermissionError_
+from app.utils.responses import ok, fail, not_found
 
 @app.exception_handler(AuthError)
 @app.exception_handler(PermissionError_)
@@ -213,7 +214,7 @@ async def api_error_handler(request: Request, exc):
     不会被 ExceptionGroup 包装后泄漏到 uvicorn ERROR 日志。"""
     return JSONResponse(
         status_code=exc.status_code,
-        content={"code": exc.status_code, "message": exc.detail, "data": None},
+        content=fail(exc.status_code, exc.detail),
     )
 
 
@@ -238,7 +239,7 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
     logger.warning("422 on %s %s: %s", request.method, request.url.path, errors)
     return JSONResponse(
         status_code=422,
-        content={"code": 422, "message": message, "data": None},
+        content=fail(422, message),
     )
 
 
@@ -260,7 +261,7 @@ async def global_exception_handler(request: Request, exc: Exception):
         logger.warning("Bad UUID input on %s %s: %s", request.method, request.url.path, msg)
         return JSONResponse(
             status_code=404,
-            content={"code": 404, "message": "记录不存在或 ID 格式无效", "data": None},
+            content=not_found("记录不存在或 ID 格式无效"),
         )
     logger.error("Unhandled exception: %s", exc, exc_info=True)
     # 中文提示: client.ts 对真实 5xx 会自行替换成中文文案，但 api/services/agent.ts
@@ -268,7 +269,7 @@ async def global_exception_handler(request: Request, exc: Exception):
     # 在两个前端客户端里一个中文一个英文，此处统一在源头改成中文即可两边一致。
     return JSONResponse(
         status_code=500,
-        content={"code": 500, "message": "服务器内部错误，请稍后重试或联系管理员", "data": None},
+        content=fail(500, "服务器内部错误，请稍后重试或联系管理员"),
     )
 
 
@@ -322,6 +323,6 @@ app.include_router(rag.router)  # RAG endpoints (prefix defined in router)
 
 @app.get("/api/health")
 async def health():
-    return {"code": 0, "message": "ok", "data": {"status": "running"}}
+    return ok({"status": "running"})
 
 

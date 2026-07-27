@@ -104,6 +104,11 @@ class ConfirmationReview(Base):
     manager_approved_at = Column(DateTime, nullable=True)
     # 转正审批: manager 单人审批(原型口径)
 
+    # 人工覆盖 AI 建议结论时的留痕（合规要求：必须记录谁、何时、为什么改）
+    override_reason = Column(Text, nullable=True)
+    override_by = Column(UUID(as_uuid=True), nullable=True)
+    override_at = Column(DateTime, nullable=True)
+
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

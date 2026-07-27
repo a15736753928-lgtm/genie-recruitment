@@ -19,6 +19,7 @@ from app.models.interview import InterviewEvaluation
 from app.models.performance import PerformanceRecord
 from app.models.probation import Employee
 from app.services.system.system_settings import get_system_setting
+from app.utils.responses import fail
 
 router = APIRouter(tags=["数据导出"])
 
@@ -54,11 +55,7 @@ def _to_xlsx(headers: Sequence[str], rows: List[List[Any]]) -> bytes:
 @router.get("/export/{module}")
 async def export_module(module: str, db: AsyncSession = Depends(get_db)):
     if module not in SUPPORTED_MODULES:
-        return {
-            "code": 400,
-            "message": f"不支持的导出模块，可选：{', '.join(sorted(SUPPORTED_MODULES))}",
-            "data": None,
-        }
+        return fail(400, f"不支持的导出模块，可选：{', '.join(sorted(SUPPORTED_MODULES))}")
 
     export_format = str(await get_system_setting(db, "exportFormat", "xlsx") or "xlsx").lower()
     if export_format not in ("xlsx", "csv"):

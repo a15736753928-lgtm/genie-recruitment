@@ -15,9 +15,9 @@ import uuid
 from datetime import datetime
 from typing import Optional, List
 
-from fastapi import APIRouter, Depends, File, Form, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Query, UploadFile
 from pydantic import BaseModel, Field
-from sqlalchemy import select, and_
+from sqlalchemy import select, and_, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
@@ -33,6 +33,7 @@ from app.utils.clock import iso_utc
 from app.services.ai import llm_chat
 from app.services.system.system_settings import get_system_setting
 import logging
+from app.utils.llm_json import extract_json_object
 
 logger = logging.getLogger("genie.phase1_interview")
 router = APIRouter(tags=["面试(Phase1)"])
@@ -61,6 +62,34 @@ R2_DIMS = {
     "ai_usage": 5,
     "collaboration": 5,
 }
+
+# 维度中文名 —— 前端通过 GET /interviews/dimensions 取，不要再各自硬编码一套 key。
+R1_DIM_LABELS = {
+    "authenticity": "经历真实性",
+    "logic_expression": "逻辑表达",
+    "problem_solving": "问题解决",
+    "initiative": "主动性",
+    "responsibility": "责任心",
+    "learning": "学习能力",
+    "teamwork": "团队协作",
+    "position_knowledge": "岗位认知",
+    "ai_awareness": "AI 认知",
+}
+
+R2_DIM_LABELS = {
+    "professional": "专业能力",
+    "practical_ops": "实操能力",
+    "project_exp": "项目经验",
+    "analysis": "分析能力",
+    "quality": "质量意识",
+    "execution": "执行力",
+    "ai_usage": "AI 应用",
+    "collaboration": "协作沟通",
+}
+
+
+def _dims_payload(dims: dict, labels: dict) -> dict:
+    return {k: {"key": k, "label": labels.get(k, k), "max": v} for k, v in dims.items()}
 
 
 # ── Serializers ──────────────────────────────────────────────
@@ -145,6 +174,91 @@ async def _get_threshold(db: AsyncSession, key: str, default: int) -> int:
         return int(val)
     except (TypeError, ValueError):
         return default
+
+
+# 面试的"读"权限：permissions.py 里没有 interview:view 权限点(那是别人的文件，不改)，
+# 而 require_permission(*keys) 是"全部满足"语义，单用 interview:manage 会把只有
+# interview:score 的 interviewer / manager 挡在列表页外面。故此处做 any-of 校验。
+_INTERVIEW_READ_PERMS = ("interview:manage", "interview:score", "resume:view")
+
+
+async def _require_interview_read(current: CurrentUser = Depends(get_current_user)) -> CurrentUser:
+    if any(current.has(p) for p in _INTERVIEW_READ_PERMS):
+        return current
+    from app.core.security import PermissionError_
+    raise PermissionError_(f"无权限: 需要 {' 或 '.join(_INTERVIEW_READ_PERMS)} 之一")
+
+
+# ── GET /api/interviews/dimensions ────────────────────────────
+# 注意：必须声明在任何 /interviews/{...} 动态路径之前，否则会被动态段吞掉。
+
+@router.get("/interviews/dimensions")
+async def get_interview_dimensions(current: CurrentUser = Depends(_require_interview_read)):
+    """面试评分维度定义(后端真源)。submit_score 严格校验维度键名集合必须与此一致。"""
+    return ok({
+        "r1": _dims_payload(R1_DIMS, R1_DIM_LABELS),
+        "r2": _dims_payload(R2_DIMS, R2_DIM_LABELS),
+    })
+
+
+# ── GET /api/interviews ───────────────────────────────────────
+
+@router.get("/interviews")
+async def list_interviews(
+    candidate_id: Optional[str] = Query(None, alias="candidateId"),
+    position_id: Optional[str] = Query(None, alias="positionId"),
+    round: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100, alias="pageSize"),
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(_require_interview_read),
+):
+    """面试列表(分页 + 过滤)，供面试排期/评分页使用。"""
+    q = select(Interview)
+    if candidate_id:
+        try:
+            q = q.where(Interview.candidate_id == uuid.UUID(candidate_id))
+        except (ValueError, TypeError):
+            return ok({"list": [], "total": 0, "page": page, "pageSize": page_size})
+    if position_id:
+        try:
+            q = q.where(Interview.position_id == uuid.UUID(position_id))
+        except (ValueError, TypeError):
+            return ok({"list": [], "total": 0, "page": page, "pageSize": page_size})
+    if round:
+        q = q.where(Interview.round == round)
+    if status:
+        q = q.where(Interview.status == status)
+
+    total = (await db.execute(select(func.count()).select_from(q.subquery()))).scalar() or 0
+    rows = (await db.execute(
+        q.order_by(Interview.created_at.desc()).offset((page - 1) * page_size).limit(page_size)
+    )).scalars().all()
+
+    # 批量补候选人姓名 / 岗位名(避免 N+1)
+    cand_ids = {iv.candidate_id for iv in rows if iv.candidate_id}
+    pos_ids = {iv.position_id for iv in rows if iv.position_id}
+    cand_map = {}
+    if cand_ids:
+        cands = (await db.execute(select(Candidate).where(Candidate.id.in_(cand_ids)))).scalars().all()
+        cand_map = {c.id: c for c in cands}
+    pos_map = {}
+    if pos_ids:
+        poss = (await db.execute(select(Position).where(Position.id.in_(pos_ids)))).scalars().all()
+        pos_map = {p.id: p for p in poss}
+
+    items = []
+    for iv in rows:
+        item = serialize_interview(iv, current)
+        cand = cand_map.get(iv.candidate_id)
+        pos = pos_map.get(iv.position_id) if iv.position_id else None
+        item["candidateName"] = cand.name if cand else None
+        item["candidateStatus"] = cand.status if cand else None
+        item["positionName"] = pos.name if pos else None
+        items.append(item)
+
+    return ok({"list": items, "total": total, "page": page, "pageSize": page_size})
 
 
 # ── POST /api/interviews ──────────────────────────────────────
@@ -312,6 +426,8 @@ async def submit_score(
         if all_submitted and len(submitted_scores) >= 2:
             totals = [s.total for s in submitted_scores]
             gap = max(totals) - min(totals)
+            # interviewer_score_gap 目前不在 system_settings 的 DEFAULT_SETTINGS 里，
+            # 除非管理员在系统设置中手动新增该 key，否则这里恒取兜底值 20（分差≥20 视为异常）。
             threshold = await _get_threshold(db, "interviewer_score_gap", 20)
             if gap >= threshold:
                 await push_exception(
@@ -452,13 +568,9 @@ async def run_ai_analysis(
         raw_text = await llm_chat([{"role": "user", "content": prompt}])
         # Strip code fences
         raw_text = raw_text.strip()
-        if raw_text.startswith("```json"):
-            raw_text = raw_text[7:]
-        elif raw_text.startswith("```"):
-            raw_text = raw_text[3:]
-        if raw_text.endswith("```"):
-            raw_text = raw_text[:-3]
-        raw_dict = json.loads(raw_text.strip())
+        raw_dict = extract_json_object(raw_text)
+        if raw_dict is None:
+            raise ValueError("模型未返回可解析的 JSON")
     except Exception as e:
         logger.warning("AI analysis LLM call failed: %s", e)
         raw_dict = {
@@ -569,12 +681,49 @@ async def run_ai_analysis(
         db.add(report)
     await db.flush()
 
-    return ok({
+    return ok(_serialize_ai_report(report))
+
+
+def _serialize_ai_report(report: AIInterviewReport) -> dict:
+    return {
         "reportId": str(report.id),
+        "interviewId": str(report.interview_id),
+        "candidateId": str(report.candidate_id),
+        "round": report.round,
         "score": report.score,
         "authenticityScore": report.authenticity_score,
         "advice": report.advice,
-    })
+        "answeredDirectly": report.answered_directly,
+        "roleClear": report.role_clear,
+        "concreteResult": report.concrete_result,
+        "processDescribed": report.process_described,
+        "contradictionFound": report.contradiction_found,
+        "avoidedKey": report.avoided_key,
+        "logical": report.logical,
+        "createdAt": iso_utc(report.created_at),
+    }
+
+
+@router.get("/interviews/{interview_id}/ai-analysis")
+async def get_ai_analysis(
+    interview_id: str,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(_require_interview_read),
+):
+    """读取已生成的 AI 面试分析。
+
+    此前只有 POST（现跑现取），报告虽然落了库却没有读取入口，
+    页面刷新后 AI 分数就没了，一面综合分预览也因此算不出来。
+    """
+    iv = await _load_interview(db, interview_id)
+    if not iv:
+        return not_found("面试记录不存在")
+    report = (await db.execute(
+        select(AIInterviewReport).where(AIInterviewReport.interview_id == iv.id)
+    )).scalar_one_or_none()
+    if not report:
+        return not_found("尚未生成 AI 分析")
+    return ok(_serialize_ai_report(report))
 
 
 # ── POST /api/interviews/{id}/conclusion ─────────────────────
@@ -638,6 +787,9 @@ async def submit_conclusion(
                     reason=f"一面结论: {comment}", skip_block_check=True,
                 )
             except StateError as e:
+                # 上面已写入 composite_score/conclusion（autoflush 已刷进事务），
+                # get_db 只在抛异常时回滚，正常 return 会把这半截结论静默提交。
+                await db.rollback()
                 return fail(409, e.message)
 
     else:  # r2
@@ -665,6 +817,9 @@ async def submit_conclusion(
                     reason=f"二面结论-淘汰: {comment}", skip_block_check=True,
                 )
             except StateError as e:
+                # 上面已写入 composite_score/conclusion（autoflush 已刷进事务），
+                # get_db 只在抛异常时回滚，正常 return 会把这半截结论静默提交。
+                await db.rollback()
                 return fail(409, e.message)
         else:
             iv.conclusion = "recommend"
@@ -675,6 +830,9 @@ async def submit_conclusion(
                     reason=f"二面结论-推荐录用: {comment}", skip_block_check=True,
                 )
             except StateError as e:
+                # 上面已写入 composite_score/conclusion（autoflush 已刷进事务），
+                # get_db 只在抛异常时回滚，正常 return 会把这半截结论静默提交。
+                await db.rollback()
                 return fail(409, e.message)
 
         # AI vs interviewer conflict check

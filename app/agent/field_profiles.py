@@ -15,6 +15,12 @@ from typing import Any, Iterable, Optional
 
 
 # ── Field catalogs (camelCase keys as returned by API layers) ──
+#
+# 重要：这里的 key 必须与序列化器的真实输出一一对应，否则视图恒为空。
+#   RESUME_FIELDS    ← app/api/recruitment/resume_serializer.py::serialize_candidate
+#   PROBATION_FIELDS ← app/api/talent/probation.py::serialize_employee
+#   POSITION_FIELDS  ← app/api/recruitment/positions.py::serialize_position
+# 新增字段前先去对应 serialize_* 里确认该 key 真的会被输出。
 
 POSITION_FIELDS: dict[str, str] = {
     "id": "岗位ID",
@@ -43,6 +49,7 @@ RESUME_FIELDS: dict[str, str] = {
     "position": "应聘岗位",
     "positionId": "岗位ID",
     "score": "匹配分",
+    "grade": "匹配等级",
     "status": "状态",
     "gender": "性别",
     "age": "年龄",
@@ -53,43 +60,45 @@ RESUME_FIELDS: dict[str, str] = {
     "phone": "电话",
     "email": "邮箱",
     "skills": "技能",
+    "schoolTierLabel": "院校层次标签",
     "educationHistory": "教育经历",
     "workHistory": "工作经历",
     "projectHistory": "项目经历",
     "aiAnalysis": "AI分析",
-    "screeningAiScore": "筛选AI分",
-    "screeningManualConfirmed": "筛选是否人工确认",
-    "screeningConfirmedBy": "筛选确认人",
-    "interviewer": "面试官",
-    "interviewRound": "面试轮次",
+    "parseStatus": "简历解析状态",
     "uploadTime": "上传时间",
-    "resumeFile": "简历文件",
+    "resumeFileUrl": "简历文件下载地址",
+    "resumeFileName": "简历文件名",
+    "resumeFileType": "简历文件类型",
 }
 
 PROBATION_FIELDS: dict[str, str] = {
     "id": "员工ID",
     "name": "姓名",
+    "candidateId": "关联候选人ID",
     "positionName": "岗位",
     "positionId": "岗位ID",
     "department": "部门",
-    "status": "状态",
+    "status": "状态（pending_onboard/training/probation/pending_confirmation/formal/transferred/resigned）",
+    "employeeType": "员工类型",
     "gender": "性别",
     "age": "年龄",
-    "joinDate": "入职日",
-    "probationEnd": "试用期截止日",
+    "onboardDate": "入职日",
+    "probationEndDate": "试用期截止日",
     "mentorName": "导师",
+    "manager": "直属主管",
+    "matchLevel": "匹配等级",
+    "currentWeek": "当前第几周",
+    "totalWeeks": "试用总周数",
+    "overallScore": "综合得分",
+    "riskLevel": "风险等级",
     "taskProgress": "任务进度%",
     "totalTasks": "任务总数",
-    "completedTasks": "已完成任务数",
-    "week1Score": "第一周得分",
-    "week1Passed": "第一周是否通过",
-    "conversionScore": "转正得分",
-    "conversionDecision": "转正结论",
+    "completedTasks": "已完成任务数（status=passed）",
     "aiScore": "AI综合分",
     "aiResult": "AI结论",
     "tasks": "任务列表",
-    "week1Assessment": "第一周评估明细",
-    "conversion": "转正评估明细",
+    "tasksByWeek": "按周分组的任务",
 }
 
 # Settings are a flat dict of many keys — catalog = known defaults.
@@ -156,23 +165,25 @@ POSITION_VIEWS: dict[str, list[str]] = {
 }
 
 RESUME_VIEWS: dict[str, list[str]] = {
-    "summary": ["id", "name", "position", "score", "status", "education", "experience", "skills"],
+    "summary": ["id", "name", "position", "score", "grade", "status", "education", "experience", "skills"],
     "core": [
-        "id", "name", "position", "positionId", "score", "status",
+        "id", "name", "position", "positionId", "score", "grade", "status",
         "gender", "age", "education", "experience", "phone", "email", "skills",
     ],
     "detail": [
-        "id", "name", "position", "positionId", "score", "status",
+        "id", "name", "position", "positionId", "score", "grade", "status",
         "gender", "age", "ethnicity", "nativePlace", "education", "experience",
-        "phone", "email", "skills",
+        "phone", "email", "skills", "schoolTierLabel",
         "educationHistory", "workHistory", "projectHistory", "aiAnalysis",
     ],
     "contact": ["id", "name", "phone", "email", "status"],
+    # 注：候选人表没有 screeningAiScore/screeningConfirmedBy/interviewer/interviewRound
+    # 这些列，序列化器也不输出，原来的 screening/interview 视图恒为空。
+    # screening 收窄为真实存在的评分与解析状态；interview 视图已删除。
     "screening": [
-        "id", "name", "score", "status",
-        "screeningAiScore", "screeningManualConfirmed", "screeningConfirmedBy",
+        "id", "name", "score", "grade", "status", "parseStatus", "aiAnalysis",
     ],
-    "interview": ["id", "name", "status", "interviewer", "interviewRound", "score"],
+    "file": ["id", "name", "resumeFileName", "resumeFileType", "resumeFileUrl", "uploadTime"],
     "full": list(RESUME_FIELDS.keys()),
 }
 
@@ -180,13 +191,18 @@ PROBATION_VIEWS: dict[str, list[str]] = {
     "summary": ["id", "name", "positionName", "status", "taskProgress", "mentorName"],
     "core": [
         "id", "name", "positionName", "positionId", "department", "status",
-        "joinDate", "probationEnd", "mentorName",
-        "taskProgress", "week1Score", "week1Passed",
-        "conversionScore", "conversionDecision", "aiScore", "aiResult",
+        "onboardDate", "probationEndDate", "mentorName", "manager",
+        "currentWeek", "totalWeeks",
+        "taskProgress", "totalTasks", "completedTasks",
+        "overallScore", "riskLevel", "aiScore", "aiResult",
     ],
-    "tasks": ["id", "name", "status", "taskProgress", "totalTasks", "completedTasks", "tasks"],
-    "week1": ["id", "name", "week1Score", "week1Passed", "week1Assessment"],
-    "conversion": ["id", "name", "conversionScore", "conversionDecision", "conversion", "aiScore", "aiResult"],
+    "tasks": [
+        "id", "name", "status", "currentWeek", "taskProgress",
+        "totalTasks", "completedTasks", "tasks",
+    ],
+    # 注：Employee 没有 week1Score/conversionScore 等列，原 week1/conversion
+    # 两个视图恒为空，已删除。周考细节看 tasks（任务自带 weekNumber），
+    # 转正结论看 core 里的 aiScore/aiResult/overallScore。
     "full": list(PROBATION_FIELDS.keys()),
 }
 
@@ -219,13 +235,11 @@ _INTENT_VIEW_HINTS: list[tuple[str, str, str]] = [
     ("position", "试用期|转正|培养", "probation_plan"),
     ("position", "职责|JD|任职要求|加分|技术栈", "jd"),
     ("resume", "电话|邮箱|联系", "contact"),
-    ("resume", "筛选|确认", "screening"),
-    ("resume", "面试官|轮次|一面|二面", "interview"),
+    ("resume", "筛选|确认|评分|匹配分", "screening"),
+    ("resume", "简历文件|附件|原件|下载", "file"),
     ("resume", "详情|完整|简历|经历", "detail"),
-    ("probation", "任务", "tasks"),
-    ("probation", "第一周|周考", "week1"),
-    ("probation", "转正", "conversion"),
-    ("probation", "改|修改|更新|导师|入职", "core"),
+    ("probation", "任务|第一周|周考", "tasks"),
+    ("probation", "转正|改|修改|更新|导师|入职", "core"),
     ("settings", "分数|合格|匹配|阈值", "scoring"),
     ("settings", "AI|解析|出题|评分", "ai"),
     ("settings", "通知|提醒", "notify"),

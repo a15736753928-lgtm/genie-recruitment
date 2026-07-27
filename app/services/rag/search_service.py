@@ -116,7 +116,10 @@ async def search(
             for h in hits:
                 h["source"] = "dense_fallback"
             fallback = hits
-        fused = _rrf_fuse(fallback, [], [], top_k=rerank_top_k)
+        # _rrf_fuse 只收 (dense, sparse)；此处曾多传一个空列表，
+        # 导致「首轮无命中 → 走扩召回兜底」这条路必定 TypeError，
+        # 而调用方把异常吞成「知识库检索暂不可用」，从未被发现。
+        fused = _rrf_fuse(fallback, [], top_k=rerank_top_k)
 
     if not fused:
         return []

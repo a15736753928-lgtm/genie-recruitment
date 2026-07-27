@@ -2,7 +2,8 @@
 
 设计原则（按需求）：
 - 一次只处理一个问题：接收单个问题 + 回答原文，输出 3 个维度的分数。
-- 固定 3 个评分维度：表达能力、逻辑思维、技术深度（与前端 EVAL_DIMENSION_NAMES 对齐）。
+- 固定 3 个评分维度：表达能力、逻辑思维、技术深度。这是「单题评分」专用维度，
+  与面试轮次评定的 R1_DIMS/R2_DIMS（app/api/talent/phase1_interview.py）是两回事，不要混用。
 - 输出极简：只输出这 3 个数字（及维度名），不输出长篇点评，稳定且省 token。
 - 无状态：每次调用独立，可安全并发。批量评分时用 asyncio.gather 并发调用多个 Agent 实例。
 - 失败返回兜底分数，调用方据此落库，保证前端 AI 参考评分栏始终有内容。
@@ -22,7 +23,7 @@ from app.config import get_settings
 settings = get_settings()
 
 
-# ── 评分维度（固定 3 个，与前端 EVAL_DIMENSION_NAMES 完全一致）──────────
+# ── 单题评分维度（固定 3 个）────────────────────────────────────
 SCORING_DIMENSIONS: List[str] = ["表达能力", "逻辑思维", "技术深度"]
 
 # 每个维度的评分量表（rubric），供 Agent 保持评分一致性。

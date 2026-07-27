@@ -9,7 +9,7 @@ from datetime import datetime
 from typing import Optional, List, Any
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import select, func, and_, or_
+from sqlalchemy import select, func, and_, or_, String  # String: skills JSON 列 cast 用，缺它两处搜索必 NameError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
@@ -261,18 +261,28 @@ async def list_talent_pool(
 
 
 @router.get("/talent-pool/search")
-async def search_talent(q: str = Query(default=""), current: CurrentUser = Depends(require_permission("talent:view")), db: AsyncSession = Depends(get_db)):
-    """按标签/技能搜索匹配人才(用于项目人员推荐)。"""
-    if not q.strip(): return ok([])
-    pattern = f"%{q.strip()}%"
-    rows = (await db.execute(
-        select(TalentProfile).where(
+async def search_talent(
+    q: str = Query(default="", description="搜索关键字"),
+    keyword: str = Query(default="", description="q 的别名，前端历史上传的是 keyword"),
+    current: CurrentUser = Depends(require_permission("talent:view")),
+    db: AsyncSession = Depends(get_db),
+):
+    """按标签/技能搜索匹配人才(用于项目人员推荐)。
+
+    q / keyword 两个参数名都接受(前端一直传 keyword，此前恒命中空分支返回空数组)。
+    关键字为空时返回人才池前 20 条，而不是空列表。
+    """
+    term = (keyword or q or "").strip()
+    stmt = select(TalentProfile)
+    if term:
+        pattern = f"%{term}%"
+        stmt = stmt.where(
             or_(
                 TalentProfile.skills.cast(String).ilike(pattern),
                 TalentProfile.trainable_skills.cast(String).ilike(pattern),
             )
-        ).limit(20)
-    )).scalars().all()
+        )
+    rows = (await db.execute(stmt.limit(20))).scalars().all()
     return ok([{"employeeId": str(p.employee_id), "abilityLevel": p.ability_level,
                 "skills": p.skills, "department": p.department,
                 "taskSuccessRate": float(p.task_success_rate) if p.task_success_rate else None}
@@ -354,6 +364,9 @@ async def approve_promotion(
     approvers.append(str(current.id))
     pr.approver_ids = approvers
 
+    # PromotionRecord / EquityRecord 未在状态机 TRANSITIONS 中登记(刻意不登记，
+    # pending→approved 的两态实体没必要上状态机)；但 status 只能取下面这些字面量，
+    # 绝不接受请求体裸传的值。
     if len(approvers) >= 2:
         pr.status = "approved"; pr.approved_at = datetime.utcnow()
         # 更新画像职级

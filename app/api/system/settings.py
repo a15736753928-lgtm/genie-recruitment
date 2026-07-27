@@ -11,6 +11,7 @@ from app.services.system.system_settings import (
     invalidate_cache,
 )
 from app.utils.clock import iso_utc
+from app.utils.responses import ok
 
 router = APIRouter(tags=["系统设置"])
 
@@ -18,14 +19,14 @@ router = APIRouter(tags=["系统设置"])
 @router.get("/settings")
 async def get_settings(db: AsyncSession = Depends(get_db)):
     data = await get_system_settings(db)
-    return {"code": 0, "message": "ok", "data": data}
+    return ok(data)
 
 
 @router.get("/settings/kb-engine")
 async def get_kb_engine_info():
     from app.services.system.kb_settings import get_kb_engine_info
 
-    return {"code": 0, "message": "ok", "data": get_kb_engine_info()}
+    return ok(get_kb_engine_info())
 
 
 @router.put("/settings")
@@ -49,7 +50,7 @@ async def update_settings(
 
     await db.flush()
     invalidate_cache()
-    return {"code": 0, "message": "ok", "data": merged}
+    return ok(merged)
 
 
 @router.post("/settings/cleanup")
@@ -58,7 +59,7 @@ async def trigger_cleanup(db: AsyncSession = Depends(get_db)):
     from app.services.system.data_retention import cleanup_expired
 
     result = await cleanup_expired(db)
-    return {"code": 0, "message": "ok", "data": result}
+    return ok(result)
 
 
 # ── Audit log ──────────────────────────────────────────
@@ -70,20 +71,16 @@ async def list_audit_log(db: AsyncSession = Depends(get_db)):
         select(AuditLog).order_by(desc(AuditLog.created_at)).limit(50)
     )
     logs = result.scalars().all()
-    return {
-        "code": 0,
-        "message": "ok",
-        "data": [
-            {
-                "id": log.id,
-                "time": log.time,
-                "actor": log.actor,
-                "action": log.action,
-                "section": log.section or "",
-            }
-            for log in logs
-        ],
-    }
+    return ok([
+          {
+              "id": log.id,
+              "time": log.time,
+              "actor": log.actor,
+              "action": log.action,
+              "section": log.section or "",
+          }
+          for log in logs
+      ])
 
 
 @router.post("/settings/audit-log")
@@ -98,14 +95,10 @@ async def append_audit_log(body: dict, db: AsyncSession = Depends(get_db)):
     )
     db.add(log)
     await db.flush()
-    return {
-        "code": 0,
-        "message": "ok",
-        "data": {
-            "id": log.id,
-            "time": log.time,
-            "actor": log.actor,
-            "action": log.action,
-            "section": log.section or "",
-        },
-    }
+    return ok({
+          "id": log.id,
+          "time": log.time,
+          "actor": log.actor,
+          "action": log.action,
+          "section": log.section or "",
+      })

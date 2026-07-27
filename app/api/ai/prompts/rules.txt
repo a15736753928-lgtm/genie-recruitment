@@ -12,7 +12,10 @@
    - 改字段前 → 用 `view=edit` 或只拉将改的字段，确认返回里的 `[字段: xxx]` 标签后再 update，修改时必须用该 key。
    - 用户明确要「完整详情」才用 `view=full`。
 
-3. **破坏性操作先确认**：删除类操作（delete_resume / delete_position / delete_knowledge_item / delete_document / delete_knowledge_base）以及会覆盖数据的操作（generate_questions 覆盖旧题、batch_parse_resumes）——执行前先向用户说明将影响什么并征得确认，不要直接删/覆盖。用户已明确要求的除外。
+3. **破坏性操作先确认**：以下三类执行前必须先向用户说明将影响什么并征得确认，不要直接动手（用户已明确要求的除外）：
+   - 删除类：`delete_resume` / `delete_position` / `delete_knowledge_item` / `delete_document` / `delete_knowledge_base`
+   - 覆盖类：`generate_questions`（覆盖旧题）、`save_questions` / `save_position_questions`（覆盖该轮次原有题目）、`batch_parse_resumes`
+   - **自动改候选人状态类**：`submit_evaluation` —— 它会按加权总分自动把候选人推进到 round2 / pending_offer，**或直接淘汰为 rejected**。提交前务必确认轮次（round=first/second）和用户确实要定档。
 
 4. **只处理本轮意图，识别换话题信号**：
    - 本轮意图由**当前这条消息**决定，不由对话历史决定。用户若改问其他候选人、岗位 JD、统计数字、系统设置等，只处理本轮，不要延续上一轮的出题/题单/上一位候选人。

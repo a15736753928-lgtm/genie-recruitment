@@ -23,6 +23,7 @@ from langchain_core.tools import BaseTool
 from typing import TypedDict, Annotated
 
 from app.agent.tool_result import ToolResult, DisplayHint
+from app.agent_os.output import DISPLAY_HINTS
 from app.services.ai import create_langchain_llm
 
 
@@ -46,7 +47,6 @@ class AgentResult:
 def build_agent_graph(
     tools: list[BaseTool],
     system_prompt: str,
-    tool_result_adapter=None,  # optional ToolResultAdapter for structured output
 ) -> StateGraph:
     """Build a compiled LangGraph ReAct agent.
 
@@ -80,10 +80,7 @@ def build_agent_graph(
     workflow.add_conditional_edges("agent", should_continue, {"tools": "tools", END: END})
     workflow.add_edge("tools", "agent")
 
-    compiled = workflow.compile()
-    # Attach the adapter for use in streaming
-    compiled._tool_result_adapter = tool_result_adapter
-    return compiled
+    return workflow.compile()
 
 
 # ── SSE Helpers ─────────────────────────────────────────
@@ -101,7 +98,7 @@ _TOOL_PROGRESS: dict[str, int] = {
     "list_resumes": 70, "get_resume": 80, "list_positions": 80, "get_position": 80,
     "get_questions": 80, "get_evaluation": 80, "get_leaderboard": 80,
     "get_rankings": 80, "get_settings": 90, "get_operations_dashboard": 80,
-    "get_dashboard_overview": 80, "get_knowledge_stats": 90,
+    "get_knowledge_stats": 90,
     "get_knowledge_categories": 90, "get_probation_stats": 80,
     "get_performance_stats": 80, "get_department_performance": 80,
     "get_grade_distribution": 80, "get_bonus_info": 80,
@@ -135,30 +132,8 @@ def _tool_progress(tool_name: str) -> int:
 
 
 def _display_hint_for(tool_name: str) -> str:
-    """Map tool name to display hint for frontend card rendering.
-
-    Uses the comprehensive mapping from ToolResultAdapter when available,
-    falling back to the legacy hardcoded mapping.
-    """
-    try:
-        from app.agent_os.output.adapter import ToolResultAdapter
-        return ToolResultAdapter.DISPLAY_HINTS.get(tool_name, "text")
-    except ImportError:
-        pass
-    # Legacy fallback
-    if tool_name in ("list_resumes", "rag_search", "recall_test"):
-        return "list"
-    if tool_name in ("get_resume", "get_position", "list_positions"):
-        return "card"
-    if tool_name in ("get_questions", "generate_questions"):
-        return "questions"
-    if tool_name in ("get_evaluation", "save_evaluation", "ai_score_question"):
-        return "score"
-    if tool_name in ("get_leaderboard", "get_rankings"):
-        return "table"
-    if tool_name in ("get_probation_stats", "get_performance_stats", "get_dashboard_overview"):
-        return "stats"
-    return "text"
+    """Map tool name to display hint for frontend card rendering."""
+    return DISPLAY_HINTS.get(tool_name, "text")
 
 
 # ── Streaming ───────────────────────────────────────────

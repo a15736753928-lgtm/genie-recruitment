@@ -23,7 +23,7 @@ from app.config import get_settings
 settings = get_settings()
 
 
-# ── 评分维度（固定 4 个，与前端 REVERSE_QUESTION_DIMENSION_NAMES 完全一致）──────
+# ── 反问环节评分维度（固定 4 个）──────────────────────────────────
 REVERSE_DIMENSIONS: List[str] = ["问题深度", "团队业务理解", "职业规划清晰度", "沟通"]
 
 # 每个维度的评分量表（rubric），供 Agent 保持评分一致性。

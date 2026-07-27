@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 from app.database import get_db
 from app.models.recruitment import Position, Candidate, PositionQuestion
 from app.utils.clock import iso_utc
+from app.utils.responses import ok, not_found, conflict
 router = APIRouter(tags=["岗位"])
 
 
@@ -77,11 +78,7 @@ def serialize_position(p: Position) -> dict:
 async def list_positions(db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(Position).order_by(Position.created_at))
     positions = result.scalars().all()
-    return {
-        "code": 0,
-        "message": "ok",
-        "data": [serialize_position(p) for p in positions],
-    }
+    return ok([serialize_position(p) for p in positions])
 
 
 @router.get("/positions/{position_id}")
@@ -89,8 +86,8 @@ async def get_position(position_id: str, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(Position).where(Position.id == position_id))
     position = result.scalar_one_or_none()
     if not position:
-        return {"code": 404, "message": "岗位不存在", "data": None}
-    return {"code": 0, "message": "ok", "data": serialize_position(position)}
+        return not_found("岗位不存在")
+    return ok(serialize_position(position))
 
 
 @router.post("/positions")
@@ -100,7 +97,7 @@ async def create_position(
 ):
     existing = await db.execute(select(Position).where(Position.name == req.name))
     if existing.scalar_one_or_none():
-        return {"code": 409, "message": "岗位名已存在", "data": None}
+        return conflict("岗位名已存在")
 
     position = Position(
         name=req.name,
@@ -117,7 +114,7 @@ async def create_position(
     db.add(position)
     await db.flush()
     await db.refresh(position)
-    return {"code": 0, "message": "ok", "data": serialize_position(position)}
+    return ok(serialize_position(position))
 
 
 @router.put("/positions/{position_id}")
@@ -129,7 +126,7 @@ async def update_position(
     result = await db.execute(select(Position).where(Position.id == position_id))
     position = result.scalar_one_or_none()
     if not position:
-        return {"code": 404, "message": "岗位不存在", "data": None}
+        return not_found("岗位不存在")
 
     update_data = req.model_dump(exclude_unset=True)
     for field, value in update_data.items():
@@ -137,7 +134,7 @@ async def update_position(
 
     await db.flush()
     await db.refresh(position)
-    return {"code": 0, "message": "ok", "data": serialize_position(position)}
+    return ok(serialize_position(position))
 
 
 @router.delete("/positions/{position_id}")
@@ -150,13 +147,13 @@ async def delete_position(
     result = await db.execute(select(Position).where(Position.id == position_id))
     position = result.scalar_one_or_none()
     if not position:
-        return {"code": 404, "message": "岗位不存在", "data": None}
+        return not_found("岗位不存在")
 
     candidate_result = await db.execute(
         select(Candidate).where(Candidate.position_id == position_id).limit(1)
     )
     if candidate_result.scalar_one_or_none():
-        return {"code": 409, "message": "该岗位下有关联候选人，请先删除或转移相关简历后再删除岗位", "data": None}
+        return conflict("该岗位下有关联候选人，请先删除或转移相关简历后再删除岗位")
 
     # employees 外键是 NO ACTION，先解除引用再删岗位
     await db.execute(
@@ -166,7 +163,7 @@ async def delete_position(
 
     await db.delete(position)
     await db.flush()
-    return {"code": 0, "message": "ok", "data": None}
+    return ok()
 
 
 # ── Position question bank ──
@@ -183,22 +180,18 @@ async def get_position_questions(
         .order_by(PositionQuestion.index_num)
     )
     questions = result.scalars().all()
-    return {
-        "code": 0,
-        "message": "ok",
-        "data": [
-            {
-                "id": str(q.id),
-                "positionId": str(q.position_id),
-                "round": q.round,
-                "index": q.index_num,
-                "content": q.content,
-                "category": q.category,
-                "difficulty": q.difficulty,
-            }
-            for q in questions
-        ],
-    }
+    return ok([
+          {
+              "id": str(q.id),
+              "positionId": str(q.position_id),
+              "round": q.round,
+              "index": q.index_num,
+              "content": q.content,
+              "category": q.category,
+              "difficulty": q.difficulty,
+          }
+          for q in questions
+      ])
 
 
 @router.put("/positions/{position_id}/questions")
@@ -232,4 +225,4 @@ async def save_position_questions(
         ))
 
     await db.flush()
-    return {"code": 0, "message": "ok", "data": None}
+    return ok()

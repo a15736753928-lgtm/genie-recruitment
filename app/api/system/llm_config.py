@@ -23,6 +23,7 @@ from app.services.ai.config_store import (
 )
 from app.services.ai.crypto import mask_key, decrypt_key, SENTINEL_UNCHANGED
 from app.services.ai.providers.registry import get_adapter, supported_types
+from app.utils.responses import ok, fail
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["LLM 配置"])
@@ -54,7 +55,7 @@ async def get_llm_config(db: AsyncSession = Depends(get_db)):
             if k.get("apiKey"):
                 plain = decrypt_key(k["apiKey"])
                 k["apiKey"] = mask_key(plain) if plain else ""
-    return {"code": 0, "message": "ok", "data": masked}
+    return ok(masked)
 
 
 @router.put("/api/settings/llm-config")
@@ -70,7 +71,7 @@ async def update_llm_config(
     """
     masked = await save_llm_config(db, body)
     await reload_llm_config(db)
-    return {"code": 0, "message": "ok", "data": masked}
+    return ok(masked)
 
 
 # ── 测试 & 重载 ───────────────────────────────────────────
@@ -84,7 +85,7 @@ async def test_llm_provider(body: dict, db: AsyncSession = Depends(get_db)):
     provider_type = body.get("providerType", "openai_compatible")
     api_key = body.get("apiKey", "").strip()
     if not api_key:
-        return {"code": 400, "message": "API Key 不能为空", "data": None}
+        return fail(400, "API Key 不能为空")
 
     # 构建临时 provider dict
     provider = {
@@ -99,10 +100,12 @@ async def test_llm_provider(body: dict, db: AsyncSession = Depends(get_db)):
 
     try:
         adapter = get_adapter(provider_type)
-        ok, msg = await adapter.test_connection(provider, api_key)
-        return {"code": 0 if ok else 1, "message": msg, "data": {"ok": ok}}
+        connected, msg = await adapter.test_connection(provider, api_key)
+        if not connected:
+            return fail(1, msg, {"ok": False})
+        return ok({"ok": True}, message=msg)
     except Exception as exc:
-        return {"code": 1, "message": str(exc), "data": {"ok": False}}
+        return fail(1, str(exc), {"ok": False})
 
 
 @router.post("/api/settings/llm-config/reload")
@@ -110,16 +113,16 @@ async def manual_reload_llm(db: AsyncSession = Depends(get_db)):
     """手动刷新 Router 缓存（调试用）。"""
     await reload_llm_config(db)
     stats = await get_router_stats()
-    return {"code": 0, "message": "Router 已重载", "data": stats}
+    return ok(stats, message="Router 已重载")
 
 
 @router.get("/api/settings/llm-config/supported-types")
 async def get_supported_types():
     """返回当前环境支持的 provider type 列表。"""
-    return {"code": 0, "message": "ok", "data": supported_types()}
+    return ok(supported_types())
 
 
 @router.get("/api/settings/llm-config/router-stats")
 async def get_router_status():
     """返回 Router 当前状态（调试用）。"""
-    return {"code": 0, "message": "ok", "data": await get_router_stats()}
+    return ok(await get_router_stats())

@@ -28,10 +28,10 @@ router = APIRouter(tags=["任务积分(Phase3)"])
 # ── 等级点范围 ──────────────────────────────────────────────
 LEVEL_RANGES = {"S": (500, 1000), "A": (200, 500), "B": (80, 200), "C": (20, 80), "D": (5, 20)}
 
-async def _get_setting(db: AsyncSession, key: str, default: Any) -> Any:
-    row = await db.execute(select(SystemSetting).where(SystemSetting.key == key))
-    s = row.scalar_one_or_none()
-    return s.value if s else default
+# 统一走 global 设置 dict —— 曾经这里自建 helper 直查独立行，而管理员在设置页保存
+# 走的是 PUT /settings（只更新 key="global" 那一行），两套存储互不相通，
+# 导致「管理员改了扣分阈值永远不生效」。
+from app.services.system.system_settings import get_system_setting as _get_setting
 
 # ── 序列化 ───────────────────────────────────────────────────
 
@@ -143,12 +143,29 @@ async def create_task(
 
 
 class UpdateTaskRequest(BaseModel):
-    model_config = {"populate_by_name": True}
+    # extra=allow: 只为了能"看见"前端多传的键并显式报错，
+    # 不允许它们进入 setattr 循环(见 update_task 里的 model_fields 过滤)。
+    model_config = {"populate_by_name": True, "extra": "allow"}
     name: Optional[str] = None; goal: Optional[str] = None
     level: Optional[str] = None; base_points: Optional[int] = Field(None, alias="basePoints")
     acceptance_criteria: Optional[str] = Field(None, alias="acceptanceCriteria")
     deadline: Optional[str] = None; priority: Optional[str] = None
     deliverables: Optional[str] = None; risk_note: Optional[str] = Field(None, alias="riskNote")
+
+
+# PUT /tasks/{id} 不承担状态推进；下面这张表用于把误传的 status 指回专用端点。
+_STATUS_ENDPOINT_HINT = {
+    "pending": "POST /tasks/{id}/publish",
+    "in_progress": "POST /tasks/{id}/start",
+    "pending_accept": "POST /tasks/{id}/submit",
+    "passed": "POST /tasks/{id}/acceptance",
+}
+# 验收相关字段只能由 POST /tasks/{id}/acceptance 写入(积分公式的输入)。
+_ACCEPTANCE_ONLY_KEYS = {
+    "completionRate", "completionCoeff", "qualityCoeff", "timeCoeff",
+    "timelinessCoeff", "actualPoints", "collaborationPoints",
+    "innovationPoints", "penaltyPoints",
+}
 
 
 @router.put("/tasks/{task_id}")
@@ -157,14 +174,26 @@ async def update_task(
     current: CurrentUser = Depends(require_permission("task:create")),
     db: AsyncSession = Depends(get_db),
 ):
+    # 先拒绝越界字段，再做任何加载/赋值(避免"返回 200 但什么都没发生"的静默吞)
+    extra = body.model_extra or {}
+    if "status" in extra:
+        hint = _STATUS_ENDPOINT_HINT.get(str(extra.get("status")))
+        return fail(400, f"状态不可通过 PUT /tasks/{{id}} 修改，请改用 "
+                         f"{hint or '专用端点(/publish /start /submit /acceptance)'}")
+    bad_keys = _ACCEPTANCE_ONLY_KEYS & set(extra)
+    if bad_keys:
+        return fail(400, f"验收字段 {', '.join(sorted(bad_keys))} 不可通过 PUT /tasks/{{id}} 提交，"
+                         f"请改用 POST /tasks/{{id}}/acceptance")
+
     try: tid = uuid.UUID(task_id)
     except ValueError: return not_found("任务不存在")
     t = (await db.execute(select(WorkTask).where(WorkTask.id == tid))).scalar_one_or_none()
     if not t: return not_found("任务不存在")
     if t.status in ("closed", "passed"):
         return fail(409, "已完成或已关闭的任务不可修改")
+    declared = set(UpdateTaskRequest.model_fields)
     for field, val in body.model_dump(exclude_unset=True, exclude={"base_points"}).items():
-        if val is not None and hasattr(t, field):
+        if field in declared and val is not None and hasattr(t, field):
             setattr(t, field, val)
     if body.base_points is not None:
         lo, hi = LEVEL_RANGES.get(t.level, (0, 0))
@@ -249,7 +278,8 @@ async def start_task(task_id: str, current: CurrentUser = Depends(require_permis
     except ValueError: return not_found("任务不存在")
     t = (await db.execute(select(WorkTask).where(WorkTask.id == tid))).scalar_one_or_none()
     if not t: return not_found("任务不存在")
-    if t.status != "pending": return fail(409, "只有待认领的任务可开始")
+    # rework 也走这里重新开工（状态机 in_progress ← [pending, rework]）
+    if t.status not in ("pending", "rework"): return fail(409, "只有待认领或需返工的任务可开始")
     try: await transition(db, "work_task", t, "in_progress", actor_id=current.id, actor_name=current.username, skip_block_check=True)
     except StateError as e: return fail(409, e.message)
     return ok(_serialize_task(t))
@@ -263,8 +293,13 @@ async def submit_task(task_id: str, body: dict, current: CurrentUser = Depends(r
     if not t: return not_found("任务不存在")
     if t.status != "in_progress": return fail(409, "只有进行中的任务可提交")
     t.deliverables = body.get("deliverables") or t.deliverables
-    try: await transition(db, "work_task", t, "pending_accept", actor_id=current.id, actor_name=current.username, skip_block_check=True)
-    except StateError as e: return fail(409, e.message)
+    try:
+        await transition(db, "work_task", t, "pending_accept", actor_id=current.id, actor_name=current.username, skip_block_check=True)
+    except StateError as e:
+        # deliverables 已赋值(autoflush 会刷进事务)；get_db() 只在抛异常时回滚，
+        # 这里正常 return 会把半截修改静默提交，必须显式回滚。
+        await db.rollback()
+        return fail(409, e.message)
     await write_audit(db, actor=current.username, action=f"提交任务: {t.name}", section="tasks")
     return ok(_serialize_task(t))
 
@@ -337,6 +372,59 @@ async def accept_task(
     await write_audit(db, actor=current.username, action=f"验收任务: {t.name} 得分: {actual}", section="tasks")
     return ok({"task": _serialize_task(t), "acceptance": _serialize_acceptance(acc),
                "pointRecord": _serialize_point(pr)})
+
+
+@router.post("/tasks/{task_id}/rework")
+async def rework_task(
+    task_id: str, body: dict,
+    current: CurrentUser = Depends(require_permission("task:accept")),
+    db: AsyncSession = Depends(get_db),
+):
+    """验收不通过，打回返工。
+
+    此前状态机里有 rework 这个状态，却没有任何端点能产生它——验收只能一路 passed，
+    「不通过」在业务上无路可走。
+    """
+    try: tid = uuid.UUID(task_id)
+    except ValueError: return not_found("任务不存在")
+    t = (await db.execute(select(WorkTask).where(WorkTask.id == tid))).scalar_one_or_none()
+    if not t: return not_found("任务不存在")
+    if t.status != "pending_accept": return fail(409, "只有待验收的任务可打回返工")
+    reason = (body.get("reason") or "").strip()
+    if not reason: return fail(400, "打回返工必须填写原因")
+
+    try:
+        await transition(db, "work_task", t, "rework", actor_id=current.id,
+                         actor_name=current.username, reason=reason, skip_block_check=True)
+    except StateError as e:
+        await db.rollback()
+        return fail(409, e.message)
+    t.rework_count = (t.rework_count or 0) + 1
+    await db.flush()
+    await write_audit(db, actor=current.username, action=f"打回返工: {t.name}（{reason}）", section="tasks")
+    return ok(_serialize_task(t))
+
+
+@router.post("/tasks/{task_id}/close")
+async def close_task(
+    task_id: str,
+    current: CurrentUser = Depends(require_permission("task:create")),
+    db: AsyncSession = Depends(get_db),
+):
+    """归档任务（passed / rework 之后的终态）。"""
+    try: tid = uuid.UUID(task_id)
+    except ValueError: return not_found("任务不存在")
+    t = (await db.execute(select(WorkTask).where(WorkTask.id == tid))).scalar_one_or_none()
+    if not t: return not_found("任务不存在")
+    if t.status not in ("passed", "rework"): return fail(409, "只有已通过或需返工的任务可关闭")
+    try:
+        await transition(db, "work_task", t, "closed", actor_id=current.id,
+                         actor_name=current.username, skip_block_check=True)
+    except StateError as e:
+        await db.rollback()
+        return fail(409, e.message)
+    await write_audit(db, actor=current.username, action=f"关闭任务: {t.name}", section="tasks")
+    return ok(_serialize_task(t))
 
 
 # ═══════════════════════════════════════════════
@@ -453,15 +541,23 @@ async def create_rp(
     if body.points <= 0: return fail(400, "分数必须为正整数")
     if not body.reason.strip(): return fail(400, "原因不可为空")
 
-    # 扣分必须提供证据
+    try: eid = uuid.UUID(body.employee_id)
+    except (ValueError, TypeError): return fail(400, "无效的 employeeId")
+
+    # 扣分必须提供证据。
+    # 这里"先记异常再拒绝"是有意设计(与 create_task 无验收标准同款)：留下"有人试图无证据扣分"的痕迹。
+    # 原实现 entity_id=uuid.uuid4() 指向不存在的实体，异常队列点进去查无此记录 → 改挂到真实员工上。
+    # severity 用 warn 而非 block：entity_type="employee" 已在状态机 TRANSITIONS 中登记，
+    # 挂 block 级异常会连带冻结该员工的转正/调岗等所有状态迁移(误伤)。
     if body.type == "penalty" and (not body.evidence or len(body.evidence) == 0):
-        await push_exception(db, entity_type="reward_penalty", entity_id=uuid.uuid4(),
-                             exception_type="deduction_no_evidence", detail="扣分缺少证据", severity="block")
+        await push_exception(db, entity_type="employee", entity_id=eid,
+                             exception_type="deduction_no_evidence",
+                             detail=f"扣分缺少证据: {body.reason.strip()[:100]}", severity="warn")
         return fail(422, "扣分须提供证据")
 
     threshold = await _get_setting(db, "major_penalty_threshold", 200)
     rp = RewardPenaltyRecord(
-        employee_id=uuid.UUID(body.employee_id), type=body.type, points=body.points,
+        employee_id=eid, type=body.type, points=body.points,
         reason=body.reason, rule_ref=body.rule_ref, evidence=body.evidence,
         requires_dual_approval=(body.type == "penalty" and body.points >= threshold),
         status="dual_pending" if (body.type == "penalty" and body.points >= threshold) else "confirmed",
@@ -526,6 +622,13 @@ async def list_rp(
     current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db),
 ):
     q = select(RewardPenaltyRecord)
+    # 员工自助: 只能看自己（与 list_points / list_appeals 同一收窄规则）。
+    # 此前这里没做收窄，员工请求「我的奖惩」会拿到全公司的奖惩记录。
+    if current.permissions and "self:points:view" in current.permissions and "points:reward" not in current.permissions:
+        if not current.employee_id:
+            return fail(403, "无法识别员工身份")
+        q = q.where(RewardPenaltyRecord.employee_id == current.employee_id)
+        employee_id = None
     if type: q = q.where(RewardPenaltyRecord.type == type)
     if employee_id:
         try: q = q.where(RewardPenaltyRecord.employee_id == uuid.UUID(employee_id))
@@ -560,10 +663,17 @@ class HandleAppealRequest(BaseModel):
     action: str = "resolved"  # resolved / rejected
 
 
+# Appeal 未在状态机 TRANSITIONS 中登记(刻意不登记，避免为两状态实体过度设计)，
+# 但终态值必须来自受控集合，不能把请求体裸值直接写进 status。
+_APPEAL_ACTIONS = ("resolved", "rejected")
+
+
 @router.put("/appeals/{appeal_id}/handle")
 async def handle_appeal(
     appeal_id: str, body: HandleAppealRequest, current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db),
 ):
+    if body.action not in _APPEAL_ACTIONS:
+        return fail(400, f"无效的处理动作 {body.action!r}，只接受: {' / '.join(_APPEAL_ACTIONS)}")
     try: aid = uuid.UUID(appeal_id)
     except ValueError: return not_found("申诉不存在")
     a = (await db.execute(select(Appeal).where(Appeal.id == aid))).scalar_one_or_none()

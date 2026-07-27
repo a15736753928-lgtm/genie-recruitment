@@ -1,5 +1,6 @@
 """模块二: 简历评分 + 筛选决策 API。"""
 from __future__ import annotations
+import logging
 import uuid
 from typing import Optional
 from fastapi import APIRouter, Depends, Query
@@ -18,14 +19,14 @@ from app.schemas.ai_advice import AIAdvice
 from app.utils.responses import ok, fail, not_found
 from app.utils.audit import write_audit
 from app.utils.clock import iso_utc
+from app.utils.llm_json import extract_json_object
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["简历筛选"])
 
 
-async def _get_threshold(db: AsyncSession, key: str, default):
-    row = await db.execute(select(SystemSetting).where(SystemSetting.key == key))
-    s = row.scalar_one_or_none()
-    return s.value if s else default
+from app.services.system.system_settings import get_system_setting as _get_threshold
 
 
 def compute_grade(total: int, thresholds: dict) -> str:
@@ -114,11 +115,9 @@ async def score_candidate(
             '"missing_information":["..."],"recommended_action":"...","requires_human_confirmation":true}'
         )
         resp_text = await llm_chat([{"role": "user", "content": prompt}])
-        s_idx = resp_text.find("{")
-        e_idx = resp_text.rfind("}") + 1
-        if s_idx < 0 or e_idx <= s_idx:
-            raise ValueError("No JSON")
-        raw = json.loads(resp_text[s_idx:e_idx])
+        raw = extract_json_object(resp_text)
+        if raw is None:
+            raise ValueError("模型未返回可解析的 JSON")
     except Exception as e:
         return fail(500, f"AI 评分失败: {e}")
 
@@ -173,17 +172,23 @@ async def score_candidate(
     score_obj.grade = grade
     score_obj.advice = advice_dict
 
+    # score 与 screening_ai_score 都要写：列表页与 grade 换算读的是 score
+    # （见 resume_serializer.serialize_candidate），此前只写 screening_ai_score
+    # 而那个字段全仓无人序列化，导致「跑完 AI 评分，界面分数和等级毫无变化」。
+    # 上传解析时写入的 score 只是解析阶段的粗估，这里的 8 维加权分是权威值，应覆盖它。
     candidate.screening_ai_score = total
+    candidate.score = total
     await db.flush()
 
-    # transition to pending_screen if new
+    # 评分完成即进入待筛选池。迁移失败不阻断打分结果返回（分数本身已算出且有效），
+    # 但必须记日志——静默 pass 会让「候选人卡在 new 永远进不了筛选列表」无声无息。
     if candidate.status in ("new", "parsed"):
         try:
             await transition(db, "candidate", candidate, "pending_screen",
                              actor_id=current.id, actor_name=current.username,
                              skip_block_check=True)
-        except StateError:
-            pass
+        except StateError as e:
+            logger.warning("候选人 %s 打分后无法进入待筛选: %s", cid, e.message)
 
     return ok(serialize_score(score_obj, current))
 
@@ -233,6 +238,7 @@ class DecisionRequest(BaseModel):
     action: str    # invite/supplement/transfer/reserve/reject
     reason: Optional[str] = None
     target_position_id: Optional[str] = Field(None, alias="targetPositionId")
+    material_note: Optional[str] = Field(None, alias="materialNote")
     resume_viewed: bool = Field(alias="resumeViewed")
 
 
@@ -270,6 +276,20 @@ async def candidate_decision(
         if conflict and not body.reason:
             return fail(400, "决策与 AI 建议不一致，请填写原因")
 
+    # 转岗的目标岗位先解析校验再赋值——放在 transition 之前赋值会在迁移失败时
+    # 留下「岗位已改但状态没动」的脏数据（get_db 不会为正常 return 回滚）。
+    target_position: Optional[uuid.UUID] = None
+    if body.action == "transfer":
+        if not body.target_position_id:
+            return fail(400, "转岗需指定目标岗位")
+        try:
+            target_position = uuid.UUID(body.target_position_id)
+        except ValueError:
+            return fail(400, "目标岗位 ID 格式不正确")
+        exists = await db.execute(select(Position.id).where(Position.id == target_position))
+        if exists.scalar_one_or_none() is None:
+            return not_found("目标岗位不存在")
+
     # 状态迁移
     try:
         if body.action == "invite":
@@ -285,20 +305,24 @@ async def candidate_decision(
                              actor_id=current.id, actor_name=current.username,
                              reason=body.reason)
         elif body.action == "transfer":
-            if body.target_position_id:
-                candidate.position_id = uuid.UUID(body.target_position_id)
+            candidate.position_id = target_position
             await transition(db, "candidate", candidate, "pending_screen",
                              actor_id=current.id, actor_name=current.username,
                              reason=body.reason, skip_block_check=True)
         elif body.action == "supplement":
-            pass  # 留在 pending_screen，无状态迁移
+            await transition(db, "candidate", candidate, "pending_materials",
+                             actor_id=current.id, actor_name=current.username,
+                             reason=body.material_note or body.reason,
+                             skip_block_check=True)
         else:
             return fail(400, f"不支持的操作: {body.action}")
     except StateError as e:
+        await db.rollback()
         return fail(409, e.message)
 
+    note = f"（{body.material_note}）" if body.material_note else ""
     await write_audit(db, actor=current.username,
-                      action=f"简历决策: {body.action}", section="resume")
+                      action=f"简历决策: {body.action}{note}", section="resume")
     return ok({"status": candidate.status})
 
 

@@ -45,13 +45,10 @@ async def _get_department_performance(params: dict, db: AsyncSession) -> str:
     data = result.get("data", [])
     if not data:
         return f"部门绩效（{params.get('quarter','')}）：无数据"
+    # 路由只返回 {department, score}（score 即部门平均分），没有人数字段。
     lines = [f"部门绩效（{params.get('quarter','')}）：共 {len(data)} 个部门："]
     for d in data:
-        lines.append(
-            f"  {d.get('department') or d.get('name','—')} | "
-            f"平均分:{d.get('avgScore') or d.get('average','—')} | "
-            f"人数:{d.get('count') or d.get('headcount','—')}"
-        )
+        lines.append(f"  {d.get('department','—')} | 平均分:{d.get('score','—')}")
     return "\n".join(lines)
 
 
@@ -76,13 +73,11 @@ async def _get_quarter_trends(params: dict, db: AsyncSession) -> str:
     data = result.get("data", [])
     if not data:
         return "季度趋势：无数据"
+    # 路由只返回 {quarter, score, isCurrent}（score 即该季度平均分），没有参与人数。
     lines = [f"近 {len(data)} 个季度趋势："]
     for d in data:
-        lines.append(
-            f"  {d.get('quarter','—')} | "
-            f"平均分:{d.get('avgScore') or d.get('average','—')} | "
-            f"参与:{d.get('participants') or d.get('count','—')}"
-        )
+        mark = "（当前季度）" if d.get("isCurrent") else ""
+        lines.append(f"  {d.get('quarter','—')} | 平均分:{d.get('score','—')}{mark}")
     return "\n".join(lines)
 
 

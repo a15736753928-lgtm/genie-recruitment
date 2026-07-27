@@ -33,8 +33,10 @@ async def _rag_search(params: dict, db: AsyncSession) -> str:
                 )
             return f"检索到 {len(results)} 条相关知识:\n" + "\n---\n".join(summaries)
         return "未检索到相关知识"
-    except Exception:
-        return "知识库检索暂不可用"
+    except Exception as exc:
+        # 必须含「失败」二字：WriteVerifier / 上层判定靠关键词识别失败，
+        # 否则模型会把「检索不可用」误当成「确实没有这条知识」。
+        return f"知识库检索失败：{exc}。请稍后重试或改用其他工具，不要据此断定知识不存在。"
 
 
 async def _list_knowledge(params: dict, db: AsyncSession) -> str:
@@ -80,6 +82,8 @@ async def _get_knowledge_categories(params: dict, db: AsyncSession) -> str:
 
 
 async def _upload_knowledge_file(params: dict, db: AsyncSession) -> str:
+    # 注意：文件在前端「添加资料」时已经上传到 MinIO，本工具不做任何上传，
+    # 仅确认 object key 已就绪并提示模型进入下一步（create_knowledge_item）。
     object_key = params["fileKey"]
     file_name = params["fileName"]
     return f"知识库素材文件「{file_name}」已就绪，object key={object_key}。请接着调用 create_knowledge_item 完成入库。"
@@ -108,8 +112,9 @@ async def _delete_knowledge_item(params: dict, db: AsyncSession) -> str:
 async def _recall_test(params: dict, db: AsyncSession) -> str:
     from app.api.knowledge.knowledge_base import recall_test as fn
     result = await fn(body={"query": params["query"]}, db=db)
-    data = result.get("data", [])
-    return f"召回测试命中 {len(data)} 条"
+    data = result.get("data") or {}
+    hits = data.get("list") or []
+    return f"召回测试命中 {len(hits)} 条（阈值 {data.get('threshold', '—')}）"
 
 
 async def _list_knowledge_bases(params: dict, db: AsyncSession) -> str:
@@ -122,19 +127,19 @@ async def _list_knowledge_bases(params: dict, db: AsyncSession) -> str:
 async def _create_knowledge_base(params: dict, db: AsyncSession) -> str:
     from app.api.knowledge.rag import create_knowledge_base as fn
     result = await fn(body={"name": params["name"], "description": params.get("description", "")}, db=db)
-    return f"已创建RAG知识库「{params['name']}」" if result.get("code") == 200 or result.get("code") == 0 else f"创建失败：{result.get('message', '')}"
+    return f"已创建RAG知识库「{params['name']}」" if result.get("code") == 0 else f"创建失败：{result.get('message', '')}"
 
 
 async def _update_knowledge_base(params: dict, db: AsyncSession) -> str:
     from app.api.knowledge.rag import update_knowledge_base as fn
     result = await fn(kb_id=params["id"], body=params.get("fields", {}), db=db)
-    return f"已更新RAG知识库 {params['id']}" if result.get("code") in (0, 200) else f"更新失败：{result.get('message', '')}"
+    return f"已更新RAG知识库 {params['id']}" if result.get("code") == 0 else f"更新失败：{result.get('message', '')}"
 
 
 async def _delete_knowledge_base(params: dict, db: AsyncSession) -> str:
     from app.api.knowledge.rag import delete_knowledge_base as fn
     result = await fn(kb_id=params["id"], db=db)
-    return f"已删除RAG知识库 {params['id']}" if result.get("code") in (0, 200) else f"删除失败：{result.get('message', '')}"
+    return f"已删除RAG知识库 {params['id']}" if result.get("code") == 0 else f"删除失败：{result.get('message', '')}"
 
 
 async def _upload_document(params: dict, db: AsyncSession) -> str:
@@ -153,8 +158,9 @@ async def _upload_document(params: dict, db: AsyncSession) -> str:
         except OSError:
             pass
     upload_file = UploadFile(file=io.BytesIO(content), filename=file_name)
-    result = await fn(file=upload_file, kb_id=kb_id)
-    if result.get("code") in (0, 200):
+    # db 必须显式传：直调路由函数不走依赖注入，漏传会拿到 Depends 对象并在 SQL 层崩溃。
+    result = await fn(file=upload_file, kb_id=kb_id, db=db)
+    if result.get("code") == 0:
         d = result.get("data", {})
         return f"已上传文档「{file_name}」到知识库 {kb_id}，文档ID={d.get('docId', '')}，任务ID={d.get('taskId', '')}。入库异步进行中。"
     return f"上传失败：{result.get('message', '')}"
@@ -164,6 +170,9 @@ async def _list_documents(params: dict, db: AsyncSession) -> str:
     from app.api.knowledge.rag import list_documents as fn
     result = await fn(
         kb_id=params.get("kbId") or "",
+        # status 有 Query("") 默认值：不显式传会拿到 Query 对象，
+        # 而 bool(Query("")) 为 True，会被拼进 where 造成 SQL 绑定错误。
+        status=params.get("status") or "",
         page=1,
         page_size=int(params.get("limit", 20) or 20),
         db=db,
@@ -186,7 +195,7 @@ async def _list_documents(params: dict, db: AsyncSession) -> str:
 async def _delete_document(params: dict, db: AsyncSession) -> str:
     from app.api.knowledge.rag import delete_document as fn
     result = await fn(doc_id=params["id"], db=db)
-    return f"已删除文档 {params['id']}" if result.get("code") in (0, 200) else f"删除失败：{result.get('message', '')}"
+    return f"已删除文档 {params['id']}" if result.get("code") == 0 else f"删除失败：{result.get('message', '')}"
 
 
 def register_handlers(registry) -> None:

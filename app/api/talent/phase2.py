@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 import json
+import logging
 import uuid
 import math
 from datetime import datetime, date, timedelta
@@ -26,28 +27,31 @@ from app.models.settings import SystemSetting
 from app.core.security import get_current_user, require_permission, CurrentUser
 from app.core.state_machine import transition, StateError
 from app.core.exceptions import push_exception
-from app.utils.responses import ok, fail, not_found
+from app.utils.responses import ok, fail, not_found, conflict
 from app.utils.audit import write_audit
 from app.utils.clock import iso_utc
+from app.utils.llm_json import extract_json_array
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["试用期&培训(Phase2)"])
 
 # ── 常量 ─────────────────────────────────────────────────────
+#
+# 这里曾有 TECH_W1 / NONTECH_W1 / W2_4_DIMS_TECH / W2_4_DIMS_NONTECH 四组周评维度定义，
+# 但全仓从无任何代码读取它们（save_week_review 只对 dimensions 求和校验 0-100，不校验键名），
+# 而前端 constants/businessRules.ts 另有一套键名不同的维度在真正驱动周评表单——
+# 两套定义长期并存且互不知情。已删除这四组死常量，避免后来者误以为后端在做维度校验。
+#
+# 周评维度的真源：前端 constants/businessRules.ts（PROBATION_WEEK1_TECH / PROBATION_NON_TECH）。
+# ProbationWeekReview.dimensions 是自由 JSON 列，按岗位可配置的那套评分标准另存在
+# positions 表（见 services/recruitment/seed_data_v2.py 的 WEEK1_COMMON），属岗位级配置数据。
+#
+# 面试维度不同——那套有后端强校验，真源在 phase1_interview.py 的 R1_DIMS/R2_DIMS，
+# 前端通过 GET /api/interviews/dimensions 取用。
 
-TECH_W1 = {"tech_foundation": 25, "task_completion": 20, "quality": 20, "learning_speed": 10,
-           "problem_solving": 10, "documentation": 10, "work_standards": 5}
-NONTECH_W1 = {"company_knowledge": 20, "role_understanding": 20, "tool_proficiency": 20,
-              "basic_task": 20, "learning_attitude": 10, "reporting": 10}
-W2_4_DIMS_TECH = {"goal_completion": 25, "quality": 20, "independence": 15, "on_time": 10,
-                  "tech_standards": 10, "problem_solving": 10, "collaboration": 5, "retrospective": 5}
-W2_4_DIMS_NONTECH = {"task_completion": 25, "quality": 20, "independence": 15, "time_management": 10,
-                     "collaboration": 10, "learning_improvement": 10, "responsibility": 5, "work_standards": 5}
 
-
-async def _get_setting(db: AsyncSession, key: str, default: Any) -> Any:
-    row = await db.execute(select(SystemSetting).where(SystemSetting.key == key))
-    s = row.scalar_one_or_none()
-    return s.value if s else default
+from app.services.system.system_settings import get_system_setting as _get_setting
 
 
 # ── 序列化 ───────────────────────────────────────────────────
@@ -106,6 +110,9 @@ def _serialize_confirmation(cr: ConfirmationReview) -> dict:
             "recommendation": cr.recommendation, "status": cr.status,
             "mentorComment": cr.mentor_comment, "managerComment": cr.manager_comment,
             "managerApproved": cr.manager_approved,
+            "overrideReason": cr.override_reason,
+            "overrideBy": str(cr.override_by) if cr.override_by else None,
+            "overrideAt": iso_utc(cr.override_at),
             "createdAt": iso_utc(cr.created_at)}
 
 def _serialize_employee(e: Employee) -> dict:
@@ -170,11 +177,7 @@ async def create_plan(
             f"返回 JSON: [{{\"week\":1,\"title\":\"...\",\"focus\":\"...\",\"goals\":[\"...\"],\"trainingItems\":[\"...\"]}},...]"
         )
         resp = await llm_chat([{"role": "user", "content": prompt}])
-        s = resp.find("["); e = resp.rfind("]") + 1
-        if 0 <= s < e:
-            weeks_data = json.loads(resp[s:e])[:total_weeks]
-        else:
-            weeks_data = []
+        weeks_data = (extract_json_array(resp) or [])[:total_weeks]
     except Exception:
         weeks_data = []
 
@@ -201,8 +204,8 @@ async def create_plan(
             emp.onboard_date = sd or date.today()
             await transition(db, "employee", emp, "training", actor_id=current.id,
                              actor_name=current.username, skip_block_check=True)
-        except StateError:
-            pass
+        except StateError as e:
+            logger.warning("员工 %s 入职后无法进入培训: %s", eid, e.message)
 
     await write_audit(db, actor=current.username, action="创建试用期计划", section="probation")
     return ok(_serialize_plan(plan))
@@ -415,8 +418,8 @@ async def sync_confirmation(
         try:
             await transition(db, "employee", emp, "pending_confirmation",
                              actor_id=current.id, actor_name=current.username, skip_block_check=True)
-        except StateError:
-            pass
+        except StateError as e:
+            logger.warning("员工 %s 无法进入待转正: %s", eid, e.message)
 
     await db.flush()
     await write_audit(db, actor=current.username, action="同步转正评分", section="confirmation")
@@ -454,28 +457,29 @@ async def approve_confirmation(
     if not emp:
         return not_found("员工不存在")
 
+    rejected = body.recommendation == "reject"
+    target_status = "probation" if rejected else "formal"
+
+    # 员工状态迁移放在写审批单之前：迁移失败要整单拒绝并明确报错。
+    # 此处过去是 except StateError: pass —— 审批单被写成「已通过」、员工却没转正，
+    # 接口还返回 200，用户在审批页看到成功、员工列表里人还挂在试用期。
+    try:
+        await transition(db, "employee", emp, target_status,
+                         actor_id=current.id, actor_name=current.username,
+                         reason="转正未通过" if rejected else "转正通过",
+                         skip_block_check=True)
+    except StateError as e:
+        await db.rollback()
+        return conflict(e.message)
+
     cr.recommendation = body.recommendation
     cr.manager_comment = body.manager_comment
     cr.mentor_comment = body.mentor_comment
     cr.manager_approved = True
     cr.manager_approved_at = datetime.utcnow()
+    cr.status = "rejected" if rejected else "approved"
 
-    if body.recommendation == "reject":
-        cr.status = "rejected"
-        try:
-            await transition(db, "employee", emp, "probation",
-                             actor_id=current.id, actor_name=current.username,
-                             reason="转正未通过", skip_block_check=True)
-        except StateError:
-            pass
-    else:
-        cr.status = "approved"
-        try:
-            await transition(db, "employee", emp, "formal",
-                             actor_id=current.id, actor_name=current.username,
-                             skip_block_check=True)
-        except StateError:
-            pass
+    if not rejected:
         # P4 钩子: 创建人才画像
         try:
             from app.services.talent.talent_profile import ensure_talent_profile
@@ -512,9 +516,29 @@ async def update_recommendation(
         "next90DaysGoals": "next_90days_goals",
         "recommendation": "recommendation",
     }
+    # 人工覆盖 AI 建议结论时必须留下原因（合规要求）：前端一直在收集这个原因，
+    # 但此前既不在白名单里、也没有落库字段，等于走了个形式。
+    old_rec = cr.recommendation
+    new_rec = body.get("recommendation")
+    override_reason = (body.get("overrideReason") or body.get("reason") or "").strip()
+    is_override = bool(new_rec) and new_rec != old_rec
+    if is_override and not override_reason:
+        return fail(400, "人工调整转正结论必须填写原因")
+
     for field, column in field_map.items():
         if field in body:
             setattr(cr, column, body[field])
+
+    if is_override:
+        cr.override_reason = override_reason
+        cr.override_by = current.id
+        cr.override_at = datetime.utcnow()
+        await write_audit(
+            db, actor=current.username,
+            action=f"人工调整转正结论 {old_rec or '—'} → {new_rec}（{override_reason}）",
+            section="confirmation",
+        )
+
     await db.flush()
     return ok(_serialize_confirmation(cr))
 
@@ -665,8 +689,8 @@ async def complete_course(
                 await transition(db, "employee", emp, "probation",
                                  actor_id=current.id, actor_name=current.username, skip_block_check=True)
                 emp.current_week = 1
-            except StateError:
-                pass
+            except StateError as e:
+                logger.warning("员工 %s 培训完成后无法进入试用期: %s", eid, e.message)
 
     await db.flush()
     return ok(_serialize_training_progress(tp))

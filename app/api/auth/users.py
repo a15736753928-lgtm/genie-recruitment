@@ -62,6 +62,40 @@ async def list_users(
     return ok({"list": result, "total": total, "page": page, "pageSize": page_size})
 
 
+@router.get("/selectable")
+async def list_selectable_users(
+    role: Optional[str] = Query(None, description="按角色码过滤，如 interviewer / mentor"),
+    keyword: Optional[str] = Query(None),
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """选人下拉专用的轻量用户列表。
+
+    完整的 `GET /users` 需要 `system:manage`（只有 admin 有），但排期面试要选面试官、
+    发 Offer 要选 mentor —— HR 和部门经理都拿不到用户列表，只能手填 UUID。
+    这里只返回 id/姓名/部门/角色，不含邮箱、手机号、状态等敏感字段，任何登录用户可读。
+    """
+    q = select(User).where(User.is_deleted == False, User.status == "active")
+    if role:
+        q = q.where(User.id.in_(select(UserRole.user_id).where(UserRole.role_code == role)))
+    if keyword:
+        like = f"%{keyword.strip()}%"
+        q = q.where(User.display_name.ilike(like) | User.username.ilike(like))
+
+    users = (await db.execute(q.order_by(User.display_name).limit(200))).scalars().all()
+    result = []
+    for u in users:
+        result.append({
+            "id": str(u.id),
+            "username": u.username,
+            "displayName": u.display_name,
+            "department": u.department,
+            "employeeId": str(u.employee_id) if u.employee_id else None,
+            "roles": await _get_user_roles(db, u.id),
+        })
+    return ok(result)
+
+
 class CreateUserRequest(BaseModel):
     model_config = {"populate_by_name": True}
     username: str

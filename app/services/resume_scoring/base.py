@@ -153,33 +153,18 @@ def _parse_batched_scores(raw: str, rubrics: dict[str, str]) -> dict[str, Option
     """Parse the LLM's JSON (or near-JSON) response into per-dimension scores."""
     result: dict[str, Optional[int]] = {name: None for name in rubrics}
 
-    # ── Attempt 1: strict JSON ──
-    try:
-        scores = json.loads(raw)
-        if isinstance(scores, dict):
-            for name in rubrics:
-                val = scores.get(name)
-                if isinstance(val, (int, float)):
-                    result[name] = max(0, min(100, int(val)))
-            if any(v is not None for v in result.values()):
-                return result
-    except json.JSONDecodeError:
-        pass
+    # ── Attempt 1: 统一的 JSON 抽取（含围栏剥离、括号配对、尾随逗号/裸换行修复）──
+    from app.utils.llm_json import extract_json_object
+    scores = extract_json_object(raw)
+    if isinstance(scores, dict):
+        for name in rubrics:
+            val = scores.get(name)
+            if isinstance(val, (int, float)):
+                result[name] = max(0, min(100, int(val)))
+        if any(v is not None for v in result.values()):
+            return result
 
-    # ── Attempt 2: extract JSON block from markdown/code fences ──
-    json_block = re.search(r"\{[^{}]*\}", raw, re.DOTALL)
-    if json_block:
-        try:
-            scores = json.loads(json_block.group())
-            if isinstance(scores, dict):
-                for name in rubrics:
-                    val = scores.get(name)
-                    if isinstance(val, (int, float)):
-                        result[name] = max(0, min(100, int(val)))
-        except json.JSONDecodeError:
-            pass
-
-    # ── Attempt 3: per-dimension regex fallback ──
+    # ── Attempt 2: per-dimension regex fallback ──
     for name in rubrics:
         if result[name] is not None:
             continue

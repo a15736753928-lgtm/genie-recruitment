@@ -9,7 +9,12 @@ from app.database import Base
 
 
 class AgentProject(Base):
-    """Agent 对话项目分组（类似 Codex 的 Project）。"""
+    """AI 对话工作台左栏的**会话文件夹**（用于把多个对话归到一组）。
+
+    与 `app/models/phase4.py::Project` 完全无关——那个是「项目人员推荐」里的真实业务项目
+    （有技能要求、能力等级、人员分配）。两者同名易混，凡涉及本类一律称「会话文件夹」，
+    涉及 phase4.Project 一律称「业务项目」。
+    """
     __tablename__ = "agent_projects"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)

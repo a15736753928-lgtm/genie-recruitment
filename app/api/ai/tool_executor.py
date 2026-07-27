@@ -37,6 +37,9 @@ async def execute_tool_call(tool_name: str, params: dict, db: AsyncSession) -> s
         return f"工具 {tool_name} 执行完成"
 
     except Exception as e:
+        # 异常在这里被转成返回值，调用方 _execute_tool_sync 的 except 分支永远进不来，
+        # 会无条件 commit 掉 handler 崩溃前写了一半的数据。必须在此就地回滚。
+        await db.rollback()
         trace_id = get_trace_id()
         logger.warning("Tool execution error tool=%s trace=%s: %s", tool_name, trace_id, e)
-        return f"工具执行错误: {str(e)}"
+        return f"工具执行失败: {str(e)}"

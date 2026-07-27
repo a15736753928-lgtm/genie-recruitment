@@ -18,6 +18,7 @@ from app.core.state_machine import transition, StateError
 from app.utils.responses import ok, fail, not_found
 from app.utils.audit import write_audit
 from app.utils.clock import iso_utc
+from app.utils.llm_json import extract_json_object
 
 router = APIRouter(tags=["招聘需求"])
 
@@ -297,25 +298,23 @@ async def ai_generate(
             '"probationFramework":{"week1":"...","weeks24":"..."},'
             '"trainingSuggestions":["..."]}'
         )
-        import json
         resp_text = await llm_chat([{"role": "user", "content": prompt}])
-        # extract JSON from response
-        start = resp_text.find("{")
-        end = resp_text.rfind("}") + 1
-        if start < 0 or end <= start:
-            raise ValueError("No JSON found")
-        ai_draft = json.loads(resp_text[start:end])
+        ai_draft = extract_json_object(resp_text)
+        if ai_draft is None:
+            raise ValueError("模型未返回可解析的 JSON")
     except Exception as e:
         return fail(500, f"AI 生成失败，请重试: {e}")
 
-    req.ai_draft = ai_draft
+    # 状态迁移放在赋值之前：迁移失败要整单拒绝，否则 ai_draft 会被静默提交
     if req.status == "draft":
         try:
             await transition(db, "recruitment_request", req, "ai_generated",
                              actor_id=current.id, actor_name=current.username,
                              skip_block_check=True)
         except StateError as e:
+            await db.rollback()
             return fail(409, e.message)
+    req.ai_draft = ai_draft
     await write_audit(db, actor=current.username, action="AI 生成招聘草稿", section="recruitment")
     return ok(_serialize_req(req, current))
 
@@ -418,7 +417,10 @@ async def confirm_request(
     if body.role == "hr":
         req.hr_confirmed_by = current.id
         req.hr_confirmed_at = now
-        if req.status == "ai_generated":
+        # draft 也要能进 hr_confirmed：AI 生成不是必经步骤，需求可以手工填完直接确认。
+        # 此前只认 ai_generated，导致「部门先确认 → HR 再确认」这条路上状态一直停在
+        # draft，最后那步 draft → dept_confirmed 必然非法，双方都确认了却永远发布不了。
+        if req.status in ("draft", "ai_generated"):
             try:
                 await transition(db, "recruitment_request", req, "hr_confirmed",
                                  actor_id=current.id, actor_name=current.username,
@@ -462,6 +464,13 @@ async def publish_request(
         return not_found("招聘需求不存在")
     if req.status != "dept_confirmed":
         return fail(409, "需 HR 与部门负责人双方确认后才能发布")
+
+    # positions.name 有唯一约束：重名时此处会抛 IntegrityError 变成裸 500，
+    # 用户只看到「服务器内部错误」，完全不知道是岗位重名。先查再给明确提示。
+    dup = await db.execute(select(Position).where(Position.name == req.position_name))
+    existing_position = dup.scalar_one_or_none()
+    if existing_position is not None:
+        return fail(409, f"岗位「{req.position_name}」已存在，请修改需求里的岗位名称后再发布")
 
     # Resolve department name for Position record
     dept_name = None

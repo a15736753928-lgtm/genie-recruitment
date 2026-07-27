@@ -116,18 +116,11 @@ externalDimensions 固定 7 项、internalDimensions 固定 4 项、detailSectio
 
 
 def _parse_json_object(content: str) -> dict:
-    text = (content or "").strip()
-    if text.startswith("```json"):
-        text = text[7:]
-    if text.startswith("```"):
-        text = text[3:]
-    if text.endswith("```"):
-        text = text[:-3]
-    start = text.find("{")
-    end = text.rfind("}")
-    if start >= 0 and end > start:
-        text = text[start : end + 1]
-    return json.loads(text)
+    from app.utils.llm_json import extract_json_object
+    parsed = extract_json_object(content)
+    if parsed is None:
+        raise ValueError("模型未返回可解析的 JSON 对象")
+    return parsed
 
 
 def _normalize_dimension_list(items: Any, defaults: list[str]) -> list[dict]:

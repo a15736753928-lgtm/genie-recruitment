@@ -145,6 +145,8 @@ def register_project_routes(router):
             assigned_by=current.username,
         )
         db.add(a)
+        # Project 未在状态机 TRANSITIONS 中登记(open→staffed 两态，无需上状态机)；
+        # 这里的值是服务端算出来的字面量常量，不来自请求体。
         if len(existing) + 1 >= proj.headcount:
             proj.status = "staffed"
         await db.flush()
