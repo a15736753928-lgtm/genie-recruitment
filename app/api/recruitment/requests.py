@@ -4,6 +4,7 @@ import uuid
 from datetime import datetime
 from typing import Optional, List, Union, Any
 from fastapi import APIRouter, Depends, Query
+from fastapi.responses import Response
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -136,8 +137,17 @@ def _format_ai_outputs(draft: Any) -> dict | None:
 
     competencies = draft.get("competencyModel") or []
 
+    # jobDescription 支持两种格式：结构化 JSON 对象或纯文本字符串
+    job_desc = draft.get("jobDescription")
+    if isinstance(job_desc, dict):
+        # 结构化格式，直接返回
+        job_desc_formatted = job_desc
+    else:
+        # 旧的纯文本格式，转为字符串
+        job_desc_formatted = str(job_desc or "")
+
     return {
-        "jobDescription": str(draft.get("jobDescription") or ""),
+        "jobDescription": job_desc_formatted,
         "competencyModel": normalize_dims(competencies),
         "resumeScoringRules": rules_normalized,
         "resumeScoringRulesPreview": rules_preview,
@@ -338,7 +348,37 @@ async def ai_generate(
             f"- 淘汰条件: {req.elimination_criteria}\n\n"
             "## 返回 JSON 结构（请务必返回完整、详细的 JSON）\n"
             "{\n"
-            '  "jobDescription": "详细的岗位说明书，包含岗位定位、核心价值、发展路径等（至少300字）",\n'
+            '  "jobDescription": {\n'
+            '    "basicInfo": {\n'
+            '      "positionName": "岗位名称",\n'
+            '      "department": "所属部门",\n'
+            '      "headcount": 1,\n'
+            '      "reportTo": "汇报对象",\n'
+            '      "salaryRange": "薪资范围",\n'
+            '      "workLocation": "工作地点",\n'
+            '      "employmentType": "正式员工",\n'
+            '      "level": "岗位等级"\n'
+            "    },\n"
+            '    "mission": "岗位使命和核心价值（100字以上）",\n'
+            '    "responsibilities": ["主要工作职责1（含量化指标）", "职责2", "..."],\n'
+            '    "qualifications": {\n'
+            '      "required": ["必须具备的条件1", "条件2"],\n'
+            '      "preferred": ["优先条件1", "加分项2"]\n'
+            "    },\n"
+            '    "permissions": ["岗位工作权限1", "权限2"],\n'
+            '    "collaborations": {\n'
+            '      "internal": ["内部协作部门/角色1", "协作2"],\n'
+            '      "external": ["外部协作对象1"]\n'
+            "    },\n"
+            '    "workEnvironment": {\n'
+            '      "officeType": "办公室/远程/混合",\n'
+            '      "workingHours": "工作时间",\n'
+            '      "overtime": "加班情况",\n'
+            '      "travel": "出差要求"\n'
+            "    },\n"
+            '    "kpi": ["核心绩效考核指标1", "指标2", "指标3"],\n'
+            '    "careerPath": "职业发展通道描述"\n'
+            "  },\n"
             '  "competencyModel": [\n'
             '    {"dimension": "专业技能", "weight": 30, "description": "评估标准描述"},\n'
             '    {"dimension": "项目经验", "weight": 20, "description": "评估标准描述"}\n'
@@ -795,3 +835,87 @@ async def get_position_ai_artifact(
     if artifact is None:
         return not_found("未找到该类型的 AI 产物")
     return ok(_serialize_artifact(artifact))
+
+
+# ── 岗位说明书 PDF 下载 ────────────────────────────────────────
+
+
+@router.get("/recruitment-requests/{req_id}/job-description/pdf")
+async def download_job_description_pdf(
+    req_id: str,
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """下载岗位说明书 PDF 文档。"""
+    try:
+        rid = uuid.UUID(req_id)
+    except ValueError:
+        return not_found("招聘需求不存在")
+    row = await db.execute(select(RecruitmentRequest).where(RecruitmentRequest.id == rid))
+    req = row.scalar_one_or_none()
+    if req is None:
+        return not_found("招聘需求不存在")
+    if not req.ai_draft:
+        return fail(400, "请先生成 AI 内容")
+
+    # 支持两种数据结构：
+    # 1. 新格式: ai_draft.jobDescription = { basicInfo: {...}, mission: "...", ... }
+    # 2. 旧格式: ai_draft = { basicInfo: {...}, mission: "...", ... } (扁平结构)
+    job_desc = req.ai_draft.get("jobDescription")
+
+    if isinstance(job_desc, dict):
+        # 新格式，jobDescription 是结构化对象
+        pass
+    elif isinstance(req.ai_draft.get("basicInfo"), dict):
+        # 旧格式，ai_draft 本身就是扁平结构
+        job_desc = req.ai_draft
+    else:
+        job_desc = None
+
+    if not job_desc:
+        return fail(400, "岗位说明书内容不存在，请点击「重新生成」生成新格式内容")
+
+    # 如果是纯文本格式（非常旧的数据），转换为结构化格式
+    if isinstance(job_desc, str):
+        job_desc = {
+            "basicInfo": {
+                "positionName": req.position_name,
+                "department": req.department_id or "—",
+                "headcount": req.headcount,
+                "reportTo": req.direct_manager_name or "—",
+                "salaryRange": req.salary_range or "—",
+                "workLocation": "—",
+                "employmentType": "正式员工",
+                "level": "—",
+            },
+            "mission": job_desc,
+            "responsibilities": (req.job_responsibilities or "—").split("\n") if req.job_responsibilities else ["—"],
+            "qualifications": {
+                "required": (req.job_requirements or "—").split("\n") if req.job_requirements else ["—"],
+                "preferred": (req.bonus_items or "—").split("\n") if req.bonus_items else ["—"],
+            },
+            "permissions": ["—"],
+            "collaborations": {"internal": ["—"], "external": ["—"]},
+            "workEnvironment": {
+                "officeType": "办公室",
+                "workingHours": "标准工作时间",
+                "overtime": "视项目需要",
+                "travel": "视岗位需要",
+            },
+            "kpi": req.probation_goal.split("\n") if req.probation_goal else ["—"],
+            "careerPath": "—",
+        }
+
+    from app.services.job_description_pdf import generate_pdf_bytes
+    from urllib.parse import quote
+
+    pdf_bytes = generate_pdf_bytes(job_desc)
+    filename = f"岗位说明书_{req.position_name}.pdf"
+    # 对文件名进行 URL 编码以支持中文
+    encoded_filename = quote(filename)
+
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}"},
+    )
