@@ -137,11 +137,27 @@ def _format_ai_outputs(draft: Any) -> dict | None:
 
     competencies = draft.get("competencyModel") or []
 
-    # jobDescription 支持两种格式：结构化 JSON 对象或纯文本字符串
+    # jobDescription 支持三种格式：
+    # 1. 新格式: draft.jobDescription = { basicInfo: {...}, mission: "...", ... }
+    # 2. 扁平格式: draft = { basicInfo: {...}, mission: "...", ... } (AI 可能不嵌套)
+    # 3. 旧格式: draft.jobDescription = "纯文本..."
     job_desc = draft.get("jobDescription")
     if isinstance(job_desc, dict):
-        # 结构化格式，直接返回
+        # 新格式，jobDescription 是结构化对象
         job_desc_formatted = job_desc
+    elif isinstance(draft.get("basicInfo"), dict):
+        # 扁平格式，basicInfo 直接在顶层，整个 draft 就是岗位说明书
+        job_desc_formatted = {
+            "basicInfo": draft.get("basicInfo"),
+            "mission": draft.get("mission"),
+            "responsibilities": draft.get("responsibilities"),
+            "qualifications": draft.get("qualifications"),
+            "permissions": draft.get("permissions"),
+            "collaborations": draft.get("collaborations"),
+            "workEnvironment": draft.get("workEnvironment"),
+            "kpi": draft.get("kpi"),
+            "careerPath": draft.get("careerPath"),
+        }
     else:
         # 旧的纯文本格式，转为字符串
         job_desc_formatted = str(job_desc or "")
