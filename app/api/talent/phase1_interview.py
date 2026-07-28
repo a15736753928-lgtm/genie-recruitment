@@ -307,11 +307,11 @@ async def schedule_interview(
     if block_exc:
         return fail(422, f"存在未处理的异常[{block_exc.exception_type}]，请先在异常队列中处理")
 
-    # Parse scheduledAt
+    # Parse scheduledAt — strip tzinfo so naive UTC matches the DateTime column
     scheduled_at = None
     if body.scheduled_at:
         try:
-            scheduled_at = datetime.fromisoformat(body.scheduled_at.replace("Z", "+00:00"))
+            scheduled_at = datetime.fromisoformat(body.scheduled_at.replace("Z", "+00:00")).replace(tzinfo=None)
         except ValueError:
             scheduled_at = None
 

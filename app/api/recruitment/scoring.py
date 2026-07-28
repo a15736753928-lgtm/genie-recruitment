@@ -352,6 +352,11 @@ async def candidate_decision(
     # 状态迁移
     try:
         if body.action == "invite":
+            # new/parsed 须先经过 pending_screen，才能迁到 invited
+            if candidate.status in ("new", "parsed"):
+                await transition(db, "candidate", candidate, "pending_screen",
+                                 actor_id=current.id, actor_name=current.username,
+                                 reason="自动推进至待筛选")
             await transition(db, "candidate", candidate, "invited",
                              actor_id=current.id, actor_name=current.username,
                              reason=body.reason)

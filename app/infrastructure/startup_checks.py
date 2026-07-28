@@ -318,14 +318,14 @@ async def check_funasr(settings: Settings) -> CheckResult:
         )
     except ImportError as e:
         return CheckResult(
-            "FunASR (语音转写)", "critical", CheckStatus.FAIL,
-            f"依赖缺失 — 运行 asr_init.py 安装: {e}",
+            "FunASR (语音转写)", "optional", CheckStatus.WARN,
+            f"依赖缺失（语音转写不可用）— 运行 asr_init.py 安装: {e}",
             (time.perf_counter() - t0) * 1000,
         )
     except Exception as e:
         return CheckResult(
-            "FunASR (语音转写)", "critical", CheckStatus.FAIL,
-            f"模型加载失败 — 运行 asr_init.py 下载模型: {e}",
+            "FunASR (语音转写)", "optional", CheckStatus.WARN,
+            f"模型加载失败（语音转写不可用）— 运行 asr_init.py 下载模型: {e}",
             (time.perf_counter() - t0) * 1000,
         )
 
@@ -692,13 +692,13 @@ async def run_startup_checks(settings: Settings) -> list[CheckResult]:
         check_upload_dir,
         check_minio,
         check_portrait_gender,
-        check_funasr,
     ]
     checks_phase2: list[CheckFn] = [
         check_milvus_lite,
         check_embedding_model,
         check_reranker_model,
         check_rapidocr,
+        check_funasr,
     ]
     checks_phase3: list[CheckFn] = [
         check_deepseek_api_key,

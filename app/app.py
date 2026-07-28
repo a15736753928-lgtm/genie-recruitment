@@ -48,8 +48,8 @@ async def lifespan(app: FastAPI):
     results = await run_startup_checks(settings)
     print_check_summary(results)
 
-    # If ANY check failed, refuse to start
-    failures = [r for r in results if r.status == CheckStatus.FAIL]
+    # If ANY critical check failed, refuse to start; optional/config failures are warnings only
+    failures = [r for r in results if r.status == CheckStatus.FAIL and r.category == "critical"]
     if failures:
         msg = "以下依赖未就绪，拒绝启动:\n" + "\n".join(
             f"  ✗ {f.name}: {f.detail}" for f in failures
