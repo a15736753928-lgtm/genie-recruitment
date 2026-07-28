@@ -162,6 +162,7 @@ class CandidateAIAnalysis(Base):
     highlights = Column(JSON)
     risks = Column(JSON)
     dimensions = Column(JSON)
+    resume_extra = Column(JSON)  # 行业经验/管理经验/到岗时间/薪资/作品/证书
     analyzed_at = Column(DateTime, default=datetime.utcnow)
 
     candidate = relationship("Candidate", back_populates="ai_analysis")

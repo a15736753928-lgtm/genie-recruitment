@@ -64,6 +64,135 @@ class ScoreRequest(BaseModel):
     position_id: Optional[str] = Field(None, alias="positionId")
 
 
+async def compute_8d_score(db: AsyncSession, candidate: Candidate) -> Optional[dict]:
+    """对候选人执行 8 维 AI 评分，返回评分原始 dict 或 None（LLM 失败时）。
+
+    供 ``POST /candidates/score``（手动触发）和上传流程（自动触发）共用。
+    """
+    from app.services.ai import llm_chat
+    from app.models.recruitment import CandidateAIAnalysis
+
+    cid = candidate.id
+    ai_row = await db.execute(
+        select(CandidateAIAnalysis).where(CandidateAIAnalysis.candidate_id == cid)
+    )
+    ai_ana = ai_row.scalar_one_or_none()
+    if ai_ana:
+        resume_summary = f"技能: {ai_ana.keywords}\n工作经历: {ai_ana.experience_insight}\n推荐: {ai_ana.recommendation}"
+    else:
+        resume_summary = f"姓名:{candidate.name} 学历:{candidate.education} 工作年限:{candidate.experience}"
+
+    prompt = (
+        "你是专业 HR，请对以下候选人简历做 8 维评分，满分 100 分。\n"
+        f"候选人信息: {resume_summary}\n\n"
+        "返回 JSON（所有数值为整数/浮点数，字段不可缺失）:\n"
+        '{"skill_match":0-25,"project_match":0-20,"position_exp":0-15,'
+        '"achievement":0-15,"industry_exp":0-10,"learning":0-5,"stability":0-5,"bonus_skill":0-5,'
+        '"total":0-100,"confidence":0.0-1.0,'
+        '"evidence":["..."],"strengths":["..."],"risks":["..."],'
+        '"missing_information":["..."],"recommended_action":"...","requires_human_confirmation":true}'
+    )
+    resp_text = await llm_chat([{"role": "user", "content": prompt}], max_tokens=2048)
+    raw = extract_json_object(resp_text)
+    if raw is None:
+        logger.warning("8维评分 LLM 返回无法解析，原始文本前200字: %s", (resp_text or "")[:200])
+    return raw
+
+
+async def _save_score(
+    db: AsyncSession,
+    candidate: Candidate,
+    raw: dict,
+    *,
+    position_id: Optional[uuid.UUID] = None,
+    thresholds: Optional[dict] = None,
+) -> ResumeScore:
+    """将8维评分原始 dict 写入 ResumeScore 并更新候选人分数。"""
+    if thresholds is None:
+        thresholds = {"A": 85, "B": 70, "C": 60}
+
+    total = int(raw.get("total", 0))
+    grade = compute_grade(total, thresholds)
+
+    advice_dict = {
+        "result": raw.get("recommended_action", ""),
+        "score": total,
+        "confidence": float(raw.get("confidence", 0.0)),
+        "evidence": raw.get("evidence") or [],
+        "strengths": raw.get("strengths") or [],
+        "risks": raw.get("risks") or [],
+        "missing_information": raw.get("missing_information") or [],
+        "recommended_action": raw.get("recommended_action", ""),
+        "requires_human_confirmation": bool(raw.get("requires_human_confirmation", True)),
+    }
+
+    existing_row = await db.execute(
+        select(ResumeScore).where(ResumeScore.candidate_id == candidate.id,
+                                   ResumeScore.position_id == position_id)
+    )
+    score_obj = existing_row.scalar_one_or_none()
+    if score_obj is None:
+        score_obj = ResumeScore(candidate_id=candidate.id, position_id=position_id)
+        db.add(score_obj)
+
+    score_obj.skill_match = int(raw.get("skill_match", 0))
+    score_obj.project_match = int(raw.get("project_match", 0))
+    score_obj.position_exp = int(raw.get("position_exp", 0))
+    score_obj.achievement = int(raw.get("achievement", 0))
+    score_obj.industry_exp = int(raw.get("industry_exp", 0))
+    score_obj.learning = int(raw.get("learning", 0))
+    score_obj.stability = int(raw.get("stability", 0))
+    score_obj.bonus_skill = int(raw.get("bonus_skill", 0))
+    score_obj.total = total
+    score_obj.grade = grade
+    score_obj.advice = advice_dict
+
+    candidate.screening_ai_score = total
+    candidate.score = total
+    return score_obj
+
+
+async def auto_score_after_upload(
+    db: AsyncSession,
+    candidate: Candidate,
+    position_id: Optional[uuid.UUID] = None,
+) -> None:
+    """上传简历后自动触发 8 维评分。失败只记日志，不阻断上传流程。
+
+    使用 savepoint 保证评分失败时不影响外层事务（解析结果仍可提交）。
+    """
+    try:
+        raw = await compute_8d_score(db, candidate)
+        if not raw:
+            logger.warning("候选人 %s 8维AI评分返回空，跳过", candidate.id)
+            return
+        evidence = raw.get("evidence") or []
+        if not evidence:
+            logger.warning("候选人 %s 8维AI评分缺少证据，跳过", candidate.id)
+            return
+
+        thresholds = await _get_threshold(db, "resume_grade_thresholds", {"A": 85, "B": 70, "C": 60})
+        await _save_score(db, candidate, raw, position_id=position_id, thresholds=thresholds)
+        # savepoint 包住 flush：评分失败只回滚评分部分，不影响已完成的解析结果
+        sp = await db.begin_nested()
+        try:
+            await db.flush()
+            await sp.commit()
+            # 验证写入确实生效
+            check = await db.execute(
+                select(ResumeScore).where(ResumeScore.candidate_id == candidate.id)
+            )
+            found = check.scalar_one_or_none()
+            logger.info("候选人 %s 自动8维评分完成: %s, DB验证: %s",
+                        candidate.id, raw.get("total"),
+                        "找到" if found else "未找到！")
+        except Exception as flush_err:
+            await sp.rollback()
+            logger.warning("候选人 %s 8维评分 flush 失败（已回滚）: %s", candidate.id, flush_err)
+    except Exception as e:
+        logger.warning("候选人 %s 自动8维评分失败（不阻断上传）: %s", candidate.id, e)
+
+
 @router.post("/candidates/score")
 async def score_candidate(
     body: ScoreRequest,
@@ -86,42 +215,13 @@ async def score_candidate(
         except ValueError:
             return not_found("岗位不存在")
 
-    thresholds = await _get_threshold(db, "resume_grade_thresholds", {"A": 85, "B": 70, "C": 60})
-    confidence_threshold = await _get_threshold(db, "ai_confidence_threshold", 0.6)
-
-    # 调用 AI 评分
     try:
-        from app.services.ai import llm_chat
-        from app.models.recruitment import CandidateAIAnalysis
-        ai_row = await db.execute(
-            select(CandidateAIAnalysis).where(CandidateAIAnalysis.candidate_id == cid)
-        )
-        ai_ana = ai_row.scalar_one_or_none()
-        resume_summary = ""
-        if ai_ana:
-            resume_summary = f"技能: {ai_ana.keywords}\n工作经历: {ai_ana.experience_insight}\n推荐: {ai_ana.recommendation}"
-        else:
-            resume_summary = f"姓名:{candidate.name} 学历:{candidate.education} 工作年限:{candidate.experience}"
-
-        import json
-        prompt = (
-            "你是专业 HR，请对以下候选人简历做 8 维评分，满分 100 分。\n"
-            f"候选人信息: {resume_summary}\n\n"
-            "返回 JSON（所有数值为整数/浮点数，字段不可缺失）:\n"
-            '{"skill_match":0-25,"project_match":0-20,"position_exp":0-15,'
-            '"achievement":0-15,"industry_exp":0-10,"learning":0-5,"stability":0-5,"bonus_skill":0-5,'
-            '"total":0-100,"confidence":0.0-1.0,'
-            '"evidence":["..."],"strengths":["..."],"risks":["..."],'
-            '"missing_information":["..."],"recommended_action":"...","requires_human_confirmation":true}'
-        )
-        resp_text = await llm_chat([{"role": "user", "content": prompt}])
-        raw = extract_json_object(resp_text)
+        raw = await compute_8d_score(db, candidate)
         if raw is None:
             raise ValueError("模型未返回可解析的 JSON")
     except Exception as e:
         return fail(500, f"AI 评分失败: {e}")
 
-    # 验证 evidence
     evidence = raw.get("evidence") or []
     if not evidence:
         await push_exception(db, entity_type="candidate", entity_id=cid,
@@ -130,58 +230,17 @@ async def score_candidate(
         return fail(422, "AI 建议缺少证据")
 
     confidence = float(raw.get("confidence", 0.0))
+    confidence_threshold = await _get_threshold(db, "ai_confidence_threshold", 0.6)
     if confidence < confidence_threshold:
         await push_exception(db, entity_type="candidate", entity_id=cid,
                              exception_type="low_confidence",
                              detail=f"AI 置信度 {confidence:.2f} < {confidence_threshold}", severity="block")
 
-    total = int(raw.get("total", 0))
-    grade = compute_grade(total, thresholds)
-
-    advice_dict = {
-        "result": raw.get("recommended_action", ""),
-        "score": total,
-        "confidence": confidence,
-        "evidence": evidence,
-        "strengths": raw.get("strengths") or [],
-        "risks": raw.get("risks") or [],
-        "missing_information": raw.get("missing_information") or [],
-        "recommended_action": raw.get("recommended_action", ""),
-        "requires_human_confirmation": bool(raw.get("requires_human_confirmation", True)),
-    }
-
-    # upsert
-    existing_row = await db.execute(
-        select(ResumeScore).where(ResumeScore.candidate_id == cid,
-                                   ResumeScore.position_id == pid)
-    )
-    score_obj = existing_row.scalar_one_or_none()
-    if score_obj is None:
-        score_obj = ResumeScore(candidate_id=cid, position_id=pid)
-        db.add(score_obj)
-
-    score_obj.skill_match = int(raw.get("skill_match", 0))
-    score_obj.project_match = int(raw.get("project_match", 0))
-    score_obj.position_exp = int(raw.get("position_exp", 0))
-    score_obj.achievement = int(raw.get("achievement", 0))
-    score_obj.industry_exp = int(raw.get("industry_exp", 0))
-    score_obj.learning = int(raw.get("learning", 0))
-    score_obj.stability = int(raw.get("stability", 0))
-    score_obj.bonus_skill = int(raw.get("bonus_skill", 0))
-    score_obj.total = total
-    score_obj.grade = grade
-    score_obj.advice = advice_dict
-
-    # score 与 screening_ai_score 都要写：列表页与 grade 换算读的是 score
-    # （见 resume_serializer.serialize_candidate），此前只写 screening_ai_score
-    # 而那个字段全仓无人序列化，导致「跑完 AI 评分，界面分数和等级毫无变化」。
-    # 上传解析时写入的 score 只是解析阶段的粗估，这里的 8 维加权分是权威值，应覆盖它。
-    candidate.screening_ai_score = total
-    candidate.score = total
+    thresholds = await _get_threshold(db, "resume_grade_thresholds", {"A": 85, "B": 70, "C": 60})
+    score_obj = await _save_score(db, candidate, raw, position_id=pid, thresholds=thresholds)
     await db.flush()
 
-    # 评分完成即进入待筛选池。迁移失败不阻断打分结果返回（分数本身已算出且有效），
-    # 但必须记日志——静默 pass 会让「候选人卡在 new 永远进不了筛选列表」无声无息。
+    # 评分完成即进入待筛选池。
     if candidate.status in ("new", "parsed"):
         try:
             await transition(db, "candidate", candidate, "pending_screen",
@@ -346,5 +405,12 @@ async def get_score(
     row = await db.execute(q.order_by(ResumeScore.created_at.desc()).limit(1))
     score = row.scalar_one_or_none()
     if score is None:
+        # 查看该候选人是否有任何 ResumeScore 记录（不区分 position）
+        check_all = await db.execute(
+            select(ResumeScore).where(ResumeScore.candidate_id == cand_id)
+        )
+        all_scores = check_all.scalars().all()
+        logger.info("GET /score candidate=%s position=%s → None (总记录数: %d)",
+                     cid, position_id, len(all_scores))
         return not_found("该候选人暂无评分记录")
     return ok(serialize_score(score, current))

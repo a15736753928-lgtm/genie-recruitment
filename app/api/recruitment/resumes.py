@@ -265,7 +265,21 @@ async def get_resume(resume_id: str, db: AsyncSession = Depends(get_db)):
     candidate = result.scalar_one_or_none()
     if not candidate:
         return not_found("候选人不存在")
-    return ok(serialize_candidate(candidate))
+    data = serialize_candidate(candidate)
+    # 顺带返回 scoreDetail，避免前端单独请求 score 时遇到401
+    try:
+        from app.models.phase1 import ResumeScore
+        from app.api.recruitment.scoring import serialize_score
+        score_row = await db.execute(
+            select(ResumeScore).where(ResumeScore.candidate_id == candidate.id)
+            .order_by(ResumeScore.created_at.desc()).limit(1)
+        )
+        score_obj = score_row.scalar_one_or_none()
+        if score_obj:
+            data["scoreDetail"] = serialize_score(score_obj)
+    except Exception:
+        pass
+    return ok(data)
 
 
 @router.post("/resumes/upload")
@@ -575,10 +589,43 @@ async def reanalyze_resume(resume_id: str, db: AsyncSession = Depends(get_db)):
         return fail(500, f"解析失败: {error}")
 
     await db.flush()
+
+    # 重新解析后也自动触发 8 维评分
+    try:
+        from app.api.recruitment.scoring import auto_score_after_upload
+        logger.info("reanalyze: 准备调用 auto_score, candidate=%s, position_id=%s",
+                     candidate.id, candidate.position_id)
+        await auto_score_after_upload(
+            db, candidate,
+            position_id=candidate.position_id,
+        )
+    except Exception as e:
+        logger.warning("重新解析后自动8维评分失败: %s", e, exc_info=True)
+
+    await db.flush()
     candidate = await load_candidate(db, resume_id)
     if not candidate:
         return fail(500, "候选人加载失败")
-    return ok(serialize_candidate(candidate))
+
+    # 顺带返回 score 数据，避免前端再发一次可能 401 的请求
+    score_data = None
+    try:
+        from app.models.phase1 import ResumeScore
+        from app.api.recruitment.scoring import serialize_score
+        score_row = await db.execute(
+            select(ResumeScore).where(ResumeScore.candidate_id == candidate.id)
+            .order_by(ResumeScore.created_at.desc()).limit(1)
+        )
+        score_obj = score_row.scalar_one_or_none()
+        if score_obj:
+            score_data = serialize_score(score_obj)
+    except Exception:
+        pass
+
+    result = serialize_candidate(candidate)
+    if score_data:
+        result["scoreDetail"] = score_data
+    return ok(result)
 
 
 @router.delete("/resumes/{resume_id}")

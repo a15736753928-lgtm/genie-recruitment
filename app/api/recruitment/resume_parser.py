@@ -268,90 +268,117 @@ from app.utils.json_utils import extract_json_from_text as _extract_json_from_ll
 
 # ── LLM Resume Parsing ──────────────────────────────────────
 
-async def parse_resume_with_llm(text: str, position_name: str = "") -> Tuple[dict, Optional[str]]:
-    """Use LLM to parse resume text into structured data."""
+# ── 并行解析：3 个独立 LLM 调用分别提取不同类型的信息 ────────
+# 每个 prompt 更聚焦、输出更短、不会截断，还能并行执行降低总耗时。
+
+async def _parse_profile(text: str, position_hint: str) -> dict:
+    """LLM 调用 1：提取基本档案（个人信息 + 教育/工作/项目经历）"""
     from app.services.ai import llm_chat
 
-    position_hint = f"\n目标应聘岗位：{position_name}" if position_name else ""
-    prompt = f"""你是一个专业的简历解析器。请从以下简历文本中提取结构化信息，返回纯JSON格式。{position_hint}
-
-【注意】不要输出 analysis.dimensions 字段，维度评分由系统独立子 Agent 计算。
+    prompt = f"""你是一个专业的简历解析器。请从简历文本中提取个人基本信息和经历，返回纯JSON。
+{position_hint}
 
 【简历文本】
 {text[:12000]}
 
-请返回如下JSON结构（找不到的字符串字段请填"未知"，应届生经验填"应届"）：
+返回如下JSON（找不到的填"未知"，应届经验填"应届"）：
 {{
     "name": "姓名",
     "gender": "男/女/未知",
     "age": null,
-    "birthDate": "出生日期，格式如2003-12-12，无则null",
+    "birthDate": "出生日期如2003-12-12，无则null",
     "education": "最高学历：大专/本科/硕士/博士/其他/未知",
-    "experience": "工作年限，如7年；无工作经历填在校中",
+    "experience": "工作年限如7年；无工作经历填在校中",
     "phone": "手机号，未知填未知",
     "email": "邮箱，未知填未知",
-    "ethnicity": "民族，简历未提及则填汉族",
+    "ethnicity": "民族，未提及填汉族",
     "nativePlace": "籍贯或现居地，未知填未知",
     "skills": ["技能1", "技能2"],
     "educationHistory": [{{"school": "学校", "degree": "学位", "major": "专业", "period": "时间段"}}],
     "workHistory": [{{"company": "公司", "role": "职位", "period": "时间段", "description": "工作描述"}}],
-    "projectHistory": [{{"name": "项目名", "role": "角色", "period": "时间段", "description": "项目描述"}}],
-    "analysis": {{
-        "overallScore": 0-100的整数,
-        "keywords": ["关键词1", "关键词2", "关键词3", "关键词4", "关键词5"],
-        "summary": "综合评价摘要",
-        "positionMatch": "岗位匹配度分析",
-        "experienceInsight": "经验洞察",
-        "highlights": ["亮点"],
-        "risks": ["风险点"],
-        "recommendation": "推荐建议"
-    }}
+    "projectHistory": [{{"name": "项目名", "role": "角色", "period": "时间段", "description": "项目描述"}}]
 }}
 
-只返回JSON，不要任何其他文字。
+只返回JSON。严格要求：只能提取原文明确出现的信息，不得臆造。age留null，识别到出生日期填birthDate。"""
+    raw = await llm_chat(messages=[{"role": "user", "content": prompt}], temperature=0.3, max_tokens=4096)
+    return json.loads(_extract_json_from_llm(raw))
 
-【严格要求】
-1. 只能提取简历原文中明确出现的信息，严禁根据岗位或常识推测学历、年限、学校等信息。
-2. education、educationHistory 仅在原文出现学校名、学历词（如本科/硕士/大专/学士）或教育时间段时填写；原文完全没有则 education 填"未知"，educationHistory 返回 []。
-3. workHistory 同样仅填写原文明确写出的公司与岗位，不得臆造。
-4. keywords 必须输出恰好 5 个，从简历技能、项目、工具栈中提取，不足 5 个时用技能字段补足。
 
-注意：age字段不要自行填写，留null即可；若识别到出生日期请填入birthDate，系统会自动计算年龄。
-注意：不要输出 analysis.dimensions 字段，维度评分由系统独立子 Agent 计算。"""
+async def _parse_extra(text: str) -> dict:
+    """LLM 调用 2：提取扩展字段（行业经验/管理经验/到岗时间/薪资/作品/证书）"""
+    from app.services.ai import llm_chat
 
+    prompt = f"""从以下简历文本中提取6项特定信息，返回纯JSON。
+
+【简历文本】
+{text[:12000]}
+
+返回如下JSON（没有则填"未知"或返回空数组）：
+{{
+    "industryExperience": "行业经验描述，如'3年AI行业经验'，未知填未知",
+    "managementExperience": "管理经验描述，如'带过5人团队'，未知填未知",
+    "availableDate": "到岗时间，如'随时到岗'/'一周内'，未知填未知",
+    "salaryExpectation": "薪资要求，如'25-30K'/'面议'，未知填未知",
+    "portfolio": ["作品、GitHub、博客等链接或名称"],
+    "certificates": ["职业证书、资格认证名称"]
+}}
+
+只返回JSON。严格只提取原文明确出现的信息，不得推测。"""
+    raw = await llm_chat(messages=[{"role": "user", "content": prompt}], temperature=0.3, max_tokens=2048)
+    return json.loads(_extract_json_from_llm(raw))
+
+
+async def _parse_analysis(text: str, position_hint: str) -> dict:
+    """LLM 调用 3：AI 综合评估（评分 + 关键词 + 优劣势分析）"""
+    from app.services.ai import llm_chat
+
+    prompt = f"""你是资深HR分析师。请分析以下简历并给出综合评估，返回纯JSON。
+{position_hint}
+
+【简历文本】
+{text[:12000]}
+
+返回如下JSON：
+{{
+    "overallScore": 0到100的整数,
+    "keywords": ["关键词1", "关键词2", "关键词3", "关键词4", "关键词5"],
+    "summary": "综合评价摘要（50-100字）",
+    "positionMatch": "岗位匹配度分析",
+    "experienceInsight": "经验洞察",
+    "highlights": ["亮点1", "亮点2"],
+    "risks": ["风险点1"],
+    "recommendation": "推荐建议"
+}}
+
+只返回JSON。注意：不要输出dimensions字段。keywords恰好5个，不足用技能补。"""
+    raw = await llm_chat(messages=[{"role": "user", "content": prompt}], temperature=0.3, max_tokens=2048)
+    return json.loads(_extract_json_from_llm(raw))
+
+
+async def _safe_parse(coro, label: str) -> dict:
+    """安全执行单个 LLM 解析任务，失败返回空 dict 并记录日志。"""
     try:
-        raw = await llm_chat(
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.3,
-            max_tokens=4096,
-        )
-        content = _extract_json_from_llm(raw)
-        parsed = json.loads(content)
-    except json.JSONDecodeError as e:
-        logger.warning("LLM returned invalid JSON on first attempt: %s", e)
-        try:
-            fix_prompt = (
-                f"你刚才返回了无效的 JSON。请修复后重新输出，只返回纯 JSON，不要任何其他文字。\n\n"
-                f"错误：{e}\n\n"
-                f"【原始任务】：{prompt}"
-            )
-            raw2 = await llm_chat(
-                messages=[{"role": "user", "content": fix_prompt}],
-                temperature=0.1,
-                max_tokens=4096,
-            )
-            content2 = _extract_json_from_llm(raw2)
-            parsed = json.loads(content2)
-            logger.info("LLM JSON retry succeeded")
-        except json.JSONDecodeError as e2:
-            logger.error("LLM still returned invalid JSON after retry: %s", e2)
-            return {}, f"AI 返回格式错误（重试后仍失败）: {e2}"
-        except Exception as e2:
-            logger.exception("LLM retry failed with unexpected error")
-            return {}, f"AI 重试失败: {e2}"
+        return await coro
     except Exception as e:
-        logger.exception("LLM parse error")
-        return {}, f"AI 解析失败: {e}"
+        logger.warning("简历并行解析 [%s] 失败: %s", label, e)
+        return {}
+
+
+async def parse_resume_with_llm(text: str, position_name: str = "") -> Tuple[dict, Optional[str]]:
+    """Use LLM to parse resume text into structured data (3 parallel calls)."""
+    import asyncio
+
+    position_hint = f"\n目标应聘岗位：{position_name}" if position_name else ""
+
+    # 三个解析任务并行执行
+    profile_task, extra_task, analysis_task = await asyncio.gather(
+        _safe_parse(_parse_profile(text, position_hint), "基本档案"),
+        _safe_parse(_parse_extra(text), "扩展信息"),
+        _safe_parse(_parse_analysis(text, position_hint), "AI评估"),
+    )
+
+    # 合并结果
+    parsed = {**profile_task, **extra_task, "analysis": analysis_task}
 
     parsed = enrich_parsed_fields(parsed, text)
     if parsed.get("name") == UNKNOWN:

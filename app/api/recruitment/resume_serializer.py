@@ -148,5 +148,6 @@ def serialize_candidate(c: Candidate) -> dict:
             "highlights": a.highlights or [],
             "risks": a.risks or [],
             "recommendation": a.recommendation or "",
+            "resumeExtra": a.resume_extra or {},
         }
     return data

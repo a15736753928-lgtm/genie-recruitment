@@ -176,6 +176,18 @@ async def _upload_one_resume(
             if parse_message and is_candidate_parsed(candidate):
                 parse_message = None
 
+    # 5.5) 自动 8 维 AI 评分（写入 ResumeScore，供前端 AI 评分标签页展示）
+    try:
+        from app.api.recruitment.scoring import auto_score_after_upload
+        cand_for_scoring = await _load_candidate(db, candidate.id)
+        if cand_for_scoring:
+            await auto_score_after_upload(
+                db, cand_for_scoring,
+                position_id=uuid.UUID(resolved_position_id) if resolved_position_id else None,
+            )
+    except Exception as e:
+        logger.warning("自动8维评分失败（不阻断上传）: %s", e)
+
     await db.flush()
 
     # 6) RAG 知识库入库
@@ -393,6 +405,12 @@ async def fill_candidate_from_parsed(candidate: Candidate, parsed: dict, db: Asy
 
     analysis_data = parsed.get("analysis") or {}
     if analysis_data:
+        resume_extra = {}
+        for key in ("industryExperience", "managementExperience", "availableDate",
+                     "salaryExpectation", "portfolio", "certificates"):
+            val = parsed.get(key)
+            if val is not None:
+                resume_extra[key] = val
         candidate.ai_analysis = CandidateAIAnalysis(
             overall_score=analysis_data.get("overallScore"),
             summary=analysis_data.get("summary"),
@@ -403,5 +421,6 @@ async def fill_candidate_from_parsed(candidate: Candidate, parsed: dict, db: Asy
             highlights=analysis_data.get("highlights"),
             risks=analysis_data.get("risks"),
             dimensions=analysis_data.get("dimensions"),
+            resume_extra=resume_extra or None,
         )
         candidate.score = analysis_data.get("overallScore") or candidate.score or 0
