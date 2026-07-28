@@ -767,10 +767,20 @@ async def publish_request(
         dept_name = dept.name if dept else None
 
     draft = req.ai_draft or {}
+    import json as _json
+    # jd_content 是 VARCHAR，结构化格式的 jobDescription 需要转为 JSON 字符串
+    jd_content_raw = draft.get("jobDescription")
+    if isinstance(jd_content_raw, dict):
+        jd_content_str = _json.dumps(jd_content_raw, ensure_ascii=False)
+    elif jd_content_raw:
+        jd_content_str = str(jd_content_raw)
+    else:
+        jd_content_str = ""
+
     position = Position(
         name=req.position_name,
         department=dept_name,
-        jd_content=draft.get("jobDescription"),
+        jd_content=jd_content_str,
         jd_responsibilities=req.job_responsibilities or "",
         jd_requirements=req.job_requirements or "",
         jd_preferred=req.bonus_items or "",
