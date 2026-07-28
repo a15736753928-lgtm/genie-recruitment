@@ -119,7 +119,7 @@ def serialize_candidate(c: Candidate) -> dict:
             {"name": p.name, "role": p.role, "period": p.period, "description": p.description or ""}
             for p in (c.project_experiences or [])
         ],
-        "resumeFileUrl": f"/resumes/{c.id}/file" if resume_path else "",
+        "resumeFileUrl": f"/api/resumes/{c.id}/file" if resume_path else "",
         "resumeFileName": os.path.basename(resume_path) if resume_path else "",
         "resumeFileType": resume_ext.lstrip("."),
         "parseStatus": "parsed" if is_candidate_parsed(c) else "pending",
