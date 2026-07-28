@@ -341,95 +341,219 @@ async def ai_generate(
         return fail(409, "当前状态不允许 AI 生成")
 
     try:
-        from app.services.ai import llm_chat
+        import asyncio
         import logging
+        from app.services.ai import llm_chat
+        from app.utils.llm_json import extract_json_object, extract_json_array
         _log = logging.getLogger(__name__)
-        prompt = (
-            f"你是资深 HR 顾问和岗位设计专家。请根据以下招聘需求，生成 7 件结构化产品，以 JSON 格式返回。\n\n"
-            f"## 招聘需求\n"
-            f"- 岗位名称: {req.position_name}\n"
-            f"- 部门: {req.department_id or '待定'}\n"
-            f"- 招聘人数: {req.headcount}\n"
-            f"- 岗位描述: {req.job_description}\n"
-            f"- 工作职责: {req.job_responsibilities}\n"
-            f"- 任职要求: {req.job_requirements}\n"
-            f"- 工作经验要求: {req.work_experience}\n"
-            f"- 学历要求: {req.education_requirement}\n"
-            f"- 加分项: {req.bonus_items}\n"
-            f"- 核心任务: {req.core_tasks}\n"
-            f"- 必备技能: {', '.join(req.required_skills or [])}\n"
-            f"- 优先技能: {', '.join(req.preferred_skills or [])}\n"
-            f"- 薪资范围: {req.salary_range}\n"
-            f"- 试用期目标: {req.probation_goal}\n"
-            f"- 淘汰条件: {req.elimination_criteria}\n\n"
-            "## 返回 JSON 结构（请务必返回完整、详细的 JSON）\n"
-            "{\n"
-            '  "jobDescription": {\n'
-            '    "basicInfo": {\n'
-            '      "positionName": "岗位名称",\n'
-            '      "department": "所属部门",\n'
-            '      "headcount": 1,\n'
-            '      "reportTo": "汇报对象",\n'
-            '      "salaryRange": "薪资范围",\n'
-            '      "workLocation": "工作地点",\n'
-            '      "employmentType": "正式员工",\n'
-            '      "level": "岗位等级"\n'
-            "    },\n"
-            '    "mission": "岗位使命和核心价值（100字以上）",\n'
-            '    "responsibilities": ["主要工作职责1（含量化指标）", "职责2", "..."],\n'
-            '    "qualifications": {\n'
-            '      "required": ["必须具备的条件1", "条件2"],\n'
-            '      "preferred": ["优先条件1", "加分项2"]\n'
-            "    },\n"
-            '    "permissions": ["岗位工作权限1", "权限2"],\n'
-            '    "collaborations": {\n'
-            '      "internal": ["内部协作部门/角色1", "协作2"],\n'
-            '      "external": ["外部协作对象1"]\n'
-            "    },\n"
-            '    "workEnvironment": {\n'
-            '      "officeType": "办公室/远程/混合",\n'
-            '      "workingHours": "工作时间",\n'
-            '      "overtime": "加班情况",\n'
-            '      "travel": "出差要求"\n'
-            "    },\n"
-            '    "kpi": ["核心绩效考核指标1", "指标2", "指标3"],\n'
-            '    "careerPath": "职业发展通道描述"\n'
-            "  },\n"
-            '  "competencyModel": [\n'
-            '    {"dimension": "专业技能", "weight": 30, "description": "评估标准描述"},\n'
-            '    {"dimension": "项目经验", "weight": 20, "description": "评估标准描述"}\n'
-            "  ],\n"
-            '  "resumeScoringRules": {\n'
-            '    "skillMatch": 25, "projectMatch": 20, "positionExp": 15,\n'
-            '    "achievement": 15, "industryExp": 10, "learning": 5, "stability": 5, "bonusSkill": 5\n'
-            "  },\n"
-            '  "interviewDimensionsR1": [\n'
-            '    {"dimension": "经历真实性", "weight": 15, "description": "评估要点", "sampleQuestions": ["问题1", "问题2"]}\n'
-            "  ],\n"
-            '  "interviewDimensionsR2": [\n'
-            '    {"dimension": "专业能力", "weight": 25, "description": "评估要点", "sampleQuestions": ["问题1"]}\n'
-            "  ],\n"
-            '  "probationFramework": {\n'
-            '    "phases": [\n'
-            '      {"name": "第1周", "duration": "1周", "goals": ["目标1"], "evaluationMethod": "评估方式"}\n'
-            "    ]\n"
-            "  },\n"
-            '  "trainingPlan": [\n'
-            '    {"title": "培训模块", "duration": "2小时", "content": "培训内容", "objectives": ["目标"], "method": "方式"}\n'
-            "  ]\n"
-            "}"
+
+        # ── 基础信息（所有 prompt 共用）────────────────────────────
+        base_info = (
+            f"岗位名称: {req.position_name}\n"
+            f"部门: {req.department_id or '待定'}\n"
+            f"招聘人数: {req.headcount}\n"
+            f"岗位描述: {req.job_description}\n"
+            f"工作职责: {req.job_responsibilities}\n"
+            f"任职要求: {req.job_requirements}\n"
+            f"工作经验要求: {req.work_experience}\n"
+            f"学历要求: {req.education_requirement}\n"
+            f"加分项: {req.bonus_items}\n"
+            f"核心任务: {req.core_tasks}\n"
+            f"必备技能: {', '.join(req.required_skills or [])}\n"
+            f"优先技能: {', '.join(req.preferred_skills or [])}\n"
+            f"薪资范围: {req.salary_range}\n"
+            f"试用期目标: {req.probation_goal}\n"
+            f"淘汰条件: {req.elimination_criteria}"
         )
-        resp_text = await llm_chat(
-            [{"role": "user", "content": prompt}],
-            max_tokens=2048,
+
+        # ── 7 个独立的生成函数 ─────────────────────────────────────
+
+        async def gen_job_description():
+            """生成岗位说明书（结构化 JSON）"""
+            prompt = f"""你是资深 HR 顾问。根据以下招聘需求，生成结构化的岗位说明书。
+
+## 招聘需求
+{base_info}
+
+## 返回 JSON（只返回 JSON，不要其他内容）
+{{
+  "basicInfo": {{
+    "positionName": "岗位名称",
+    "department": "所属部门",
+    "headcount": 1,
+    "reportTo": "汇报对象",
+    "salaryRange": "薪资范围",
+    "workLocation": "工作地点",
+    "employmentType": "正式员工",
+    "level": "岗位等级"
+  }},
+  "mission": "岗位使命和核心价值（100字以上）",
+  "responsibilities": ["主要工作职责1（含量化指标）", "职责2"],
+  "qualifications": {{
+    "required": ["必须具备的条件1", "条件2"],
+    "preferred": ["优先条件1", "加分项2"]
+  }},
+  "permissions": ["岗位工作权限1", "权限2"],
+  "collaborations": {{
+    "internal": ["内部协作部门/角色1", "协作2"],
+    "external": ["外部协作对象1"]
+  }},
+  "workEnvironment": {{
+    "officeType": "办公室/远程/混合",
+    "workingHours": "工作时间",
+    "overtime": "加班情况",
+    "travel": "出差要求"
+  }},
+  "kpi": ["核心绩效考核指标1", "指标2", "指标3"],
+  "careerPath": "职业发展通道描述"
+}}"""
+            resp = await llm_chat([{"role": "user", "content": prompt}], max_tokens=2048)
+            return ("jobDescription", extract_json_object(resp))
+
+        async def gen_competency_model():
+            """生成能力模型"""
+            prompt = f"""你是资深 HR 顾问。根据以下招聘需求，生成岗位能力模型。
+
+## 招聘需求
+{base_info}
+
+## 返回 JSON 数组（只返回 JSON，不要其他内容）
+[
+  {{"dimension": "专业技能", "weight": 30, "description": "评估标准描述"}},
+  {{"dimension": "项目经验", "weight": 20, "description": "评估标准描述"}},
+  {{"dimension": "任务交付能力", "weight": 15, "description": "评估标准描述"}},
+  {{"dimension": "问题解决能力", "weight": 15, "description": "评估标准描述"}},
+  {{"dimension": "学习能力", "weight": 10, "description": "评估标准描述"}},
+  {{"dimension": "沟通协作与责任感", "weight": 10, "description": "评估标准描述"}}
+]"""
+            resp = await llm_chat([{"role": "user", "content": prompt}], max_tokens=1024)
+            return ("competencyModel", extract_json_array(resp))
+
+        async def gen_resume_scoring():
+            """生成简历评分规则"""
+            prompt = f"""你是资深 HR 顾问。根据以下招聘需求，生成简历评分规则。
+
+## 招聘需求
+{base_info}
+
+## 返回 JSON（只返回 JSON，不要其他内容）
+{{
+  "skillMatch": 25,
+  "projectMatch": 20,
+  "positionExp": 15,
+  "achievement": 15,
+  "industryExp": 10,
+  "learning": 5,
+  "stability": 5,
+  "bonusSkill": 5
+}}"""
+            resp = await llm_chat([{"role": "user", "content": prompt}], max_tokens=512)
+            return ("resumeScoringRules", extract_json_object(resp))
+
+        async def gen_interview_r1():
+            """生成一面维度"""
+            prompt = f"""你是资深 HR 顾问。根据以下招聘需求，生成第一轮面试（初试）的评估维度。
+
+## 招聘需求
+{base_info}
+
+## 返回 JSON 数组（只返回 JSON，不要其他内容）
+[
+  {{"dimension": "经历真实性", "weight": 15, "description": "评估要点描述", "sampleQuestions": ["问题1", "问题2"]}},
+  {{"dimension": "专业基础", "weight": 25, "description": "评估要点描述", "sampleQuestions": ["问题1", "问题2"]}},
+  {{"dimension": "项目经验", "weight": 20, "description": "评估要点描述", "sampleQuestions": ["问题1"]}},
+  {{"dimension": "学习能力", "weight": 15, "description": "评估要点描述", "sampleQuestions": ["问题1"]}},
+  {{"dimension": "沟通表达", "weight": 15, "description": "评估要点描述", "sampleQuestions": ["问题1"]}},
+  {{"dimension": "稳定性与动机", "weight": 10, "description": "评估要点描述", "sampleQuestions": ["问题1"]}}
+]"""
+            resp = await llm_chat([{"role": "user", "content": prompt}], max_tokens=1500)
+            return ("interviewDimensionsR1", extract_json_array(resp))
+
+        async def gen_interview_r2():
+            """生成二面维度"""
+            prompt = f"""你是资深技术面试官。根据以下招聘需求，生成第二轮面试（复试）的评估维度。
+
+## 招聘需求
+{base_info}
+
+## 返回 JSON 数组（只返回 JSON，不要其他内容）
+[
+  {{"dimension": "系统设计能力", "weight": 25, "description": "评估要点描述", "sampleQuestions": ["问题1", "问题2"]}},
+  {{"dimension": "技术深度", "weight": 25, "description": "评估要点描述", "sampleQuestions": ["问题1", "问题2"]}},
+  {{"dimension": "问题解决思路", "weight": 20, "description": "评估要点描述", "sampleQuestions": ["问题1"]}},
+  {{"dimension": "技术视野", "weight": 15, "description": "评估要点描述", "sampleQuestions": ["问题1"]}},
+  {{"dimension": "领导力/影响力", "weight": 15, "description": "评估要点描述", "sampleQuestions": ["问题1"]}}
+]"""
+            resp = await llm_chat([{"role": "user", "content": prompt}], max_tokens=1500)
+            return ("interviewDimensionsR2", extract_json_array(resp))
+
+        async def gen_probation_framework():
+            """生成试用期框架"""
+            prompt = f"""你是资深 HR 顾问。根据以下招聘需求，生成试用期考核框架。
+
+## 招聘需求
+{base_info}
+- 试用期目标: {req.probation_goal}
+- 淘汰条件: {req.elimination_criteria}
+
+## 返回 JSON（只返回 JSON，不要其他内容）
+{{
+  "phases": [
+    {{"name": "第1周", "duration": "1周", "goals": ["熟悉环境和团队", "了解项目背景"], "evaluationMethod": "导师评价"}},
+    {{"name": "第2-4周", "duration": "3周", "goals": ["独立完成小型任务", "熟悉开发流程"], "evaluationMethod": "任务完成度评估"}},
+    {{"name": "第2-3个月", "duration": "2个月", "goals": ["独立负责模块开发", "达到试用期目标"], "evaluationMethod": "转正评审"}}
+  ]
+}}"""
+            resp = await llm_chat([{"role": "user", "content": prompt}], max_tokens=1024)
+            return ("probationFramework", extract_json_object(resp))
+
+        async def gen_training_plan():
+            """生成培训建议"""
+            prompt = f"""你是资深 HR 顾问。根据以下招聘需求，生成入职培训计划。
+
+## 招聘需求
+{base_info}
+
+## 返回 JSON 数组（只返回 JSON，不要其他内容）
+[
+  {{"title": "公司文化与价值观", "duration": "半天", "content": "企业使命、愿景、核心价值观", "objectives": ["了解公司文化", "认同核心价值观"], "method": "讲座"}},
+  {{"title": "产品与业务介绍", "duration": "1天", "content": "公司产品线、业务模式、客户群体", "objectives": ["理解产品定位", "了解业务流程"], "method": "讲解+演示"}},
+  {{"title": "技术架构概览", "duration": "1天", "content": "技术栈、系统架构、开发规范", "objectives": ["熟悉技术栈", "了解代码规范"], "method": "技术分享"}},
+  {{"title": "开发工具与流程", "duration": "半天", "content": "Git、CI/CD、项目管理工具", "objectives": ["掌握开发工具", "熟悉发布流程"], "method": "实操"}},
+  {{"title": "团队协作规范", "duration": "半天", "content": "代码评审、文档规范、沟通机制", "objectives": ["了解协作流程", "掌握规范要求"], "method": "讲解"}}
+]"""
+            resp = await llm_chat([{"role": "user", "content": prompt}], max_tokens=1500)
+            return ("trainingPlan", extract_json_array(resp))
+
+        # ── 并发执行所有 7 个生成任务 ──────────────────────────────
+        _log.info("开始并发生成 7 件产品...")
+        results = await asyncio.gather(
+            gen_job_description(),
+            gen_competency_model(),
+            gen_resume_scoring(),
+            gen_interview_r1(),
+            gen_interview_r2(),
+            gen_probation_framework(),
+            gen_training_plan(),
+            return_exceptions=True,
         )
-        _log.info("AI 生成招聘需求原始响应长度: %d", len(resp_text or ""))
-        _log.debug("AI 生成招聘需求原始响应: %s", resp_text[:500] if resp_text else "(空)")
-        ai_draft = extract_json_object(resp_text)
-        if ai_draft is None:
-            _log.error("AI 返回内容无法解析为 JSON: %s", resp_text[:300] if resp_text else "(空)")
-            raise ValueError("模型未返回可解析的 JSON，请重试")
-        _log.info("AI 生成招聘需求成功，包含字段: %s", list(ai_draft.keys()))
+
+        # ── 合并结果 ──────────────────────────────────────────────
+        ai_draft = {}
+        for r in results:
+            if isinstance(r, Exception):
+                _log.error("AI 生成失败: %s", r)
+                continue
+            key, value = r
+            if value is not None:
+                ai_draft[key] = value
+            else:
+                _log.warning("AI 生成 %s 返回空", key)
+
+        if not ai_draft:
+            raise ValueError("所有 AI 生成任务均失败，请重试")
+
+        _log.info("AI 生成完成，成功 %d/7 项: %s", len(ai_draft), list(ai_draft.keys()))
     except Exception as e:
         _log.exception("AI 生成招聘需求失败")
         return fail(500, f"AI 生成失败，请重试: {e}")
