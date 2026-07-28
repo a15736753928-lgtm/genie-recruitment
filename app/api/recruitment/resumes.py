@@ -224,7 +224,7 @@ async def get_resume_file(resume_id: str, db: AsyncSession = Depends(get_db)):
         return FileResponse(
             stored,
             media_type=media_type,
-            filename=filename,
+            # 不传 filename：避免 Starlette 自动设置 Content-Disposition: attachment
             headers={"Content-Disposition": cd_header},
         )
 
