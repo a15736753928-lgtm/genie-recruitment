@@ -155,11 +155,20 @@ async def delete_position(
     if candidate_result.scalar_one_or_none():
         return conflict("该岗位下有关联候选人，请先删除或转移相关简历后再删除岗位")
 
-    # employees 外键是 NO ACTION，先解除引用再删岗位
-    await db.execute(
-        text("UPDATE employees SET position_id = NULL WHERE position_id = :pid"),
-        {"pid": position_id},
-    )
+    # 解除所有引用 positions 的外键（无 ON DELETE CASCADE 的表）
+    ref_tables = [
+        "employees",
+        "interviews",
+        "recruitment_requests",
+        "offer_approvals",
+        "probation_plans",
+        "resume_scores",
+    ]
+    for tbl in ref_tables:
+        await db.execute(
+            text(f"UPDATE {tbl} SET position_id = NULL WHERE position_id = :pid"),
+            {"pid": position_id},
+        )
 
     await db.delete(position)
     await db.flush()
