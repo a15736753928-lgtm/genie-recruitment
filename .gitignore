@@ -34,3 +34,5 @@ Thumbs.db
 # Claude
 .claude/
 .playwright-mcp/
+
+ai_temp/
