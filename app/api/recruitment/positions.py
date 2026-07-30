@@ -156,12 +156,18 @@ async def delete_position(
         return conflict("该岗位下有关联候选人，请先删除或转移相关简历后再删除岗位")
 
     # 解除所有引用 positions 的外键（无 ON DELETE CASCADE 的表）
+    # 从 PostgreSQL 约束中查到的引用表：
+    #   position_questions (CASCADE, ORM managed)
+    #   candidates (FK, checked above)
+    #   employees, interviews, recruitment_requests, offer_approvals,
+    #   resume_scores, position_ai_artifacts, position_competency (CASCADE)
     ref_tables = [
         "employees",
         "interviews",
         "recruitment_requests",
         "offer_approvals",
         "resume_scores",
+        "position_ai_artifacts",
     ]
     for tbl in ref_tables:
         await db.execute(
