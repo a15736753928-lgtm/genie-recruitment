@@ -161,7 +161,6 @@ async def delete_position(
         "interviews",
         "recruitment_requests",
         "offer_approvals",
-        "probation_plans",
         "resume_scores",
     ]
     for tbl in ref_tables:
