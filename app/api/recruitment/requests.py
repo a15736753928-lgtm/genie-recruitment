@@ -833,15 +833,107 @@ async def list_requests(
     current: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    # 1) 已有的招聘需求
     q = select(RecruitmentRequest)
     total = (await db.execute(select(func.count()).select_from(q.subquery()))).scalar() or 0
     rows = (await db.execute(
         q.order_by(RecruitmentRequest.created_at.desc())
          .offset((page - 1) * page_size).limit(page_size)
     )).scalars().all()
+    result = [_serialize_req(r, current) for r in rows]
+
+    # 2) 把 positions 里还没有 recruitment_request 关联的岗位也列出来，
+    #    标记 status="uninitiated"，让前端能看到并一键发起招聘。
+    published_position_ids = await db.execute(
+        select(RecruitmentRequest.position_id).where(
+            RecruitmentRequest.position_id.isnot(None),
+            RecruitmentRequest.status == "published",
+        )
+    )
+    published_ids = {r[0] for r in published_position_ids.all()}
+
+    # 已经在 recruitment_requests 中引用（但未发布或已关闭）的岗位，也要补充进来
+    all_linked_position_ids = await db.execute(
+        select(RecruitmentRequest.position_id).where(
+            RecruitmentRequest.position_id.isnot(None)
+        )
+    )
+    linked_ids = {r[0] for r in all_linked_position_ids.all()}
+
+    # 查所有 positions，排除已经有已发布请求的
+    all_positions = (await db.execute(
+        select(Position).where(Position.id.notin_(linked_ids - published_ids)).order_by(Position.created_at.desc())
+    )).scalars().all()
+
+    # 构建已有请求中引用的 position_id → request_id 的映射，给未发布但已关联的请求提供入口
+    linked_request_map = {}
+    if all_linked_position_ids:
+        linked_rows = await db.execute(
+            select(RecruitmentRequest.position_id, RecruitmentRequest.id).where(
+                RecruitmentRequest.position_id.isnot(None)
+            )
+        )
+        linked_request_map = {str(r[0]): str(r[1]) for r in linked_rows.all()}
+
+    result_position_ids = {
+        str(r["positionId"]) for r in result
+        if r.get("positionId") is not None
+    }
+
+    for pos in all_positions:
+        pid = str(pos.id)
+        # 跳过已有请求且已发布、或已在本次请求列表中的
+        if pid in result_position_ids:
+            continue
+        # 跳过已有请求且已发布的
+        if pid in published_ids:
+            continue
+
+        # 构建虚拟请求实体
+        existing_req_id = linked_request_map.get(pid)
+        result.append({
+            "id": existing_req_id or pid,  # 有已有请求就用请求id，否则用岗位id（前端用作唯一标识）
+            "positionName": pos.name,
+            "departmentId": None,
+            "headcount": 1,
+            "salaryRange": pos.salary_range or "",
+            "salaryMasked": False,
+            "workExperience": pos.experience_requirement or "",
+            "educationRequirement": pos.education_requirement or "",
+            "jobDescription": pos.jd_content or "",
+            "jobResponsibilities": pos.jd_responsibilities or "",
+            "jobRequirements": pos.jd_requirements or "",
+            "bonusItems": pos.jd_preferred or "",
+            "coreTasks": [],
+            "requiredSkills": [],
+            "preferredSkills": [],
+            "deliverableReq": "",
+            "deliverableRequirements": "",
+            "probationGoal": "",
+            "probationGoals": "",
+            "eliminationCriteria": "",
+            "interviewerIds": [],
+            "interviewers": [],
+            "directManagerId": None,
+            "directManager": "",
+            "submitterId": None,
+            "status": "uninitiated" if not existing_req_id else "draft",
+            "aiDraft": None,
+            "aiOutputs": None,
+            "hrConfirmedBy": None,
+            "hrConfirmedAt": None,
+            "deptConfirmedBy": None,
+            "deptConfirmedAt": None,
+            "positionId": pid,
+            "createdAt": pos.created_at.isoformat() if pos.created_at else None,
+            "updatedAt": pos.updated_at.isoformat() if pos.updated_at else None,
+        })
+
     return ok({
-        "list": [_serialize_req(r, current) for r in rows],
-        "total": total, "page": page, "pageSize": page_size,
+        "list": result,
+        "total": total + len(result) - len(rows),
+        "page": page,
+        "pageSize": page_size,
     })
 
 
@@ -859,6 +951,64 @@ async def get_request(
     req = row.scalar_one_or_none()
     if req is None:
         return not_found("招聘需求不存在")
+    return ok(_serialize_req(req, current))
+
+
+@router.post("/positions/{position_id}/initiate-request")
+async def initiate_request_from_position(
+    position_id: str,
+    current: CurrentUser = Depends(require_permission("recruitment_request:create")),
+    db: AsyncSession = Depends(get_db),
+):
+    """从已有岗位一键发起招聘需求。使用岗位 JD 填充需求，HR 只需补少量必填项。"""
+    try:
+        pid = uuid.UUID(position_id)
+    except ValueError:
+        return not_found("岗位不存在")
+    row = await db.execute(select(Position).where(Position.id == pid))
+    pos = row.scalar_one_or_none()
+    if pos is None:
+        return not_found("岗位不存在")
+
+    # 检查是否已有未发布的招聘需求
+    existing = await db.execute(
+        select(RecruitmentRequest).where(
+            RecruitmentRequest.position_id == pid,
+            RecruitmentRequest.status.in_(["draft", "ai_generated", "hr_confirmed", "dept_confirmed"]),
+        )
+    )
+    if existing.scalar_one_or_none():
+        return fail(409, "该岗位已有进行中的招聘需求，请勿重复发起")
+
+    # 用岗位 JD 数据填充招聘需求
+    req = RecruitmentRequest(
+        position_name=pos.name,
+        headcount=1,
+        department_id=None,
+        salary_range=pos.salary_range or "",
+        work_experience=pos.experience_requirement or "",
+        education_requirement=pos.education_requirement or "",
+        job_description=pos.jd_content or "",
+        job_responsibilities=pos.jd_responsibilities or "",
+        job_requirements=pos.jd_requirements or "",
+        bonus_items=pos.jd_preferred or "",
+        core_tasks="",
+        required_skills=[],
+        preferred_skills=[],
+        deliverable_req="",
+        probation_goal="",
+        elimination_criteria="",
+        interviewer_ids=[],
+        direct_manager_id=None,
+        direct_manager_name="",
+        submitter_id=current.id,
+        status="draft",
+        position_id=pos.id,
+    )
+    db.add(req)
+    await db.flush()
+    await db.refresh(req)
+    await write_audit(db, actor=current.username, action=f"从岗位「{pos.name}」发起招聘需求", section="recruitment")
     return ok(_serialize_req(req, current))
 
 

@@ -169,6 +169,13 @@ async def check_port_available(settings: Settings) -> CheckResult:
     inherited socket and falsely report "already in use". connect() only
     succeeds when some OTHER process is actually accepting connections on the
     port, which is exactly the conflict we want to catch.
+
+    Windows ghost-socket handling: on Windows, a killed process may leave a
+    LISTEN socket that still accepts connections (ghost socket). To distinguish
+    a real conflict from a reclaimable ghost, we attempt bind() with
+    SO_REUSEADDR after connect() succeeds — if bind works, the port can be
+    reclaimed by uvicorn (which also uses SO_REUSEADDR), so we WARN instead
+    of FAIL.
     """
     import socket
     port = settings.app_port
@@ -179,6 +186,31 @@ async def check_port_available(settings: Settings) -> CheckResult:
         # If connect succeeds, someone else is already listening → conflict.
         sock.connect(("127.0.0.1", port))
         sock.close()
+
+        # Try SO_REUSEADDR bind to see if the port is reclaimable (ghost socket)
+        reclaimable = False
+        test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        test_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            test_sock.bind((settings.app_host, port))
+            test_sock.listen(1)
+            reclaimable = True
+        except OSError:
+            pass
+        finally:
+            try:
+                test_sock.close()
+            except OSError:
+                pass
+
+        if reclaimable:
+            hint = await asyncio.to_thread(_find_port_owner, port)
+            return CheckResult(
+                f"Port {port}", "critical", CheckStatus.PASS,
+                f"Reclaimable (SO_REUSEADDR) — ghost socket will be overridden{hint}",
+                (time.perf_counter() - t0) * 1000,
+            )
+
         hint = await asyncio.to_thread(_find_port_owner, port)
         return CheckResult(
             f"Port {port}", "critical", CheckStatus.FAIL,
