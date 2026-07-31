@@ -650,8 +650,6 @@ async def update_request(
     req = row.scalar_one_or_none()
     if req is None:
         return not_found("招聘需求不存在")
-    if req.status in ("published", "closed"):
-        return fail(409, "已发布，不可修改")
     data = body.model_dump(exclude_unset=True, by_alias=False)
     if "direct_manager_id" in data:
         raw = (data.pop("direct_manager_id") or "").strip()
@@ -665,6 +663,9 @@ async def update_request(
                 data["direct_manager_name"] = matched.display_name if matched else raw
     for field, value in data.items():
         if hasattr(req, field) and value is not None:
+            # 空字符串对 UUID / nullable 列无意义，跳过以保持原值
+            if isinstance(value, str) and not value.strip():
+                continue
             setattr(req, field, value)
     await db.flush()
     return ok(_serialize_req(req, current))
@@ -750,64 +751,64 @@ async def publish_request(
     if req.status != "dept_confirmed":
         return fail(409, "需 HR 与部门负责人双方确认后才能发布")
 
-    # positions.name 有唯一约束：重名时此处会抛 IntegrityError 变成裸 500，
-    # 用户只看到「服务器内部错误」，完全不知道是岗位重名。先查再给明确提示。
+    # positions.name 有唯一约束：先查是否已存在，已存在则复用，不存在则新建
     dup = await db.execute(select(Position).where(Position.name == req.position_name))
     existing_position = dup.scalar_one_or_none()
     if existing_position is not None:
-        return fail(409, f"岗位「{req.position_name}」已存在，请修改需求里的岗位名称后再发布")
+        # 岗位已存在，直接复用，不再重复创建
+        position = existing_position
+    else:
+        # Resolve department name for Position record
+        dept_name = None
+        if req.department_id:
+            dept_row = await db.execute(
+                select(Department).where(Department.id == req.department_id)
+            )
+            dept = dept_row.scalar_one_or_none()
+            dept_name = dept.name if dept else None
 
-    # Resolve department name for Position record
-    dept_name = None
-    if req.department_id:
-        dept_row = await db.execute(
-            select(Department).where(Department.id == req.department_id)
+        draft = req.ai_draft or {}
+        import json as _json
+        # jd_content 是 VARCHAR，结构化格式的 jobDescription 需要转为 JSON 字符串
+        jd_content_raw = draft.get("jobDescription")
+        if isinstance(jd_content_raw, dict):
+            jd_content_str = _json.dumps(jd_content_raw, ensure_ascii=False)
+        elif jd_content_raw:
+            jd_content_str = str(jd_content_raw)
+        else:
+            jd_content_str = ""
+
+        position = Position(
+            name=req.position_name,
+            department=dept_name,
+            jd_content=jd_content_str,
+            jd_responsibilities=req.job_responsibilities or "",
+            jd_requirements=req.job_requirements or "",
+            jd_preferred=req.bonus_items or "",
+            education_requirement=req.education_requirement or "",
+            experience_requirement=req.work_experience or "",
+            salary_range=req.salary_range,
+            screening_criteria=draft.get("resumeScoringRules"),
+            interview_criteria_r1=draft.get("interviewDimensionsR1"),
+            interview_criteria_r2=draft.get("interviewDimensionsR2"),
+            week1_project_requirement=draft.get("probationFramework"),
+            conversion_criteria=draft.get("trainingSuggestions"),
         )
-        dept = dept_row.scalar_one_or_none()
-        dept_name = dept.name if dept else None
+        db.add(position)
+        await db.flush()
 
-    draft = req.ai_draft or {}
-    import json as _json
-    # jd_content 是 VARCHAR，结构化格式的 jobDescription 需要转为 JSON 字符串
-    jd_content_raw = draft.get("jobDescription")
-    if isinstance(jd_content_raw, dict):
-        jd_content_str = _json.dumps(jd_content_raw, ensure_ascii=False)
-    elif jd_content_raw:
-        jd_content_str = str(jd_content_raw)
-    else:
-        jd_content_str = ""
-
-    position = Position(
-        name=req.position_name,
-        department=dept_name,
-        jd_content=jd_content_str,
-        jd_responsibilities=req.job_responsibilities or "",
-        jd_requirements=req.job_requirements or "",
-        jd_preferred=req.bonus_items or "",
-        education_requirement=req.education_requirement or "",
-        experience_requirement=req.work_experience or "",
-        salary_range=req.salary_range,
-        screening_criteria=draft.get("resumeScoringRules"),
-        interview_criteria_r1=draft.get("interviewDimensionsR1"),
-        interview_criteria_r2=draft.get("interviewDimensionsR2"),
-        week1_project_requirement=draft.get("probationFramework"),
-        conversion_criteria=draft.get("trainingSuggestions"),
-    )
-    db.add(position)
-    await db.flush()
-
-    competency_src = draft.get("competencyModel") or []
-    if competency_src:
-        for c in competency_src:
-            db.add(PositionCompetency(
-                position_id=position.id,
-                dimension=c.get("dimension", ""),
-                weight=c.get("weight", 0),
-                locked=True,
-            ))
-    else:
-        for dim, weight in DEFAULT_COMPETENCIES:
-            db.add(PositionCompetency(position_id=position.id, dimension=dim, weight=weight, locked=True))
+        competency_src = draft.get("competencyModel") or []
+        if competency_src:
+            for c in competency_src:
+                db.add(PositionCompetency(
+                    position_id=position.id,
+                    dimension=c.get("dimension", ""),
+                    weight=c.get("weight", 0),
+                    locked=True,
+                ))
+        else:
+            for dim, weight in DEFAULT_COMPETENCIES:
+                db.add(PositionCompetency(position_id=position.id, dimension=dim, weight=weight, locked=True))
 
     req.position_id = position.id
 
