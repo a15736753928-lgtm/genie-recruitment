@@ -48,7 +48,7 @@ class OpenAICompatibleAdapter:
             raise RuntimeError("langchain-openai 未安装，无法创建 LangChain LLM")
 
         return ChatOpenAI(
-            model=normalize_llm_model(provider.get("model", "deepseek-v4-flash")),
+            model=normalize_llm_model(provider.get("model", "mimo-v2.5")),
             api_key=api_key_plain,
             base_url=provider.get("baseUrl") or provider.get("base_url", ""),
             temperature=temperature,

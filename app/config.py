@@ -5,20 +5,21 @@ import os
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# 旧模型名 / Pro 统一映射到 Flash（用户要求不用 Pro）
+# 旧模型名全部映射到 Mimo（已弃用 DeepSeek）
 _LLM_MODEL_ALIASES: dict[str, str] = {
-    "deepseek-chat": "deepseek-v4-flash",
-    "deepseek-reasoner": "deepseek-v4-flash",
-    "deepseek-v4-pro": "deepseek-v4-flash",
-    "deepseek-pro": "deepseek-v4-flash",
+    "deepseek-chat": "mimo-v2.5",
+    "deepseek-reasoner": "mimo-v2.5",
+    "deepseek-v4-flash": "mimo-v2.5",
+    "deepseek-v4-pro": "mimo-v2.5",
+    "deepseek-pro": "mimo-v2.5",
 }
 
 
 def normalize_llm_model(model: str | None) -> str:
-    """Normalize legacy or Pro model ids to deepseek-v4-flash."""
+    """Normalize legacy model ids to mimo-v2.5."""
     name = (model or "").strip()
     if not name:
-        return "deepseek-v4-flash"
+        return "mimo-v2.5"
     return _LLM_MODEL_ALIASES.get(name.lower(), name)
 
 
@@ -27,14 +28,15 @@ class Settings(BaseSettings):
     database_url: str = ""
     database_url_sync: str = ""
 
-    # DeepSeek — set via DEEPSEEK_API_KEY in .env
+    # LLM — set via DEEPSEEK_API_KEY / DEEPSEEK_BASE_URL / DEEPSEEK_MODEL in .env
+    # 支持 Anthropic-compatible API（当前使用 Mimo）
     deepseek_api_key: str = ""
-    deepseek_base_url: str = "https://api.deepseek.com"
-    deepseek_model: str = "deepseek-v4-flash"
+    deepseek_base_url: str = "https://api.xiaomimimo.com/v1"
+    deepseek_model: str = "mimo-v2.5"
 
     # Vision (resume portrait gender inference)
     vision_enabled: bool = True
-    vision_model: str = "deepseek-v4-flash"
+    vision_model: str = "mimo-v2.5"
 
     # App
     app_host: str = "0.0.0.0"
@@ -97,7 +99,7 @@ class Settings(BaseSettings):
     @field_validator("deepseek_model", "vision_model", mode="before")
     @classmethod
     def _normalize_model_fields(cls, v):
-        return normalize_llm_model(v if v else "deepseek-v4-flash")
+        return normalize_llm_model(v if v else "mimo-v2.5")
 
     class Config:
         env_file = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")

@@ -254,8 +254,8 @@ def _vision_configured() -> bool:
     """True only when a real vision model is configured (not the bogus default)."""
     if not settings.vision_enabled or not settings.vision_model:
         return False
-    if settings.vision_model == "deepseek-v4-flash":
-        return False  # DeepSeek has no vision model; skip the failing call.
+    if settings.vision_model == "mimo-v2.5":
+        return False  # Mimo currently has no vision support; skip the failing call.
     return True
 
 

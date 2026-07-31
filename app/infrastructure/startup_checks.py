@@ -496,7 +496,8 @@ async def check_deepseek_api_reachable(settings: Settings) -> CheckResult:
 
     import httpx
 
-    url = f"{settings.deepseek_base_url.rstrip('/')}/v1/models"
+    base = settings.deepseek_base_url.rstrip("/")
+    url = f"{base}/models" if base.endswith("/v1") else f"{base}/v1/models"
     headers = {"Authorization": f"Bearer {secrets[0]}"}
     t0 = time.perf_counter()
     last_error = ""
