@@ -6,7 +6,7 @@ from typing import Optional, List, Union, Any
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import Response
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import select, func
+from sqlalchemy import select, func, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
@@ -825,6 +825,31 @@ async def publish_request(
                      actor_id=current.id, actor_name=current.username, skip_block_check=True)
     await write_audit(db, actor=current.username, action=f"发布招聘需求 → 岗位: {req.position_name}", section="recruitment")
     return ok({"positionId": str(position.id)})
+
+
+@router.delete("/recruitment-requests/{req_id}")
+async def delete_recruitment_request(
+    req_id: str,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(get_current_user),
+):
+    """删除招聘需求（无需先发布为岗位）"""
+    try:
+        rid = uuid.UUID(req_id)
+    except ValueError:
+        return not_found("招聘需求不存在")
+    row = await db.execute(select(RecruitmentRequest).where(RecruitmentRequest.id == rid))
+    req = row.scalar_one_or_none()
+    if req is None:
+        return not_found("招聘需求不存在")
+    # 清除关联的 AI 产物
+    await db.execute(
+        delete(PositionAIArtifact).where(PositionAIArtifact.recruitment_request_id == rid)
+    )
+    await db.delete(req)
+    await db.commit()
+    await write_audit(db, actor=current.username, action=f"删除招聘需求: {req.position_name}", section="recruitment")
+    return ok()
 
 
 @router.get("/recruitment-requests")
