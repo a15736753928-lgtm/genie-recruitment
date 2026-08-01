@@ -57,23 +57,7 @@ DISPLAY_HINTS: dict[str, str] = {
     "get_quarter_trends": "stats",
     "initiate_appraisal": "text",
     "update_bonus": "text",
-    # Knowledge / RAG
-    "rag_search": "list",
-    "list_knowledge": "list",
-    "get_knowledge_stats": "stats",
-    "get_knowledge_categories": "list",
-    "upload_knowledge_file": "text",
-    "create_knowledge_item": "card",
-    "update_knowledge_item": "card",
-    "delete_knowledge_item": "text",
-    "recall_test": "list",
-    "list_knowledge_bases": "list",
-    "create_knowledge_base": "card",
-    "update_knowledge_base": "card",
-    "delete_knowledge_base": "text",
-    "upload_document": "text",
-    "list_documents": "list",
-    "delete_document": "text",
+    # 知识库/RAG 工具已断开（2026-08-01）——适配项一并移除，可随工具恢复
     # Dashboard
     "get_operations_dashboard": "stats",
     # Settings

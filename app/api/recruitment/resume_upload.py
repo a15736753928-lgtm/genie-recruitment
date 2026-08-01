@@ -190,15 +190,8 @@ async def _upload_one_resume(
 
     await db.flush()
 
-    # 6) RAG 知识库入库
-    try:
-        from app.services.recruitment.resume_kb import ingest_resume_to_kb
-        await ingest_resume_to_kb(
-            db, content=content, file_name=original_name,
-            source_object_key=object_key, candidate_id=str(candidate.id),
-        )
-    except Exception as e:
-        logger.warning("简历知识库入库钩子失败: %s", e)
+    # 6) RAG 知识库入库已断开（2026-08-01）——知识库/RAG 模块停用，待决定去留。
+    #    如需恢复：还原对 ingest_resume_to_kb 的调用即可。
 
     # 7) 通知 + Webhook
     try:

@@ -62,7 +62,7 @@ TOOL_REGISTRY = {
         "description": tool_desc(
             "更新候选人状态或字段（写操作）",
             "通过初筛/安排一面/一面未通过/淘汰/改电话等",
-            "查详情(get_resume)、出题(generate_questions)、搜知识库(rag_search)",
+            "查详情(get_resume)、出题(generate_questions)",
             "「一面未通过」→ update_resume(id, status=rejected)",
         ),
         "parameters": {
@@ -655,195 +655,12 @@ TOOL_REGISTRY = {
         },
     },
 
-    # Knowledge / RAG
-    "rag_search": {
-        "name": "rag_search",
-        "description": tool_desc(
-            "语义检索知识库",
-            "查制度/规范/技术文档/公司政策",
-            "改候选人状态、查简历列表、统计人数",
-            "「公司加班制度是什么」",
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "检索查询文本"},
-                "topK": {"type": "integer", "description": "返回条数，默认5"},
-                "categoryKey": {"type": "string", "description": "分类过滤"},
-            },
-            "required": ["query"],
-        },
-    },
-    "list_knowledge": {
-        "name": "list_knowledge",
-        "description": "查询知识库素材列表。",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "categoryKey": {"type": "string"},
-                "keyword": {"type": "string"},
-                "limit": {"type": "integer", "description": "返回数量限制，默认10"},
-            },
-        },
-    },
-    "get_knowledge_stats": {
-        "name": "get_knowledge_stats",
-        "description": "获取知识库素材统计（总数/本月新增）。",
-        "parameters": {"type": "object", "properties": {}},
-    },
-    "get_knowledge_categories": {
-        "name": "get_knowledge_categories",
-        "description": "获取知识库分类树。",
-        "parameters": {"type": "object", "properties": {}},
-    },
-    "upload_knowledge_file": {
-        "name": "upload_knowledge_file",
-        "description": (
-            "确认知识库素材文件已就绪（本工具**不做任何上传**：文件在用户点「添加资料」时"
-            "就已经进了 MinIO，这里只是回显 object key 并提示进入下一步）。"
-            "调用后必须接着调 create_knowledge_item 才算真正入库。"
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "fileKey": {"type": "string", "description": "MinIO object key（如 knowledge/xxx.pdf）"},
-                "fileName": {"type": "string", "description": "原始文件名"},
-            },
-            "required": ["fileKey", "fileName"],
-        },
-    },
-    "create_knowledge_item": {
-        "name": "create_knowledge_item",
-        "description": "创建知识库素材记录（可关联已上传文件，自动入库向量化）。",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "name": {"type": "string", "description": "素材名称"},
-                "category": {"type": "string", "description": "分类key"},
-                "categoryPath": {"type": "string", "description": "分类路径"},
-                "type": {"type": "string", "description": "类型：interview/policy/tech/other"},
-                "fileId": {"type": "string", "description": "已上传文件的 object key（可选）"},
-            },
-            "required": ["name"],
-        },
-    },
-    "update_knowledge_item": {
-        "name": "update_knowledge_item",
-        "description": "更新知识库素材（名称/分类/类型）。",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "id": {"type": "string"},
-                "fields": {"type": "object", "description": "name/category/categoryPath/type"},
-            },
-            "required": ["id", "fields"],
-        },
-    },
-    "delete_knowledge_item": {
-        "name": "delete_knowledge_item",
-        "description": "删除知识库素材（同时删除向量和文件）。",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "id": {"type": "string"},
-            },
-            "required": ["id"],
-        },
-    },
-    "recall_test": {
-        "name": "recall_test",
-        "description": "知识库召回测试（检索并返回命中片段+来源）。",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string"},
-            },
-            "required": ["query"],
-        },
-    },
-
-    # RAG advanced (knowledge bases & documents)
-    "list_knowledge_bases": {
-        "name": "list_knowledge_bases",
-        "description": "列出 RAG 知识库（高级向量库）。",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "keyword": {"type": "string"},
-            },
-        },
-    },
-    "create_knowledge_base": {
-        "name": "create_knowledge_base",
-        "description": "创建 RAG 知识库。",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "name": {"type": "string"},
-                "description": {"type": "string"},
-            },
-            "required": ["name"],
-        },
-    },
-    "update_knowledge_base": {
-        "name": "update_knowledge_base",
-        "description": "更新 RAG 知识库名称/描述。",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "id": {"type": "string"},
-                "fields": {"type": "object", "description": "name/description"},
-            },
-            "required": ["id", "fields"],
-        },
-    },
-    "delete_knowledge_base": {
-        "name": "delete_knowledge_base",
-        "description": "删除 RAG 知识库及其所有文档和向量。",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "id": {"type": "string"},
-            },
-            "required": ["id"],
-        },
-    },
-    "upload_document": {
-        "name": "upload_document",
-        "description": "向 RAG 知识库上传文档并启动异步入库（向量化）。fileKey 由前端「添加资料」上传后获得。",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "kbId": {"type": "string", "description": "知识库ID"},
-                "fileKey": {"type": "string", "description": "MinIO object key"},
-                "fileName": {"type": "string", "description": "原始文件名"},
-            },
-            "required": ["kbId", "fileKey", "fileName"],
-        },
-    },
-    "list_documents": {
-        "name": "list_documents",
-        "description": "列出 RAG 知识库下的文档。",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "kbId": {"type": "string"},
-                "status": {"type": "string", "description": "按入库状态过滤，留空表示不过滤"},
-                "limit": {"type": "integer", "description": "返回数量限制，默认20"},
-            },
-        },
-    },
-    "delete_document": {
-        "name": "delete_document",
-        "description": "删除 RAG 文档及其向量分块。",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "id": {"type": "string", "description": "文档ID"},
-            },
-            "required": ["id"],
-        },
-    },
+    # ── 知识库/RAG 工具已断开（2026-08-01）────────────────────────────
+    # rag_search / list_knowledge / create_knowledge_item / recall_test /
+    # list_knowledge_bases / upload_document 等 16 个知识库工具的注册已移除。
+    # 定义仍保留在 git 历史与本文件旧版本；如后期决定恢复，从 git 历史
+    # 还原 TOOL_REGISTRY 对应键 + TOOL_PERMISSIONS 登记 + graph.py 权重 +
+    # tool_handlers/knowledge.py 注册即可。
 
     # Dashboard
     "get_operations_dashboard": {
@@ -957,30 +774,13 @@ TOOL_PERMISSIONS: dict[str, str] = {
     "initiate_appraisal": "talent:manage",
     "get_bonus_info": "salary:view",
     "update_bonus": "salary:manage",
-    # ── 知识库写管理（admin 专属；读 list_knowledge/rag_search 等未列入=公共）──
-    "upload_knowledge_file": "system:manage",
-    "create_knowledge_item": "system:manage",
-    "update_knowledge_item": "system:manage",
-    "delete_knowledge_item": "system:manage",
-    "create_knowledge_base": "system:manage",
-    "update_knowledge_base": "system:manage",
-    "delete_knowledge_base": "system:manage",
-    "upload_document": "system:manage",
-    "delete_document": "system:manage",
+    # ── 知识库/RAG 工具的权限登记已随工具摘除（2026-08-01）──
     # ── 系统设置 ──
     "get_settings": "system:manage",
     "update_settings": "system:manage",
-    # ── 系统/调试 ──
-    "recall_test": "system:manage",
     # ── 公共只读工具（显式标记，所有登录用户可见）──
     "list_positions": PUBLIC_TOOL_PERMISSION,
     "get_position": PUBLIC_TOOL_PERMISSION,
-    "list_knowledge": PUBLIC_TOOL_PERMISSION,
-    "list_knowledge_bases": PUBLIC_TOOL_PERMISSION,
-    "list_documents": PUBLIC_TOOL_PERMISSION,
-    "get_knowledge_categories": PUBLIC_TOOL_PERMISSION,
-    "get_knowledge_stats": PUBLIC_TOOL_PERMISSION,
-    "rag_search": PUBLIC_TOOL_PERMISSION,
     "get_operations_dashboard": PUBLIC_TOOL_PERMISSION,
 }
 

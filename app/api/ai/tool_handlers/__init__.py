@@ -62,7 +62,7 @@ def _bootstrap(reg: ToolHandlerRegistry) -> None:
         interview,
         probation,
         performance,
-        knowledge,
+        # knowledge 知识库/RAG handlers 已断开（2026-08-01），文件保留，恢复时加回
         dashboard,
         settings,
     )
@@ -71,6 +71,6 @@ def _bootstrap(reg: ToolHandlerRegistry) -> None:
     interview.register_handlers(reg)
     probation.register_handlers(reg)
     performance.register_handlers(reg)
-    knowledge.register_handlers(reg)
+    # knowledge.register_handlers(reg)  # 已断开（2026-08-01）
     dashboard.register_handlers(reg)
     settings.register_handlers(reg)

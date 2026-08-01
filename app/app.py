@@ -283,8 +283,7 @@ from app.api.recruitment import requests as recruitment_requests_router, scoring
 # 人才评估
 from app.api.talent import interview, probation, performance, phase1_interview, phase2 as phase2_probation, phase4 as phase4_talent
 from app.api.talent import offer as offer_router_module
-# 知识库
-from app.api.knowledge import knowledge_base as knowledge, rag
+# 知识库/RAG 路由已断开（2026-08-01）——knowledge_base 与 rag 模块停用，文件保留待定去留
 # AI 功能 — 唯一 Agent 入口（v1/v2/v3 已合并，agent_chat_v2 已删除）
 from app.api.ai import agent_chat as ai_agent
 # 第三期: 任务积分
@@ -312,13 +311,13 @@ app.include_router(phase2_probation.router, prefix="/api")  # 第二期: 试用�
 app.include_router(points_router.router, prefix="/api")    # 第三期: 任务积分奖惩申诉
 app.include_router(phase4_talent.router, prefix="/api")    # 第四期: 人才池/晋级/期权/看板
 app.include_router(performance.router, prefix="/api")
-app.include_router(knowledge.router, prefix="/api")
+# app.include_router(knowledge.router, prefix="/api")  # 已断开（2026-08-01）
 app.include_router(dashboard.router, prefix="/api")
 app.include_router(ai_agent.router, prefix="/api")
 app.include_router(settings_router.router, prefix="/api")
 app.include_router(export_router.router, prefix="/api")
 app.include_router(llm_config_router.router)
-app.include_router(rag.router)  # RAG endpoints (prefix defined in router)
+# app.include_router(rag.router)  # RAG endpoints (prefix defined in router) — 已断开（2026-08-01）
 
 
 @app.get("/api/health")

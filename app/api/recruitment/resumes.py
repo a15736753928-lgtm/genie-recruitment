@@ -55,6 +55,83 @@ logger = logging.getLogger(__name__)
 
 os.makedirs(settings.upload_dir, exist_ok=True)
 
+# ── 重新解析异步任务 ──────────────────────────────────────────
+# reanalyze 会串行调用多次 LLM（视觉抽取 → LLM 解析 → 8 维评分），单次请求
+# 动辄 1~2 分钟，远超前端默认超时（HTTP 层 60s / 前端 120s）。改为后台任务 +
+# 轮询状态：POST /resumes/{id}/reanalyze 立即返回任务状态，前端轮询
+# /resumes/{id}/reanalyze-status 直到 completed/failed。
+#
+# 任务状态放在进程内存单例表。这是低频显式操作，单 worker 下可靠；即使进程
+# 重启导致任务状态丢失，只要候选人已成功落库解析+评分，前端会兜底用现有数据。
+# 不落库避免了为加列而 rebuild 数据库（会清空全家数据）。
+_REANALYZE_TASKS: dict[str, dict] = {}
+_REANALYZE_TASK_LOCK = asyncio.Lock()
+
+
+def _reanalyze_task_state(resume_id: str) -> dict | None:
+    return _REANALYZE_TASKS.get(str(resume_id))
+
+
+async def _set_reanalyze_task(resume_id: str, **fields) -> None:
+    """更新任务状态并提交到内存表（带锁防止并发写覆盖）。"""
+    key = str(resume_id)
+    async with _REANALYZE_TASK_LOCK:
+        state = _REANALYZE_TASKS.setdefault(
+            key, {"status": "pending", "progress": 0, "stage": "排队中", "message": ""}
+        )
+        state.update(fields)
+
+
+async def _run_reanalyze_in_background(resume_id: str, position_name: str) -> None:
+    """后台执行重新解析 + 8 维评分，用独立异步会话（请求会话已随响应关闭）。
+
+    任意一步失败都落 failed 状态，避免前端一直轮询。
+    """
+    key = str(resume_id)
+    try:
+        async with async_session_factory() as task_db:
+            await _set_reanalyze_task(resume_id, status="running", progress=10, stage="读取候选人")
+            result = await task_db.execute(
+                select(Candidate)
+                .options(*CANDIDATE_LOAD_OPTIONS)
+                .where(Candidate.id == resume_id)
+            )
+            candidate = result.scalar_one_or_none()
+            if not candidate:
+                await _set_reanalyze_task(resume_id, status="failed", progress=100, message="候选人不存在")
+                return
+            if not candidate.resume_file:
+                await _set_reanalyze_task(resume_id, status="failed", progress=100, message="该候选人没有上传简历文件")
+                return
+
+            await _set_reanalyze_task(resume_id, status="running", progress=30, stage="AI 解析简历中")
+            error = await run_resume_parse(
+                candidate, position_name or (candidate.position.name if candidate.position else ""), task_db
+            )
+            if error and not is_candidate_parsed(candidate):
+                await _set_reanalyze_task(resume_id, status="failed", progress=100, message=f"解析失败: {error}")
+                return
+            await task_db.flush()
+
+            # 重新解析后自动触发 8 维权威评分
+            await _set_reanalyze_task(resume_id, status="running", progress=75, stage="8 维 AI 评分中")
+            try:
+                from app.api.recruitment.scoring import auto_score_after_upload
+                await auto_score_after_upload(
+                    task_db, candidate,
+                    position_id=candidate.position_id,
+                )
+            except Exception as e:
+                logger.warning("后台 reanalyze 自动 8 维评分失败: %s", e, exc_info=True)
+
+            await task_db.commit()
+            await _set_reanalyze_task(resume_id, status="completed", progress=100, stage="已完成")
+            logger.info("后台 reanalyze 完成 candidate=%s", resume_id)
+
+    except Exception as exc:
+        logger.error("后台 reanalyze 异常 candidate=%s: %s", resume_id, exc, exc_info=True)
+        await _set_reanalyze_task(resume_id, status="failed", progress=100, message=f"后台处理异常: {exc}")
+
 
 CANDIDATE_LOAD_OPTIONS = (
     selectinload(Candidate.position),
@@ -570,6 +647,12 @@ async def update_resume(
 
 @router.post("/resumes/{resume_id}/reanalyze")
 async def reanalyze_resume(resume_id: str, db: AsyncSession = Depends(get_db)):
+    """重新解析简历并重新生成 AI 评分——异步任务。
+
+    立即返回任务状态；前端轮询 ``/resumes/{resume_id}/reanalyze-status``
+    直到 ``completed`` 后再刷新候选人数据。避免同步串行多次 LLM 调用
+    导致请求超时。
+    """
     result = await db.execute(
         select(Candidate)
         .options(*CANDIDATE_LOAD_OPTIONS)
@@ -582,50 +665,39 @@ async def reanalyze_resume(resume_id: str, db: AsyncSession = Depends(get_db)):
     if not candidate.resume_file:
         return fail(400, "该候选人没有上传简历文件")
 
-    error = await run_resume_parse(
-        candidate, candidate.position.name if candidate.position else "", db
-    )
-    if error and not is_candidate_parsed(candidate):
-        return fail(500, f"解析失败: {error}")
+    # 已在后台解析/评分中则不重复触发
+    state = _reanalyze_task_state(resume_id)
+    if state and state["status"] in ("pending", "running"):
+        return ok({**state, "resumeId": str(resume_id)})
 
-    await db.flush()
+    position_name = candidate.position.name if candidate.position else ""
+    await _set_reanalyze_task(resume_id, status="pending", progress=0, stage="排队中", message="")
+    asyncio.create_task(_run_reanalyze_in_background(resume_id, position_name))
 
-    # 重新解析后也自动触发 8 维评分
-    try:
-        from app.api.recruitment.scoring import auto_score_after_upload
-        logger.info("reanalyze: 准备调用 auto_score, candidate=%s, position_id=%s",
-                     candidate.id, candidate.position_id)
-        await auto_score_after_upload(
-            db, candidate,
-            position_id=candidate.position_id,
-        )
-    except Exception as e:
-        logger.warning("重新解析后自动8维评分失败: %s", e, exc_info=True)
+    return ok({
+        "resumeId": str(resume_id),
+        "status": "pending",
+        "progress": 0,
+        "stage": "排队中",
+        "message": "",
+    })
 
-    await db.flush()
-    candidate = await load_candidate(db, resume_id)
-    if not candidate:
-        return fail(500, "候选人加载失败")
 
-    # 顺带返回 score 数据，避免前端再发一次可能 401 的请求
-    score_data = None
-    try:
-        from app.models.phase1 import ResumeScore
-        from app.api.recruitment.scoring import serialize_score
-        score_row = await db.execute(
-            select(ResumeScore).where(ResumeScore.candidate_id == candidate.id)
-            .order_by(ResumeScore.created_at.desc()).limit(1)
-        )
-        score_obj = score_row.scalar_one_or_none()
-        if score_obj:
-            score_data = serialize_score(score_obj)
-    except Exception:
-        pass
-
-    result = serialize_candidate(candidate)
-    if score_data:
-        result["scoreDetail"] = score_data
-    return ok(result)
+@router.get("/resumes/{resume_id}/reanalyze-status")
+async def get_reanalyze_status(resume_id: str, db: AsyncSession = Depends(get_db)):
+    """轮询重新解析任务的后台进度。"""
+    state = _reanalyze_task_state(resume_id)
+    if not state:
+        # 任务不存在：可能进程重启丢失。此时候选人已完成解析或从未触发，
+        # 语义上按「已完成」处理，前端据此直接刷新现有数据即可。
+        return ok({
+            "resumeId": str(resume_id),
+            "status": "completed",
+            "progress": 100,
+            "stage": "已完成",
+            "message": "",
+        })
+    return ok({**state, "resumeId": str(resume_id)})
 
 
 @router.delete("/resumes/{resume_id}")

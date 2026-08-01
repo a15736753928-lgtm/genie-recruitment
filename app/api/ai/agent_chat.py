@@ -1273,15 +1273,8 @@ async def upload_material(
         if candidate:
             parse_msg = await run_resume_parse(candidate, position_name, db)
 
-        # 5) RAG knowledge-base ingest
-        try:
-            from app.services.recruitment.resume_kb import ingest_resume_to_kb
-            await ingest_resume_to_kb(
-                db, content=content, file_name=filename,
-                source_object_key=object_key, candidate_id=str(candidate.id),
-            )
-        except Exception:
-            pass
+        # 5) RAG knowledge-base ingest 已断开（2026-08-01）——知识库/RAG 模块停用
+        pass
 
         # 6) Notifications
         try:
@@ -1654,7 +1647,6 @@ async def agent_chat(
 
             _INGEST_UPLOAD_TOOLS = frozenset({
                 "upload_resume", "batch_parse_resumes",
-                "upload_knowledge_file", "create_knowledge_item",
             })
             if ingestion_completed:
                 langchain_tools = [
@@ -1668,7 +1660,7 @@ async def agent_chat(
                 system_prompt += (
                     "\n\n[系统] 附件已由前端自动完成批量入库，候选人记录已写入数据库。"
                     "请仅根据附件资料向用户汇总入库结果，禁止再调用 upload_resume、"
-                    "batch_parse_resumes、upload_knowledge_file 等上传/入库工具。"
+                    "batch_parse_resumes 等上传/入库工具。"
                 )
 
             # ── Context compaction: keep history within token budget ──
