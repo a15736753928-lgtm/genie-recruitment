@@ -380,6 +380,11 @@ async def _run_parse(
     return None
 
 
+# 后台评分全局并发限制：批量上传会为每份简历创建后台评分任务，若全部并发
+# 会再次打爆 DeepSeek。限制同时最多 3 个评分任务。
+_SCORE_SEM = asyncio.Semaphore(3)
+
+
 async def _score_candidate_background(
     candidate_id: str,
     resume_text: str,
@@ -392,7 +397,8 @@ async def _score_candidate_background(
     使用独立 DB 会话（SQLAlchemy async session 不支持并发共享同一 session），
     任一失败只记日志不影响其他。不阻塞上传响应。
     """
-    from app.database import async_session_factory
+    async with _SCORE_SEM:
+        from app.database import async_session_factory
 
     async def _dimensions():
         async with async_session_factory() as db:

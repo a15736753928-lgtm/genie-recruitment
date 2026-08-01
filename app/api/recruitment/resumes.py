@@ -391,7 +391,10 @@ async def batch_upload_resumes(
             "file_ext": file_ext,
         })
 
-    sem = asyncio.Semaphore(5)
+    # 份间串行：简历之间不并发，只在单份简历内部做 8 路并行。
+    # 之前用 5 份并发 × 8 路 = 瞬时 40 个 DeepSeek 调用，直接把并发打爆、
+    # 后台评分大面积失败。改成逐份处理，每份最多 8 路并行，稳定可控。
+    sem = asyncio.Semaphore(1)
 
     async def _process_one(payload: dict) -> dict:
         async with sem:
