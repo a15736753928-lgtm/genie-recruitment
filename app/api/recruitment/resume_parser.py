@@ -46,8 +46,12 @@ def resolve_resume_file_path(stored_path: str) -> Optional[str]:
         return None
 
 
-def extract_text_from_file(file_path: str) -> Tuple[str, Optional[str]]:
-    """Extract text from PDF, DOCX, or plain text files. Returns (text, error)."""
+async def extract_text_from_file(file_path: str) -> Tuple[str, Optional[str]]:
+    """Extract text from PDF/image via MIMO multimodal vision; DOCX falls back.
+
+    PDF 文字层抽取已移除 —— 无论文本 PDF 还是扫描件，统一渲染成图交给 MIMO
+    多模态识别（单一入口，降低复杂度）。
+    """
     with minio_storage.resolved_local_path(file_path) as resolved:
         if not resolved:
             return "", f"简历文件不存在: {file_path}"
@@ -55,11 +59,8 @@ def extract_text_from_file(file_path: str) -> Tuple[str, Optional[str]]:
         ext = os.path.splitext(resolved)[1].lower()
         try:
             if ext == ".pdf":
-                import fitz
-                text = "\n".join(page.get_text() for page in fitz.open(resolved)).strip()
-                if not text:
-                    return "", "PDF 未提取到文本，可能是扫描件或图片简历，请上传可搜索文本的 PDF"
-                return text, None
+                from app.services.ai.vision import extract_text_from_vision
+                return await extract_text_from_vision(resolved)
             if ext in (".docx",):
                 from docx import Document
                 doc = Document(resolved)
@@ -69,6 +70,9 @@ def extract_text_from_file(file_path: str) -> Tuple[str, Optional[str]]:
                 return text, None
             if ext == ".doc":
                 return "", "暂不支持旧版 .doc 格式，请转换为 .docx 或 PDF 后重新上传"
+            if ext in (".jpg", ".jpeg", ".png", ".webp", ".bmp"):
+                from app.services.ai.vision import extract_text_from_vision
+                return await extract_text_from_vision(resolved)
             if ext in (".txt", ".md"):
                 with open(resolved, "r", encoding="utf-8", errors="ignore") as f:
                     return f.read().strip(), None
@@ -246,16 +250,16 @@ def normalize_experience_resume(value, *, has_work_history: bool = False) -> str
     return text
 
 
-def augment_gender_from_portrait(parsed: dict, resume_file: str) -> dict:
-    """When text parsing cannot determine gender, infer it from resume headshot."""
+async def augment_gender_from_portrait(parsed: dict, resume_file: str) -> dict:
+    """When text parsing cannot determine gender, infer it from resume headshot (multimodal)."""
     if parsed.get("gender") in ("男", "女"):
         return parsed
 
     with minio_storage.resolved_local_path(resume_file or "") as resolved:
         if not resolved:
             return parsed
-        from app.services.recruitment.portrait_gender import infer_gender_from_resume_file
-        portrait_gender = infer_gender_from_resume_file(resolved, client=None)
+        from app.services.ai.vision import infer_gender_from_vision
+        portrait_gender = await infer_gender_from_vision(resolved)
         if portrait_gender in ("男", "女"):
             parsed["gender"] = portrait_gender
     return parsed

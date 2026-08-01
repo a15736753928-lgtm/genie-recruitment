@@ -29,11 +29,8 @@ llama-index-core>=0.12.0
 
 # File Processing
 python-docx==1.1.2
-PyMuPDF>=1.24.0
-rapidocr-onnxruntime>=1.3.0
+PyMuPDF>=1.24.0  # PDF 渲染成图（多模态识别输入，不再用于文字层抽取）
 reportlab>=4.0  # PDF 生成（岗位说明书等正式文档）
-# Portrait gender recognition (resume headshot -> male/female)
-opencv-python-headless>=4.10.0
 Pillow>=10.0.0
 
 # CORS & Utils

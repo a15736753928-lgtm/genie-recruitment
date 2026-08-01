@@ -77,7 +77,7 @@ async def _upload_one_resume(
     except Exception as e:
         return _fail("failed", 500, f"简历存储失败: {e}")
 
-    resume_text, extract_error = extract_text_from_file(object_key)
+    resume_text, extract_error = await extract_text_from_file(object_key)
     if extract_error or not resume_text.strip():
         try:
             await asyncio.to_thread(minio_storage.delete_object, object_key)
@@ -257,7 +257,7 @@ async def _extract_and_parse(
 
     text = resume_text
     if text is None:
-        text, extract_error = extract_text_from_file(object_key)
+        text, extract_error = await extract_text_from_file(object_key)
         if extract_error:
             return None, extract_error
     if not (text or "").strip():
@@ -270,7 +270,7 @@ async def _extract_and_parse(
         return None, "AI 未能解析简历内容"
 
     parsed = enrich_parsed_fields(parsed, text)
-    parsed = await asyncio.to_thread(augment_gender_from_portrait, parsed, object_key or "")
+    parsed = await augment_gender_from_portrait(parsed, object_key or "")
     return parsed, parse_error
 
 
@@ -307,7 +307,7 @@ async def _run_parse(
     if not ai_enabled:
         return "AI 简历分析已关闭，仅保存文件"
 
-    text, extract_error = extract_text_from_file(candidate.resume_file)
+    text, extract_error = await extract_text_from_file(candidate.resume_file)
     if extract_error:
         return extract_error
     if not text.strip():

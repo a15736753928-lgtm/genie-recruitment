@@ -1167,7 +1167,7 @@ async def upload_material(
         tmp_path = tf.name
 
     try:
-        text, extract_error = extract_text_from_file(tmp_path)
+        text, extract_error = await extract_text_from_file(tmp_path)
     finally:
         try:
             os.remove(tmp_path)
@@ -1479,7 +1479,7 @@ async def agent_chat(
                     elif fp:
                         lines.append(f"\n[{mat.type}] {mat.name} ({id_line})")
                         try:
-                            file_text, _ = extract_text_from_file(fp)
+                            file_text, _ = await extract_text_from_file(fp)
                             if file_text.strip():
                                 truncated = file_text[:2000] + ("..." if len(file_text) > 2000 else "")
                                 lines.append(f"内容:\n{truncated}")

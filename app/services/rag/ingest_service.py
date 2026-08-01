@@ -43,49 +43,39 @@ logger = logging.getLogger(__name__)
 # Per-thread ingest overrides (loaded from system_settings in worker)
 _ingest_runtime = threading.local()
 
-# OCR fallback threshold: trigger OCR when fast extraction yields fewer chars
-_OCR_FALLBACK_THRESHOLD = settings.ocr_fallback_threshold
 
-# RapidOCR singleton
-_ocr = None
-
-
-def _ocr_enabled() -> bool:
-    return getattr(_ingest_runtime, "ocr_enabled", settings.ocr_enabled)
-
-
-# ── File Parsing (3-layer pipeline) ─────────────────────────
+# ── File Parsing (multimodal, no local OCR) ─────────────────
 
 def _extract_text(file_path: str) -> str:
-    """Parse file to text with format-specific extractors.
+    """Parse file to text via unified multimodal vision (no local OCR).
 
-    Layer 1: Fast text extraction (PyMuPDF, python-docx, raw read)
-    Layer 2: OCR fallback for images and low-text documents
-    Layer 3: Merge results
+    PDF → render pages → MIMO vision. Images → MIMO vision directly.
+    DOCX / plain text → native text read (not image-based; avoids token waste).
     """
     ext = Path(file_path).suffix.lower()
 
-    # ── Plain text: direct decode ──
+    # ── Plain text / DOCX: native read ──
     if ext in (".txt", ".md", ".markdown"):
         return _read_text_file(file_path)
+    if ext == ".docx":
+        return _extract_docx_text(file_path)
 
-    # ── Images: directly to OCR ──
-    if ext in (".png", ".jpg", ".jpeg"):
+    # ── Images: direct multimodal vision ──
+    if ext in (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"):
         with open(file_path, "rb") as f:
-            return _ocr_image(f.read())
+            from app.services.ai.vision import extract_text_from_image_bytes_sync
+            return extract_text_from_image_bytes_sync(f.read())
 
-    # ── PDF / DOCX: fast path first, OCR fallback ──
-    fast_text = _extract_text_fast(file_path, ext)
-    if len(fast_text.strip()) >= _OCR_FALLBACK_THRESHOLD:
-        return fast_text
+    # ── PDF: render to pages → multimodal vision ──
+    if ext == ".pdf":
+        from app.services.ai.vision import render_pdf_pages_to_png, extract_text_from_images_sync
+        pages = render_pdf_pages_to_png(file_path)
+        if not pages:
+            logger.warning("PDF 渲染失败，无法多模态识别: %s", os.path.basename(file_path))
+            return ""
+        return extract_text_from_images_sync(pages)
 
-    logger.info(
-        "快速提取文本不足（%d 字符），触发 OCR 兜底: %s",
-        len(fast_text.strip()),
-        os.path.basename(file_path),
-    )
-    ocr_text = _ocr_document(file_path, ext)
-    return _merge_texts(fast_text, ocr_text)
+    return ""
 
 
 def _read_text_file(path: str) -> str:
@@ -99,35 +89,8 @@ def _read_text_file(path: str) -> str:
     return ""
 
 
-def _extract_text_fast(path: str, ext: str) -> str:
-    """Layer 1: Fast native text extraction."""
-    if ext == ".pdf":
-        return _extract_pdf_text(path)
-    elif ext == ".docx":
-        return _extract_docx_text(path)
-    return ""
-
-
-def _extract_pdf_text(path: str) -> str:
-    """Extract text from PDF using PyMuPDF (fast path)."""
-    try:
-        import fitz
-        texts = []
-        for page in fitz.open(path):
-            try:
-                t = page.get_text()
-                if t:
-                    texts.append(t.strip())
-            except Exception:
-                pass
-        return "\n\n".join(texts)
-    except Exception as e:
-        logger.debug("PyMuPDF 解析失败: %s", e)
-        return ""
-
-
 def _extract_docx_text(path: str) -> str:
-    """Extract text from DOCX using python-docx (fast path)."""
+    """Extract text from DOCX using python-docx (native text, not image OCR)."""
     try:
         from docx import Document
         doc = Document(path)
@@ -135,128 +98,6 @@ def _extract_docx_text(path: str) -> str:
     except Exception as e:
         logger.debug("python-docx 解析失败: %s", e)
         return ""
-
-
-# ── Layer 2: OCR fallback ──────────────────────────────────
-
-def _ocr_document(path: str, ext: str) -> str:
-    """OCR for documents with insufficient text."""
-    if ext == ".pdf":
-        return _ocr_pdf(path)
-    elif ext == ".docx":
-        return _ocr_docx_images(path)
-    return ""
-
-
-def _ocr_pdf(path: str) -> str:
-    """Render PDF pages to images, then OCR each page."""
-    if not _ocr_enabled():
-        return ""
-
-    try:
-        import fitz
-        doc = fitz.open(path)
-        texts = []
-
-        for i, page in enumerate(doc):
-            # Check if page already has good text
-            page_text = (page.get_text() or "").strip()
-            if len(page_text) >= _OCR_FALLBACK_THRESHOLD:
-                texts.append(page_text)
-                continue
-
-            # Render page to image → OCR
-            try:
-                pix = doc[i].get_pixmap(dpi=200)
-                ocr_text = _ocr_image(pix.tobytes("png"))
-                if ocr_text.strip():
-                    texts.append(ocr_text)
-                elif page_text:
-                    texts.append(page_text)
-            except Exception:
-                if page_text:
-                    texts.append(page_text)
-
-        doc.close()
-        return "\n\n".join(texts)
-    except ImportError:
-        logger.debug("PyMuPDF (fitz) 不可用，跳过 PDF OCR")
-        return ""
-    except Exception as e:
-        logger.debug("PDF OCR 失败: %s", e)
-        return ""
-
-
-def _ocr_docx_images(path: str) -> str:
-    """Extract embedded images from DOCX and OCR them."""
-    if not _ocr_enabled():
-        return ""
-
-    try:
-        from docx import Document
-        doc = Document(path)
-        texts = []
-
-        for rel in doc.part.rels.values():
-            if "image" not in rel.reltype:
-                continue
-            try:
-                img_bytes = rel.target_part.blob
-                ocr_text = _ocr_image(img_bytes)
-                if ocr_text.strip():
-                    texts.append(ocr_text.strip())
-            except Exception:
-                pass
-
-        return "\n\n".join(texts)
-    except Exception as e:
-        logger.debug("DOCX 图片 OCR 失败: %s", e)
-        return ""
-
-
-def _ocr_image(img_data: bytes) -> str:
-    """OCR a single image using RapidOCR (PP-OCR v4)."""
-    if not _ocr_enabled():
-        return ""
-
-    ocr = _get_ocr()
-    if ocr is None:
-        return ""
-
-    try:
-        result, _ = ocr(img_data)
-        if not result:
-            return ""
-        lines = [item[1].strip() for item in result if item[1] and item[1].strip()]
-        return "\n".join(lines)
-    except Exception as e:
-        logger.debug("OCR 识别失败: %s", e)
-        return ""
-
-
-def _get_ocr():
-    """RapidOCR global singleton, lazy-loaded on first call."""
-    global _ocr
-    if _ocr is None:
-        try:
-            from rapidocr_onnxruntime import RapidOCR
-            _ocr = RapidOCR()
-            logger.info("RapidOCR 模型加载完成")
-        except ImportError:
-            logger.warning("rapidocr-onnxruntime 未安装，OCR 功能不可用")
-            return None
-    return _ocr
-
-
-def _merge_texts(fast_text: str, ocr_text: str) -> str:
-    """Merge fast extraction and OCR results, preferring OCR when richer."""
-    ocr = ocr_text.strip()
-    if len(ocr) >= _OCR_FALLBACK_THRESHOLD:
-        return ocr
-    fast = fast_text.strip()
-    if fast:
-        return fast
-    return ocr  # fallback: whatever we have
 
 
 # ── Background Ingestion ────────────────────────────────────
