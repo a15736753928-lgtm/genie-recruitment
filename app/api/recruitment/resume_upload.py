@@ -401,11 +401,21 @@ async def _score_candidate_background(
                 return
             from app.services.resume_scoring import score_all
             analysis = parsed.setdefault("analysis", {})
-            if isinstance(analysis, dict):
-                dimensions = await score_all(resume_text, parsed, position_name)
-                if dimensions and cand.ai_analysis:
-                    cand.ai_analysis.dimensions = dimensions
-                await db.commit()
+            if not isinstance(analysis, dict):
+                return
+            for attempt in range(3):
+                try:
+                    dimensions = await score_all(resume_text, parsed, position_name)
+                    if dimensions and cand.ai_analysis:
+                        cand.ai_analysis.dimensions = dimensions
+                    await db.commit()
+                    return
+                except Exception as e:
+                    if attempt < 2:
+                        logger.warning("4维打分第%d次失败（重试）: %s", attempt + 1, e)
+                        await asyncio.sleep(1.0 * (attempt + 1))
+                    else:
+                        logger.warning("4维打分重试3次仍失败: %s", e)
 
     async def _eight_dims():
         async with async_session_factory() as db:
@@ -413,8 +423,17 @@ async def _score_candidate_background(
             if not cand:
                 return
             from app.api.recruitment.scoring import auto_score_after_upload
-            await auto_score_after_upload(db, cand, position_id=cand.position_id)
-            await db.commit()
+            for attempt in range(3):
+                try:
+                    await auto_score_after_upload(db, cand, position_id=cand.position_id)
+                    await db.commit()
+                    return
+                except Exception as e:
+                    if attempt < 2:
+                        logger.warning("8维评分第%d次失败（重试）: %s", attempt + 1, e)
+                        await asyncio.sleep(1.0 * (attempt + 1))
+                    else:
+                        logger.warning("8维评分重试3次仍失败: %s", e)
 
     async def _gender_fallback():
         # 文本正则 + 解析都没拿到性别时才走 MIMO 视觉补

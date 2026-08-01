@@ -138,15 +138,10 @@ async def classify_with_llm(text: str) -> Tuple[bool, str, str]:
         max_tokens=256,
         extra_body={"thinking": {"type": "disabled"}},  # deepseek-v4-flash 关闭思考提速
     )
-    raw = (response.choices[0].message.content or "").strip()
-    if raw.startswith("```json"):
-        raw = raw[7:]
-    if raw.startswith("```"):
-        raw = raw[3:]
-    if raw.endswith("```"):
-        raw = raw[:-3]
-
-    payload = json.loads(raw.strip())
+    from app.utils.llm_json import extract_json_object
+    payload = extract_json_object((response.choices[0].message.content or "") or "")
+    if not isinstance(payload, dict):
+        raise ValueError("模型未返回可解析的 JSON")
     is_resume = bool(payload.get("isResume"))
     reason = str(payload.get("reason") or "").strip()
     document_type = str(payload.get("documentType") or "其他").strip()

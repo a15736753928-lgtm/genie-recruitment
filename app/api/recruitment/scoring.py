@@ -92,11 +92,23 @@ async def compute_8d_score(db: AsyncSession, candidate: Candidate) -> Optional[d
         '"evidence":["..."],"strengths":["..."],"risks":["..."],'
         '"missing_information":["..."],"recommended_action":"...","requires_human_confirmation":true}'
     )
-    resp_text = await llm_chat([{"role": "user", "content": prompt}], max_tokens=2048)
-    raw = extract_json_object(resp_text)
-    if raw is None:
-        logger.warning("8维评分 LLM 返回无法解析，原始文本前200字: %s", (resp_text or "")[:200])
-    return raw
+    # DeepSeek 批量并发下偶发空输出/失败，重试 3 次（空输出重试，异常也重试）
+    import asyncio as _asyncio
+    for attempt in range(3):
+        try:
+            resp_text = await llm_chat([{"role": "user", "content": prompt}], max_tokens=2048)
+        except Exception as e:
+            logger.warning("8维评分 LLM 调用失败（重试 %d/3）: %s", attempt + 1, e)
+            if attempt < 2:
+                await _asyncio.sleep(1.0 * (attempt + 1))
+                continue
+            return None
+        raw = extract_json_object(resp_text)
+        if raw is not None:
+            return raw
+        logger.warning("8维评分 LLM 空输出（重试 %d/3）", attempt + 1)
+        await _asyncio.sleep(1.0 * (attempt + 1))
+    return None
 
 
 async def _save_score(

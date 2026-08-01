@@ -321,6 +321,7 @@ async def augment_gender_from_portrait(parsed: dict, resume_file: str) -> dict:
 # ── LLM JSON extraction ─────────────────────────────────────
 
 from app.utils.json_utils import extract_json_from_text as _extract_json_from_llm
+from app.utils.llm_json import extract_json_object as _extract_json_obj
 
 
 # ── LLM Resume Parsing ──────────────────────────────────────
@@ -358,7 +359,7 @@ async def _parse_profile(text: str, position_hint: str) -> dict:
 
 只返回JSON。严格要求：只能提取原文明确出现的信息，不得臆造。age留null，识别到出生日期填birthDate。"""
     raw = await llm_chat(messages=[{"role": "user", "content": prompt}], temperature=0.3, max_tokens=4096)
-    return json.loads(_extract_json_from_llm(raw))
+    return _extract_json_obj(raw) or {}
 
 
 async def _parse_extra(text: str) -> dict:
@@ -382,7 +383,7 @@ async def _parse_extra(text: str) -> dict:
 
 只返回JSON。严格只提取原文明确出现的信息，不得推测。"""
     raw = await llm_chat(messages=[{"role": "user", "content": prompt}], temperature=0.3, max_tokens=2048)
-    return json.loads(_extract_json_from_llm(raw))
+    return _extract_json_obj(raw) or {}
 
 
 async def _parse_analysis(text: str, position_hint: str) -> dict:
@@ -409,7 +410,7 @@ async def _parse_analysis(text: str, position_hint: str) -> dict:
 
 只返回JSON。注意：不要输出dimensions字段。keywords恰好5个，不足用技能补。"""
     raw = await llm_chat(messages=[{"role": "user", "content": prompt}], temperature=0.3, max_tokens=2048)
-    return json.loads(_extract_json_from_llm(raw))
+    return _extract_json_obj(raw) or {}
 
 
 # ── 细拆解析（2026-08-01）：把 profile/analysis 两个大 JSON 拆成多个聚焦小 JSON，
@@ -441,7 +442,7 @@ async def _parse_basic(text: str, position_hint: str) -> dict:
 
 只返回JSON。严格要求：只能提取原文明确出现的信息，不得臆造。age留null，识别到出生日期填birthDate。"""
     raw = await llm_chat(messages=[{"role": "user", "content": prompt}], temperature=0.3, max_tokens=1024)
-    return json.loads(_extract_json_from_llm(raw))
+    return _extract_json_obj(raw) or {}
 
 
 async def _parse_education(text: str) -> dict:
@@ -457,7 +458,7 @@ async def _parse_education(text: str) -> dict:
 
 只返回JSON。严格只提取原文明确出现的信息。"""
     raw = await llm_chat(messages=[{"role": "user", "content": prompt}], temperature=0.3, max_tokens=1024)
-    return json.loads(_extract_json_from_llm(raw))
+    return _extract_json_obj(raw) or {}
 
 
 async def _parse_work(text: str) -> dict:
@@ -473,7 +474,7 @@ async def _parse_work(text: str) -> dict:
 
 只返回JSON。严格只提取原文明确出现的信息。"""
     raw = await llm_chat(messages=[{"role": "user", "content": prompt}], temperature=0.3, max_tokens=1024)
-    return json.loads(_extract_json_from_llm(raw))
+    return _extract_json_obj(raw) or {}
 
 
 async def _parse_project(text: str) -> dict:
@@ -489,7 +490,7 @@ async def _parse_project(text: str) -> dict:
 
 只返回JSON。严格只提取原文明确出现的信息。"""
     raw = await llm_chat(messages=[{"role": "user", "content": prompt}], temperature=0.3, max_tokens=1024)
-    return json.loads(_extract_json_from_llm(raw))
+    return _extract_json_obj(raw) or {}
 
 
 async def _parse_skills(text: str) -> dict:
@@ -505,7 +506,7 @@ async def _parse_skills(text: str) -> dict:
 
 只返回JSON。严格只提取原文明确出现的技能。"""
     raw = await llm_chat(messages=[{"role": "user", "content": prompt}], temperature=0.3, max_tokens=1024)
-    return json.loads(_extract_json_from_llm(raw))
+    return _extract_json_obj(raw) or {}
 
 
 async def _parse_score(text: str, position_hint: str) -> dict:
@@ -526,7 +527,7 @@ async def _parse_score(text: str, position_hint: str) -> dict:
 
 keywords恰好5个，不足用技能补。只返回JSON。不要输出其他字段。"""
     raw = await llm_chat(messages=[{"role": "user", "content": prompt}], temperature=0.3, max_tokens=1024)
-    return json.loads(_extract_json_from_llm(raw))
+    return _extract_json_obj(raw) or {}
 
 
 async def _parse_insight(text: str, position_hint: str) -> dict:
@@ -551,7 +552,7 @@ async def _parse_insight(text: str, position_hint: str) -> dict:
 
 只返回JSON。不要输出overallScore或keywords字段。"""
     raw = await llm_chat(messages=[{"role": "user", "content": prompt}], temperature=0.3, max_tokens=1536)
-    return json.loads(_extract_json_from_llm(raw))
+    return _extract_json_obj(raw) or {}
 
 
 async def _safe_parse(coro, label: str) -> dict:
