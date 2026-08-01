@@ -48,6 +48,7 @@ PERMISSION_REGISTRY: dict[str, str] = {
     "offer:approve": "录用审批",
     # 敏感字段
     "salary:view": "查看薪资",
+    "salary:manage": "调整薪资/奖金",
     "equity:view": "查看期权(四期)",
     # 系统
     "audit:view": "查看操作日志",
@@ -87,7 +88,7 @@ _ALL_READ = ["resume:view", "audit:view"]
 
 ROLE_PERMISSIONS: dict[str, list[str]] = {
     "ceo": _ALL_READ + [
-        "offer:approve", "salary:view", "equity:view",
+        "offer:approve", "salary:view", "salary:manage", "equity:view",
         "talent:view", "promotion:approve", "equity:approve",  # P4
     ],
     "hr": [
@@ -95,7 +96,7 @@ ROLE_PERMISSIONS: dict[str, list[str]] = {
         "position:publish", "position:manage",
         "resume:view", "resume:decide",
         "interview:manage",
-        "salary:view", "audit:view",
+        "salary:view", "salary:manage", "audit:view",
         "probation:manage", "training:view", "training:manage",
         "task:view", "points:confirm",
         "talent:view", "talent:manage", "equity:view",  # P4

@@ -57,9 +57,10 @@ async def execute_tool_call(tool_name: str, params: dict, db: AsyncSession) -> s
         # 验证路径不传 current_user → contextvar 为 None → 跳过（验证只读不改）。
         cu = get_current_user_for_tools()
         if cu is not None:
-            from app.agent.tools import TOOL_PERMISSIONS
+            from app.agent.tools import TOOL_PERMISSIONS, PUBLIC_TOOL_PERMISSION
             perm = TOOL_PERMISSIONS.get(tool_name)
-            if perm and not cu.has(perm):
+            # fail-closed：未登记或非公共工具而用户无对应权限 → 拒绝。
+            if perm is None or (perm != PUBLIC_TOOL_PERMISSION and not cu.has(perm)):
                 logger.info(
                     "工具权限拒绝 tool=%s user=%s perm=%s trace=%s",
                     tool_name, cu.username, perm, get_trace_id(),

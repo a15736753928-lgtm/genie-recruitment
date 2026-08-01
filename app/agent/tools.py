@@ -903,12 +903,17 @@ GENERAL_TOOL_NAMES = tuple(TOOL_REGISTRY.keys())
 # 规则：
 #   - 写/敏感工具映射到 app/core/permissions.py 已有权限点；
 #   - 涉及业务数据查看的敏感读工具（简历/绩效/试用期/系统设置）也挂权限；
-#   - 未列出的工具（list_positions/get_position/rag_search/知识库读/运营看板/排行榜等）
-#     视为所有登录用户可用的公共只读工具。
+#   - 公共只读工具（list_positions/get_position/rag_search/知识库读/运营看板等）
+#     显式登记为 PUBLIC_TOOL_PERMISSION，所有登录用户可见。
 #   - admin 凭 system:manage 通配放行（CurrentUser.has() 内含 WILDCARD）。
-# 同步新增工具时：若属写/敏感操作，记得在此登记，否则默认所有人可见可调。
+# 规则（fail-closed）：所有工具必须在此登记；未登记的工具默认不可见/不可调，
+# 避免新增工具忘登记就自动变成全员可用。
+# 同步新增工具时：写/敏感/涉业务数据的一律登记对应权限点；纯公共只读登记
+# PUBLIC_TOOL_PERMISSION。
+PUBLIC_TOOL_PERMISSION = "__public__"
+
 TOOL_PERMISSIONS: dict[str, str] = {
-    # ── 简历（读+写，hr/interviewer/manager 可见）──
+    # ── 简历（读+写，ceo/hr/interviewer 可见；manager 无 resume:view）──
     "list_resumes": "resume:view",
     "get_resume": "resume:view",
     "update_resume": "resume:decide",
@@ -916,7 +921,8 @@ TOOL_PERMISSIONS: dict[str, str] = {
     "batch_parse_resumes": "resume:decide",
     "reanalyze_resume": "resume:decide",
     "delete_resume": "resume:decide",
-    # ── 岗位增删改（读公开：list_positions/get_position 未列入）──
+    "get_rankings": "resume:view",
+    # ── 岗位增删改（读公开：list_positions/get_position 已登记 PUBLIC）──
     "create_position": "position:manage",
     "update_position": "position:manage",
     "delete_position": "position:manage",
@@ -931,6 +937,7 @@ TOOL_PERMISSIONS: dict[str, str] = {
     "ai_score_question": "interview:score",
     "save_evaluation": "interview:score",
     "submit_evaluation": "interview:score",
+    "get_leaderboard": "interview:score",
     # ── 试用期（管理类；employee 有 probation:submit 但无对应自助工具）──
     "list_probation": "probation:manage",
     "get_probation_stats": "probation:manage",
@@ -949,7 +956,7 @@ TOOL_PERMISSIONS: dict[str, str] = {
     "get_quarter_trends": "talent:view",
     "initiate_appraisal": "talent:manage",
     "get_bonus_info": "salary:view",
-    "update_bonus": "salary:view",
+    "update_bonus": "salary:manage",
     # ── 知识库写管理（admin 专属；读 list_knowledge/rag_search 等未列入=公共）──
     "upload_knowledge_file": "system:manage",
     "create_knowledge_item": "system:manage",
@@ -963,6 +970,18 @@ TOOL_PERMISSIONS: dict[str, str] = {
     # ── 系统设置 ──
     "get_settings": "system:manage",
     "update_settings": "system:manage",
+    # ── 系统/调试 ──
+    "recall_test": "system:manage",
+    # ── 公共只读工具（显式标记，所有登录用户可见）──
+    "list_positions": PUBLIC_TOOL_PERMISSION,
+    "get_position": PUBLIC_TOOL_PERMISSION,
+    "list_knowledge": PUBLIC_TOOL_PERMISSION,
+    "list_knowledge_bases": PUBLIC_TOOL_PERMISSION,
+    "list_documents": PUBLIC_TOOL_PERMISSION,
+    "get_knowledge_categories": PUBLIC_TOOL_PERMISSION,
+    "get_knowledge_stats": PUBLIC_TOOL_PERMISSION,
+    "rag_search": PUBLIC_TOOL_PERMISSION,
+    "get_operations_dashboard": PUBLIC_TOOL_PERMISSION,
 }
 
 
@@ -982,11 +1001,16 @@ def get_tools_for_agent(agent_id: str = "genie", current_user=None) -> List[dict
     tool_defs = [TOOL_REGISTRY[name] for name in GENERAL_TOOL_NAMES]
     if current_user is None:
         return tool_defs
-    return [
-        td for td in tool_defs
-        if not TOOL_PERMISSIONS.get(td["name"])
-        or current_user.has(TOOL_PERMISSIONS[td["name"]])
-    ]
+    # fail-closed：未登记权限的工具默认不可见；显式公共只读（PUBLIC_TOOL_PERMISSION）
+    # 或持有对应权限点的工具才对用户可见。
+    visible = []
+    for td in tool_defs:
+        perm = TOOL_PERMISSIONS.get(td["name"])
+        if perm is None:
+            continue
+        if perm == PUBLIC_TOOL_PERMISSION or current_user.has(perm):
+            visible.append(td)
+    return visible
 
 
 # ── LangChain / LangGraph Tool Conversion ────────────────
