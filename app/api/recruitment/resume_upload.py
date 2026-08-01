@@ -278,15 +278,34 @@ async def extract_and_parse_parallel(
             return None, f"无法读取文档内容：{extract_error or '内容为空'}", text or ""
 
     from app.api.recruitment.resume_parser import (
-        _parse_profile, _parse_extra, _parse_analysis, _safe_parse, enrich_parsed_fields,
+        _parse_basic, _parse_education, _parse_work, _parse_project,
+        _parse_skills, _parse_extra, _parse_score, _parse_insight,
+        _safe_parse, enrich_parsed_fields,
     )
     position_hint = f"\n目标应聘岗位：{position_name}" if position_name else ""
-    profile, extra, analysis = await asyncio.gather(
-        _safe_parse(_parse_profile(text, position_hint), "基本档案"),
-        _safe_parse(_parse_extra(text), "扩展信息"),
-        _safe_parse(_parse_analysis(text, position_hint), "AI评估"),
+    # 8 路聚焦小 JSON 并行：每个输出几百 token（vs 原 profile 4096 / analysis 2048），
+    # 总耗时 = 最慢一路，且聚焦任务更稳、不易漏字段。
+    basic_t = _safe_parse(_parse_basic(text, position_hint), "基本信息")
+    edu_t = _safe_parse(_parse_education(text), "教育经历")
+    work_t = _safe_parse(_parse_work(text), "工作经历")
+    proj_t = _safe_parse(_parse_project(text), "项目经历")
+    skills_t = _safe_parse(_parse_skills(text), "技能")
+    extra_t = _safe_parse(_parse_extra(text), "扩展信息")
+    score_t = _safe_parse(_parse_score(text, position_hint), "评分")
+    insight_t = _safe_parse(_parse_insight(text, position_hint), "洞察")
+
+    basic, edu_r, work_r, proj_r, skills_r, extra_r, score_r, insight_r = await asyncio.gather(
+        basic_t, edu_t, work_t, proj_t, skills_t, extra_t, score_t, insight_t
     )
-    merged = {**profile, **extra, "analysis": analysis}
+    merged = {
+        **basic,
+        "educationHistory": (edu_r or {}).get("educationHistory", []),
+        "workHistory": (work_r or {}).get("workHistory", []),
+        "projectHistory": (proj_r or {}).get("projectHistory", []),
+        "skills": (skills_r or {}).get("skills", []),
+        **(extra_r or {}),
+        "analysis": {**(score_r or {}), **(insight_r or {})},
+    }
     parsed = enrich_parsed_fields(merged, text)
     return parsed, None, text
 
