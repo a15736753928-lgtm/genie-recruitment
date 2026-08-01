@@ -44,7 +44,6 @@ from app.api.recruitment.resume_upload import (
     _upload_one_resume,
     _run_parse as run_resume_parse,
     _load_candidate as load_candidate,
-    _extract_and_parse as extract_and_parse_resume,
     fill_candidate_from_parsed,
 )
 from app.utils.responses import ok, fail, not_found, conflict
@@ -105,25 +104,14 @@ async def _run_reanalyze_in_background(resume_id: str, position_name: str) -> No
                 return
 
             await _set_reanalyze_task(resume_id, status="running", progress=30, stage="AI 解析简历中")
-            error = await run_resume_parse(
-                candidate, position_name or (candidate.position.name if candidate.position else ""), task_db
-            )
+            pos_name = position_name or (candidate.position.name if candidate.position else "")
+            error = await run_resume_parse(candidate, pos_name, task_db)
             if error and not is_candidate_parsed(candidate):
                 await _set_reanalyze_task(resume_id, status="failed", progress=100, message=f"解析失败: {error}")
                 return
             await task_db.flush()
 
-            # 重新解析后自动触发 8 维权威评分
-            await _set_reanalyze_task(resume_id, status="running", progress=75, stage="8 维 AI 评分中")
-            try:
-                from app.api.recruitment.scoring import auto_score_after_upload
-                await auto_score_after_upload(
-                    task_db, candidate,
-                    position_id=candidate.position_id,
-                )
-            except Exception as e:
-                logger.warning("后台 reanalyze 自动 8 维评分失败: %s", e, exc_info=True)
-
+            # 评分（4维+8维+性别）已由 run_resume_parse 内部异步后台触发
             await task_db.commit()
             await _set_reanalyze_task(resume_id, status="completed", progress=100, stage="已完成")
             logger.info("后台 reanalyze 完成 candidate=%s", resume_id)

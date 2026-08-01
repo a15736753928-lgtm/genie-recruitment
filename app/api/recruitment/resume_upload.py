@@ -133,24 +133,15 @@ async def _upload_one_resume(
     _document_type = "简历"
 
     if ai_enabled:
-        from app.api.recruitment.resume_parser import (
-            _parse_profile, _parse_extra, _parse_analysis, _safe_parse,
+        # 统一走并行解析核心（与 reanalyze/批量/对话材料共用），校验并行
+        parsed_task = extract_and_parse_parallel(
+            object_key, position.name if position else "", resume_text=resume_text
         )
-        position_hint = f"\n目标应聘岗位：{position.name}" if position and position.name else ""
-        profile_task = _safe_parse(_parse_profile(resume_text, position_hint), "基本档案")
-        extra_task = _safe_parse(_parse_extra(resume_text), "扩展信息")
-        analysis_task = _safe_parse(_parse_analysis(resume_text, position_hint), "AI评估")
         valid_task = validate_is_resume(resume_text, parsed=None, use_llm=True)
-
-        profile, extra, analysis, validation = await asyncio.gather(
-            profile_task, extra_task, analysis_task, valid_task
+        (pre_parsed, _parse_err, _text2), validation = await asyncio.gather(
+            parsed_task, valid_task
         )
         is_resume_doc, reject_reason, _document_type = validation
-
-        # 合并解析结果（性别识别不在关键路径：OCR 文本正则已兜底，
-        # 仅文本/解析都拿不到性别时才在后台走 MIMO 补）
-        merged = {**profile, **extra, "analysis": analysis}
-        pre_parsed = enrich_parsed_fields(merged, resume_text)
     else:
         is_resume_doc, reject_reason, _document_type = await validate_is_resume(
             resume_text, parsed=None, use_llm=False
@@ -266,35 +257,38 @@ async def _get_auto_parse(db: AsyncSession) -> bool:
     return bool(await get_system_setting(db, "autoParseResume", True))
 
 
-async def _extract_and_parse(
-    object_key: str,
-    position_name: str = "",
-    *,
-    db: AsyncSession,
-    resume_text: Optional[str] = None,
-) -> Tuple[Optional[dict], Optional[str]]:
-    """抽取简历文本并用 LLM 解析为结构化数据，供入库前查重或写入候选人。"""
-    ai_enabled = await _get_ai_enabled(db)
-    if not ai_enabled:
-        return None, "AI 简历分析已关闭"
+# 旧的串行预解析 _extract_and_parse 已删除（2026-08-01）——统一走 extract_and_parse_parallel
 
+
+async def extract_and_parse_parallel(
+    resume_file: str,
+    position_name: str = "",
+    resume_text: Optional[str] = None,
+) -> Tuple[Optional[dict], Optional[str], str]:
+    """抽取 + 并行解析（profile/extra/analysis 三路）+ enrich。
+
+    上传（_upload_one_resume）与重新解析（resumes.reanalyze）共用的并行解析核心。
+    返回 (parsed, error, resume_text)。性别识别不在关键路径（OCR 文本正则已兜底）。
+    resume_text 可传入避免重复抽取。
+    """
     text = resume_text
     if text is None:
-        text, extract_error = await extract_text_from_file(object_key)
-        if extract_error:
-            return None, extract_error
-    if not (text or "").strip():
-        return None, "简历文件内容为空"
+        text, extract_error = await extract_text_from_file(resume_file)
+        if extract_error or not text.strip():
+            return None, f"无法读取文档内容：{extract_error or '内容为空'}", text or ""
 
-    parsed, parse_error = await parse_resume_with_llm(text, position_name)
-    if parse_error and not parsed:
-        return None, parse_error
-    if not parsed:
-        return None, "AI 未能解析简历内容"
-
-    parsed = enrich_parsed_fields(parsed, text)
-    parsed = await augment_gender_from_portrait(parsed, object_key or "")
-    return parsed, parse_error
+    from app.api.recruitment.resume_parser import (
+        _parse_profile, _parse_extra, _parse_analysis, _safe_parse, enrich_parsed_fields,
+    )
+    position_hint = f"\n目标应聘岗位：{position_name}" if position_name else ""
+    profile, extra, analysis = await asyncio.gather(
+        _safe_parse(_parse_profile(text, position_hint), "基本档案"),
+        _safe_parse(_parse_extra(text), "扩展信息"),
+        _safe_parse(_parse_analysis(text, position_hint), "AI评估"),
+    )
+    merged = {**profile, **extra, "analysis": analysis}
+    parsed = enrich_parsed_fields(merged, text)
+    return parsed, None, text
 
 
 async def _load_candidate(db, candidate_id):
@@ -320,55 +314,51 @@ async def _run_parse(
     db: AsyncSession = None,
     pre_parsed: Optional[dict] = None,
 ) -> Optional[str]:
-    """Extract text, parse with LLM, and fill candidate. Returns error message if any."""
+    """抽取 + 并行解析 + 填充候选人。返回错误消息（None=成功）。
+
+    与上传共用 ``extract_and_parse_parallel`` 并行解析核心。
+    评分（4维/8维）不在本函数：调用方负责 ``_score_candidate_background``。
+    """
     if not candidate.resume_file:
         return "未找到简历文件"
     if db is None:
         return "内部错误：缺少数据库会话"
 
-    ai_enabled = await _get_ai_enabled(db)
-    if not ai_enabled:
-        return "AI 简历分析已关闭，仅保存文件"
-
-    text, extract_error = await extract_text_from_file(candidate.resume_file)
-    if extract_error:
-        return extract_error
-    if not text.strip():
-        return "简历文件内容为空"
-
+    resume_text = ""
     if pre_parsed is not None:
         parsed = pre_parsed
     else:
-        parsed, parse_error = await _extract_and_parse(
-            candidate.resume_file, position_name, db=db,
+        parsed, parse_error, resume_text = await extract_and_parse_parallel(
+            candidate.resume_file, position_name
         )
         if parse_error and not parsed:
             return parse_error
         if not parsed:
             return "AI 未能解析简历内容"
 
-    from app.services.resume_scoring import score_all
-    analysis = parsed.setdefault("analysis", {})
-    if isinstance(analysis, dict):
-        analysis["dimensions"] = await score_all(text, parsed, position_name)
-
     await fill_candidate_from_parsed(candidate, parsed, db)
 
-    from app.services.system.system_settings import get_system_setting
-    min_score = int(await get_system_setting(db, "minMatchScore", 70) or 70)
-    overall = None
-    if isinstance(analysis, dict):
-        overall = analysis.get("overallScore")
+    # 解析阶段粗估分（权威 8 维分优先，不覆盖）
+    analysis = parsed.get("analysis") or {}
+    overall = analysis.get("overallScore")
     if overall is None:
         overall = candidate.score
-    # 解析阶段的粗估分。若之后跑过「AI 简历评分」（scoring.py 的 8 维加权），
-    # 那边写入的才是权威值，不能被重新解析时的粗估覆盖。
     if isinstance(overall, (int, float)) and candidate.screening_ai_score is None:
         candidate.screening_ai_score = int(overall)
         candidate.score = int(overall)
-        _ = min_score
 
-    return parse_error if pre_parsed is None else None
+    # 评分异步后台（4维 + 8维 + 性别），不阻塞调用方
+    try:
+        asyncio.create_task(_score_candidate_background(
+            candidate_id=str(candidate.id),
+            resume_text=resume_text,
+            parsed=parsed,
+            position_name=position_name,
+            object_key=candidate.resume_file,
+        ))
+    except Exception as e:
+        logger.warning("创建后台评分任务失败（不阻断解析）: %s", e)
+    return None
 
 
 async def _score_candidate_background(
