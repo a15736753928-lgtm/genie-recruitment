@@ -59,9 +59,23 @@ async def extract_text_from_file(file_path: str) -> Tuple[str, Optional[str]]:
         ext = os.path.splitext(resolved)[1].lower()
         try:
             if ext == ".pdf":
+                # 1) 文字层优先（文本型 PDF 毫秒级；扫描件 get_text 为空才继续走 OCR/视觉）
+                try:
+                    import fitz
+                    doc = fitz.open(resolved)
+                    try:
+                        layer_text = "\n".join(page.get_text() for page in doc)
+                    finally:
+                        doc.close()
+                    if len((layer_text or "").strip()) >= get_settings().ocr_fallback_threshold:
+                        return layer_text.strip(), None
+                except Exception as e:
+                    logger.warning("PDF 文字层抽取失败（走 OCR 兜底）: %s", e)
+                # 2) OCR（扫描件）
                 ocr_text = await _extract_ocr_first(resolved)
                 if ocr_text is not None:
                     return ocr_text, None
+                # 3) MIMO 多模态视觉兜底
                 from app.services.ai.vision import extract_text_from_vision
                 return await extract_text_from_vision(resolved)
             if ext in (".docx",):
