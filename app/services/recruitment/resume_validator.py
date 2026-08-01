@@ -136,6 +136,7 @@ async def classify_with_llm(text: str) -> Tuple[bool, str, str]:
         messages=[{"role": "user", "content": prompt}],
         temperature=0.1,
         max_tokens=256,
+        extra_body={"thinking": {"type": "disabled"}},  # deepseek-v4-flash 关闭思考提速
     )
     raw = (response.choices[0].message.content or "").strip()
     if raw.startswith("```json"):

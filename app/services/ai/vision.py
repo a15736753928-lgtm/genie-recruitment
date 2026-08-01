@@ -27,11 +27,33 @@ from typing import Optional
 import fitz  # PyMuPDF：仅用于渲染页面 / 提取内嵌图片（不做文字层抽取）
 from PIL import Image
 
+from openai import AsyncOpenAI
+
 from app.config import get_settings
 from app.services.ai.router import llm_chat
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
+
+# 视觉客户端（懒加载单例）—— 独立于 Router，固定走 MIMO（xiaomimimo）端点。
+# 文本解析已切到 DeepSeek，Router 客户端池不再指向 MIMO；视觉必须用独立客户端，
+# 否则 model=mimo-v2.5 会打到 DeepSeek 端点而 404。
+_vision_client: Optional[AsyncOpenAI] = None
+
+
+def _get_vision_client() -> Optional[AsyncOpenAI]:
+    global _vision_client
+    if _vision_client is not None:
+        return _vision_client
+    if not settings.vision_api_key:
+        return None
+    _vision_client = AsyncOpenAI(
+        api_key=settings.vision_api_key,
+        base_url=settings.vision_base_url or "https://api.xiaomimimo.com/v1",
+        timeout=60.0,
+        max_retries=0,
+    )
+    return _vision_client
 
 # 多页识别时最多渲染的页数 & 分辨率（清晰度与 token 成本的折中）
 MAX_PAGES = 6
@@ -162,12 +184,20 @@ async def _llm_with_retry(content: list[dict], *, max_tokens: int, what: str) ->
     """
     full_messages = [{"role": "user", "content": content}]
     model = settings.vision_model
+    client = _get_vision_client()
     for attempt in range(3):
         try:
-            raw = await llm_chat(
-                full_messages,
-                model=model, temperature=0.0, max_tokens=max_tokens,
-            )
+            if client is not None:
+                resp = await client.chat.completions.create(
+                    model=model, messages=full_messages,
+                    temperature=0.0, max_tokens=max_tokens,
+                )
+                raw = (resp.choices[0].message.content or "").strip()
+            else:
+                raw = await llm_chat(
+                    full_messages,
+                    model=model, temperature=0.0, max_tokens=max_tokens,
+                )
         except Exception as exc:
             msg = str(exc)
             if "role is not supported" in msg:

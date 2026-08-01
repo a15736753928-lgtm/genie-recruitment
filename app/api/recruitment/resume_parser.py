@@ -253,6 +253,12 @@ def enrich_parsed_fields(parsed: dict, raw_text: str) -> dict:
         result["name"] = UNKNOWN
 
     gender = result.get("gender")
+    if gender not in ("男", "女"):
+        # OCR 文本里的「性别：男/女」本地正则兜底，避免无谓触发 MIMO 视觉识别
+        m = re.search(r"性别[:：\s]*([男女MmFfVv])", raw_text or "")
+        if m:
+            gender = {"男": "男", "M": "男", "m": "男",
+                      "女": "女", "F": "女", "f": "女", "V": "女", "v": "女"}.get(m.group(1))
     result["gender"] = gender if gender in ("男", "女") else UNKNOWN
 
     result["age"] = resolve_age(result, raw_text)

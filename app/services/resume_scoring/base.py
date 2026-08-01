@@ -59,6 +59,7 @@ async def _llm_score(rubric: str, resume_text: str, position_name: str) -> Optio
             messages=[{"role": "user", "content": prompt}],
             temperature=0.2,
             max_tokens=200,
+            extra_body={"thinking": {"type": "disabled"}},  # deepseek-v4-flash 关闭思考
         )
         content = (resp.choices[0].message.content or "").strip()
         m = re.search(r"\d{1,3}", content)
@@ -132,6 +133,7 @@ async def _llm_score_batched(
                 temperature=0.2,
                 max_tokens=500,
                 response_format={"type": "json_object"},
+                extra_body={"thinking": {"type": "disabled"}},  # deepseek-v4-flash 关闭思考
             )
             content = (resp.choices[0].message.content or "").strip()
             if content:

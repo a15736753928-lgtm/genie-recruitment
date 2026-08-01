@@ -181,11 +181,16 @@ async def llm_chat(
         client_order = _clients_in_robin_order()
         for key_id, client in client_order:
             try:
+                # DeepSeek v4 默认思考模式会吃满 max_tokens 导致 content 为空，
+                # 对 deepseek 系列统一关闭思考（提速且避免空输出）。
+                extra = ({"thinking": {"type": "disabled"}}
+                         if model.lower().startswith("deepseek") else {})
                 resp = await client.chat.completions.create(
                     model=model,
                     messages=messages,
                     temperature=temperature,
                     max_tokens=max_tokens,
+                    **(extra and {"extra_body": extra} or {}),
                 )
                 return (resp.choices[0].message.content or "").strip()
             except Exception as exc:
@@ -215,11 +220,14 @@ async def _llm_chat_direct(
 ) -> str:
     """兜底直连（env 配置）。"""
     client = _fallback_client()
+    extra = ({"thinking": {"type": "disabled"}}
+             if model.lower().startswith("deepseek") else {})
     resp = await client.chat.completions.create(
         model=model,
         messages=messages,
         temperature=temperature,
         max_tokens=max_tokens,
+        **(extra and {"extra_body": extra} or {}),
     )
     return (resp.choices[0].message.content or "").strip()
 

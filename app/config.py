@@ -5,14 +5,10 @@ import os
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# 旧模型名全部映射到 Mimo（已弃用 DeepSeek）
-_LLM_MODEL_ALIASES: dict[str, str] = {
-    "deepseek-chat": "mimo-v2.5",
-    "deepseek-reasoner": "mimo-v2.5",
-    "deepseek-v4-flash": "mimo-v2.5",
-    "deepseek-v4-pro": "mimo-v2.5",
-    "deepseek-pro": "mimo-v2.5",
-}
+# 旧 deepseek 模型名已弃用（2026-07-24）：deepseek-chat/deepseek-reasoner 现对应
+# deepseek-v4-flash 的非思考/思考模式。文本解析统一用 deepseek-v4-flash（关闭思考）。
+# 不再把 deepseek-* 映射到 mimo —— 文本走 DeepSeek，视觉走 MIMO，各用各的模型。
+_LLM_MODEL_ALIASES: dict[str, str] = {}
 
 
 def normalize_llm_model(model: str | None) -> str:
@@ -28,14 +24,17 @@ class Settings(BaseSettings):
     database_url: str = ""
     database_url_sync: str = ""
 
-    # LLM — set via DEEPSEEK_API_KEY / DEEPSEEK_BASE_URL / DEEPSEEK_MODEL in .env
-    # 支持 Anthropic-compatible API（当前使用 Mimo）
+    # LLM 文本解析 — DeepSeek（OpenAI 兼容协议）
+    # set via DEEPSEEK_API_KEY / DEEPSEEK_BASE_URL / DEEPSEEK_MODEL in .env
     deepseek_api_key: str = ""
-    deepseek_base_url: str = "https://api.xiaomimimo.com/v1"
-    deepseek_model: str = "mimo-v2.5"
+    deepseek_base_url: str = "https://api.deepseek.com"
+    deepseek_model: str = "deepseek-v4-flash"
 
-    # Vision (resume portrait gender inference)
+    # Vision 视觉理解 — MIMO 多模态（与文本 LLM 分开配置）
+    # set via VISION_API_KEY / VISION_BASE_URL / VISION_MODEL in .env
     vision_enabled: bool = True
+    vision_api_key: str = ""
+    vision_base_url: str = "https://api.xiaomimimo.com/v1"
     vision_model: str = "mimo-v2.5"
 
     # App

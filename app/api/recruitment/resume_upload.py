@@ -123,17 +123,39 @@ async def _upload_one_resume(
             position_source = "unknown"
             match_reason = match_reason or "AI 未能匹配到在招岗位"
 
-    # 3) 校验是否为个人求职简历
+    # 3) 岗位已前置确定（解析依赖岗位 hint）；此后全部只依赖 resume_text / object_key，
+    #    一把并行扇出：解析(3) + 性别识别 + 简历校验。
     ai_enabled = await _get_ai_enabled(db)
+    auto_parse = await _get_auto_parse(db)
     pre_parsed: Optional[dict] = None
+    is_resume_doc = True
+    reject_reason = ""
+    _document_type = "简历"
+
     if ai_enabled:
-        pre_parsed, _ = await _extract_and_parse(
-            object_key, position.name if position else "", db=db, resume_text=resume_text
+        from app.api.recruitment.resume_parser import (
+            _parse_profile, _parse_extra, _parse_analysis, _safe_parse,
+        )
+        position_hint = f"\n目标应聘岗位：{position.name}" if position and position.name else ""
+        profile_task = _safe_parse(_parse_profile(resume_text, position_hint), "基本档案")
+        extra_task = _safe_parse(_parse_extra(resume_text), "扩展信息")
+        analysis_task = _safe_parse(_parse_analysis(resume_text, position_hint), "AI评估")
+        valid_task = validate_is_resume(resume_text, parsed=None, use_llm=True)
+
+        profile, extra, analysis, validation = await asyncio.gather(
+            profile_task, extra_task, analysis_task, valid_task
+        )
+        is_resume_doc, reject_reason, _document_type = validation
+
+        # 合并解析结果（性别识别不在关键路径：OCR 文本正则已兜底，
+        # 仅文本/解析都拿不到性别时才在后台走 MIMO 补）
+        merged = {**profile, **extra, "analysis": analysis}
+        pre_parsed = enrich_parsed_fields(merged, resume_text)
+    else:
+        is_resume_doc, reject_reason, _document_type = await validate_is_resume(
+            resume_text, parsed=None, use_llm=False
         )
 
-    is_resume_doc, reject_reason, _document_type = await validate_is_resume(
-        resume_text, parsed=pre_parsed, use_llm=ai_enabled
-    )
     if not is_resume_doc:
         try:
             await asyncio.to_thread(minio_storage.delete_object, object_key)
@@ -141,7 +163,7 @@ async def _upload_one_resume(
             pass
         return _fail("invalid", 422, f"上传的文件不是简历：{reject_reason}")
 
-    # 4) 姓名查重
+    # 4) 姓名查重（依赖解析出的姓名，唯一真串行点）
     if ai_enabled and pre_parsed:
         duplicate_person = await find_duplicate_candidate(db, pre_parsed)
         if duplicate_person:
@@ -165,30 +187,38 @@ async def _upload_one_resume(
     db.add(candidate)
     await db.flush()
 
+    # 5.1) 填充候选人（评分走后台，不在此阻塞）
     parse_message = None
-    auto_parse = await _get_auto_parse(db)
-    if auto_parse:
+    if auto_parse and pre_parsed:
         candidate = await _load_candidate(db, candidate.id)
         if candidate:
-            parse_message = await _run_parse(
-                candidate, position.name if position else "", db, pre_parsed=pre_parsed
-            )
-            if parse_message and is_candidate_parsed(candidate):
+            await fill_candidate_from_parsed(candidate, pre_parsed, db)
+            # 解析阶段粗估分（保留原 _run_parse 语义：权威 8 维分优先，不覆盖）
+            analysis = pre_parsed.get("analysis") or {}
+            overall = analysis.get("overallScore")
+            if overall is None:
+                overall = candidate.score
+            if isinstance(overall, (int, float)) and candidate.screening_ai_score is None:
+                candidate.screening_ai_score = int(overall)
+                candidate.score = int(overall)
+            if pre_parsed.get("name") in (None, "", UNKNOWN):
+                parse_message = "AI 未能识别姓名，请检查简历格式"
+            elif is_candidate_parsed(candidate):
                 parse_message = None
 
-    # 5.5) 自动 8 维 AI 评分（写入 ResumeScore，供前端 AI 评分标签页展示）
-    try:
-        from app.api.recruitment.scoring import auto_score_after_upload
-        cand_for_scoring = await _load_candidate(db, candidate.id)
-        if cand_for_scoring:
-            await auto_score_after_upload(
-                db, cand_for_scoring,
-                position_id=uuid.UUID(resolved_position_id) if resolved_position_id else None,
-            )
-    except Exception as e:
-        logger.warning("自动8维评分失败（不阻断上传）: %s", e)
-
     await db.flush()
+
+    # 5.5) 后台异步评分（4维打分 + 8维 AI 评分并行，不阻塞上传响应）
+    try:
+        asyncio.create_task(_score_candidate_background(
+            candidate_id=str(candidate.id),
+            resume_text=resume_text,
+            parsed=pre_parsed or {},
+            position_name=position.name if position else "",
+            object_key=object_key,
+        ))
+    except Exception as e:
+        logger.warning("创建后台评分任务失败（不阻断上传）: %s", e)
 
     # 6) RAG 知识库入库已断开（2026-08-01）——知识库/RAG 模块停用，待决定去留。
     #    如需恢复：还原对 ingest_resume_to_kb 的调用即可。
@@ -339,6 +369,66 @@ async def _run_parse(
         _ = min_score
 
     return parse_error if pre_parsed is None else None
+
+
+async def _score_candidate_background(
+    candidate_id: str,
+    resume_text: str,
+    parsed: dict,
+    position_name: str = "",
+    object_key: str = "",
+) -> None:
+    """上传后的后台任务：4维打分 + 8维 AI 评分 + 性别兜底，并行执行。
+
+    使用独立 DB 会话（SQLAlchemy async session 不支持并发共享同一 session），
+    任一失败只记日志不影响其他。不阻塞上传响应。
+    """
+    from app.database import async_session_factory
+
+    async def _dimensions():
+        async with async_session_factory() as db:
+            cand = await _load_candidate(db, candidate_id)
+            if not cand or not parsed:
+                return
+            from app.services.resume_scoring import score_all
+            analysis = parsed.setdefault("analysis", {})
+            if isinstance(analysis, dict):
+                dimensions = await score_all(resume_text, parsed, position_name)
+                if dimensions and cand.ai_analysis:
+                    cand.ai_analysis.dimensions = dimensions
+                await db.commit()
+
+    async def _eight_dims():
+        async with async_session_factory() as db:
+            cand = await _load_candidate(db, candidate_id)
+            if not cand:
+                return
+            from app.api.recruitment.scoring import auto_score_after_upload
+            await auto_score_after_upload(db, cand, position_id=cand.position_id)
+            await db.commit()
+
+    async def _gender_fallback():
+        # 文本正则 + 解析都没拿到性别时才走 MIMO 视觉补
+        if not object_key:
+            return
+        async with async_session_factory() as db:
+            cand = await _load_candidate(db, candidate_id)
+            if not cand or cand.gender in ("男", "女"):
+                return
+            from app.api.recruitment.resume_parser import augment_gender_from_portrait
+            g = await augment_gender_from_portrait({}, object_key)
+            if isinstance(g, dict) and g.get("gender") in ("男", "女"):
+                cand.gender = g["gender"]
+                await db.commit()
+
+    results = await asyncio.gather(
+        _dimensions(), _eight_dims(), _gender_fallback(), return_exceptions=True
+    )
+    labels = ("4维打分", "8维评分", "性别兜底")
+    for i, r in enumerate(results):
+        if isinstance(r, Exception):
+            logger.warning("候选人 %s 后台[%s]失败: %s", candidate_id, labels[i], r)
+    logger.info("候选人 %s 后台任务完成", candidate_id)
 
 
 async def fill_candidate_from_parsed(candidate: Candidate, parsed: dict, db: AsyncSession):
