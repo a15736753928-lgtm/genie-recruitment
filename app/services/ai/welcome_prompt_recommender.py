@@ -198,6 +198,7 @@ async def _generate_with_llm(db: AsyncSession) -> List[dict]:
             messages=[{"role": "user", "content": _build_prompt(snapshot)}],
             temperature=0.4,
             max_tokens=1024,
+            extra_body={"thinking": {"type": "disabled"}},  # deepseek-v4-flash 关闭思考
         )
         content = (resp.choices[0].message.content or "").strip()
         data = json.loads(extract_json_array_from_text(content))
