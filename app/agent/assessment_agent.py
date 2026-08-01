@@ -318,6 +318,7 @@ async def generate_assessment_report(context: dict, fallback_score: int = 70) ->
     try:
         response = await client.chat.completions.create(
             model=settings.deepseek_model,
+            extra_body={"thinking": {"type": "disabled"}},  # deepseek-v4-flash 关闭思考
             messages=[
                 {"role": "system", "content": _build_system_prompt(position_name, round_label)},
                 {"role": "user", "content": _build_user_prompt(context)},

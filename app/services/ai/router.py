@@ -270,6 +270,7 @@ def create_langchain_llm(
             streaming=streaming,
             timeout=60,
             max_retries=2,
+            model_kwargs={"extra_body": {"thinking": {"type": "disabled"}}},  # deepseek-v4-flash 关闭思考
         )
 
     key_id = _round_robin_clients[0]
@@ -293,4 +294,5 @@ def _fallback_langchain(temperature: float, streaming: bool) -> Any:
         streaming=streaming,
         timeout=60,
         max_retries=2,
+        model_kwargs={"extra_body": {"thinking": {"type": "disabled"}}},  # deepseek-v4-flash 关闭思考
     )

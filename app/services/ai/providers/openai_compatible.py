@@ -55,6 +55,7 @@ class OpenAICompatibleAdapter:
             streaming=streaming,
             timeout=60,
             max_retries=2,
+            model_kwargs={"extra_body": {"thinking": {"type": "disabled"}}},  # deepseek-v4-flash 关闭思考
         )
 
     @staticmethod

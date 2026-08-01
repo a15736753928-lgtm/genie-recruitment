@@ -117,6 +117,7 @@ async def classify_school_tier(school_name: str) -> str:
         )
         resp = await client.chat.completions.create(
             model=settings.deepseek_model,
+            extra_body={"thinking": {"type": "disabled"}},  # deepseek-v4-flash 关闭思考
             messages=[{"role": "user", "content": prompt}],
             temperature=0.0,
             max_tokens=200,

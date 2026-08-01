@@ -143,6 +143,7 @@ async def score_self_intro(
     try:
         response = await client.chat.completions.create(
             model=settings.deepseek_model,
+            extra_body={"thinking": {"type": "disabled"}},  # deepseek-v4-flash 关闭思考
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},

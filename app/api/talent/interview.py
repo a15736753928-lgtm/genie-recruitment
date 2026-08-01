@@ -174,6 +174,7 @@ async def generate_questions_with_llm(
     try:
         response = await get_llm_client().chat.completions.create(
             model=settings.deepseek_model,
+            extra_body={"thinking": {"type": "disabled"}},  # deepseek-v4-flash 关闭思考
             messages=[{"role": "system", "content": system_prompt}],
             temperature=0.7,
             max_tokens=4096,
@@ -323,6 +324,7 @@ async def extract_qa_from_transcript(transcript_text: str, position_name: str) -
         try:
             response = await get_llm_client().chat.completions.create(
                 model=settings.deepseek_model,
+                extra_body={"thinking": {"type": "disabled"}},  # deepseek-v4-flash 关闭思考
                 messages=[{"role": "system", "content": system_prompt}],
                 temperature=0.2 if attempt == 1 else 0.4,
                 max_tokens=8192,
@@ -383,6 +385,7 @@ async def extract_segments_from_transcript(transcript_text: str, position_name: 
     try:
         response = await get_llm_client().chat.completions.create(
             model=settings.deepseek_model,
+            extra_body={"thinking": {"type": "disabled"}},  # deepseek-v4-flash 关闭思考
             messages=[{"role": "system", "content": system_prompt}],
             temperature=0.2,
             max_tokens=2048,

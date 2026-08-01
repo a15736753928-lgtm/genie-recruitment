@@ -165,6 +165,7 @@ async def _persist_assistant_turn(
                 )
                 title_resp = await get_llm_client().chat.completions.create(
                     model=settings.deepseek_model,
+                    extra_body={"thinking": {"type": "disabled"}},  # deepseek-v4-flash 关闭思考
                     messages=[{"role": "user", "content": title_prompt}],
                     temperature=0.7,
                     max_tokens=32,
