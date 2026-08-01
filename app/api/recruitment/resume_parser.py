@@ -52,56 +52,62 @@ async def extract_text_from_file(file_path: str) -> Tuple[str, Optional[str]]:
     混合 OCR+LLM（2026-08-01 启用）：PDF/图片先走本地 RapidOCR 抽文字（快、免费、
     字符保真），OCR 输出过短或不可用时回退到 MIMO 多模态视觉，准确率不降。
     """
-    with minio_storage.resolved_local_path(file_path) as resolved:
-        if not resolved:
-            return "", f"简历文件不存在: {file_path}"
+    try:
+        with minio_storage.resolved_local_path(file_path) as resolved:
+            if not resolved:
+                return "", f"简历文件不存在: {file_path}"
 
-        ext = os.path.splitext(resolved)[1].lower()
-        try:
-            if ext == ".pdf":
-                # 1) 文字层优先（文本型 PDF 毫秒级；扫描件 get_text 为空才继续走 OCR/视觉）
-                try:
-                    import fitz
-                    doc = fitz.open(resolved)
+            ext = os.path.splitext(resolved)[1].lower()
+            try:
+                if ext == ".pdf":
+                    # 1) 文字层优先（文本型 PDF 毫秒级；扫描件 get_text 为空才继续走 OCR/视觉）
                     try:
-                        layer_text = "\n".join(page.get_text() for page in doc)
-                    finally:
-                        doc.close()
-                    if len((layer_text or "").strip()) >= get_settings().ocr_fallback_threshold:
-                        return layer_text.strip(), None
-                except Exception as e:
-                    logger.warning("PDF 文字层抽取失败（走 OCR 兜底）: %s", e)
-                # 2) OCR（扫描件）
-                ocr_text = await _extract_ocr_first(resolved)
-                if ocr_text is not None:
-                    return ocr_text, None
-                # 3) MIMO 多模态视觉兜底
-                from app.services.ai.vision import extract_text_from_vision
-                return await extract_text_from_vision(resolved)
-            if ext in (".docx",):
-                from docx import Document
-                doc = Document(resolved)
-                text = "\n".join(p.text for p in doc.paragraphs).strip()
-                if not text:
-                    return "", "Word 文档未提取到文本"
-                return text, None
-            if ext == ".doc":
-                return "", "暂不支持旧版 .doc 格式，请转换为 .docx 或 PDF 后重新上传"
-            if ext in (".jpg", ".jpeg", ".png", ".webp", ".bmp"):
-                ocr_text = await _extract_ocr_first(resolved)
-                if ocr_text is not None:
-                    return ocr_text, None
-                from app.services.ai.vision import extract_text_from_vision
-                return await extract_text_from_vision(resolved)
-            if ext in (".txt", ".md"):
-                with open(resolved, "r", encoding="utf-8", errors="ignore") as f:
-                    return f.read().strip(), None
-            return "", f"不支持的文件格式: {ext}"
-        except ImportError as e:
-            return "", f"缺少文件解析依赖: {e}"
-        except Exception as e:
-            logger.exception("Failed to extract text from %s", resolved)
-            return "", f"文件解析失败: {e}"
+                        import fitz
+                        doc = fitz.open(resolved)
+                        try:
+                            layer_text = "\n".join(page.get_text() for page in doc)
+                        finally:
+                            doc.close()
+                        if len((layer_text or "").strip()) >= get_settings().ocr_fallback_threshold:
+                            return layer_text.strip(), None
+                    except Exception as e:
+                        logger.warning("PDF 文字层抽取失败（走 OCR 兜底）: %s", e)
+                    # 2) OCR（扫描件）
+                    ocr_text = await _extract_ocr_first(resolved)
+                    if ocr_text is not None:
+                        return ocr_text, None
+                    # 3) MIMO 多模态视觉兜底
+                    from app.services.ai.vision import extract_text_from_vision
+                    return await extract_text_from_vision(resolved)
+                if ext in (".docx",):
+                    from docx import Document
+                    doc = Document(resolved)
+                    text = "\n".join(p.text for p in doc.paragraphs).strip()
+                    if not text:
+                        return "", "Word 文档未提取到文本"
+                    return text, None
+                if ext == ".doc":
+                    return "", "暂不支持旧版 .doc 格式，请转换为 .docx 或 PDF 后重新上传"
+                if ext in (".jpg", ".jpeg", ".png", ".webp", ".bmp"):
+                    ocr_text = await _extract_ocr_first(resolved)
+                    if ocr_text is not None:
+                        return ocr_text, None
+                    from app.services.ai.vision import extract_text_from_vision
+                    return await extract_text_from_vision(resolved)
+                if ext in (".txt", ".md"):
+                    with open(resolved, "r", encoding="utf-8", errors="ignore") as f:
+                        return f.read().strip(), None
+                return "", f"不支持的文件格式: {ext}"
+            except ImportError as e:
+                return "", f"缺少文件解析依赖: {e}"
+            except Exception as e:
+                logger.exception("Failed to extract text from %s", resolved)
+                return "", f"文件解析失败: {e}"
+    except Exception as e:
+        # MinIO 下载/临时文件准备异常。此前该 `with` 在 try 外层，异常裸抛
+        # 到上传管道直接整份"失败"且无堆栈（吴佳熙.pdf 两次失败的形态）。
+        logger.exception("简历文件读取失败（MinIO 下载/临时文件准备）: %s", file_path)
+        return "", f"简历文件读取失败: {e}"
 
 
 # ── 混合 OCR+LLM 辅助 ──────────────────────────────────────
@@ -555,13 +561,23 @@ async def _parse_insight(text: str, position_hint: str) -> dict:
     return _extract_json_obj(raw) or {}
 
 
-async def _safe_parse(coro, label: str) -> dict:
-    """安全执行单个 LLM 解析任务，失败返回空 dict 并记录日志。"""
-    try:
-        return await coro
-    except Exception as e:
-        logger.warning("简历并行解析 [%s] 失败: %s", label, e)
-        return {}
+async def _safe_parse(coro_factory, label: str) -> dict:
+    """安全执行单个 LLM 解析任务；异常或空输出时重试 1 次。返回 dict。
+
+    coro_factory 是返回 coroutine 的可调用对象：coroutine 只能 await 一次，
+    要重试必须重新创建，故调用方需传 ``lambda: _parse_xxx(...)`` 而非直接传协程。
+    DeepSeek 在并发下偶发空输出（finish_reason=length / 限流），重试能显著
+    提高解析字段完整率。
+    """
+    for attempt in range(2):
+        try:
+            result = await coro_factory()
+            if result:
+                return result
+            logger.warning("简历并行解析 [%s] 空输出（重试 1 次）", label)
+        except Exception as e:
+            logger.warning("简历并行解析 [%s] 失败（重试 1 次）: %s", label, e)
+    return {}
 
 
 async def parse_resume_with_llm(text: str, position_name: str = "") -> Tuple[dict, Optional[str]]:
@@ -572,9 +588,9 @@ async def parse_resume_with_llm(text: str, position_name: str = "") -> Tuple[dic
 
     # 三个解析任务并行执行
     profile_task, extra_task, analysis_task = await asyncio.gather(
-        _safe_parse(_parse_profile(text, position_hint), "基本档案"),
-        _safe_parse(_parse_extra(text), "扩展信息"),
-        _safe_parse(_parse_analysis(text, position_hint), "AI评估"),
+        _safe_parse(lambda: _parse_profile(text, position_hint), "基本档案"),
+        _safe_parse(lambda: _parse_extra(text), "扩展信息"),
+        _safe_parse(lambda: _parse_analysis(text, position_hint), "AI评估"),
     )
 
     # 合并结果

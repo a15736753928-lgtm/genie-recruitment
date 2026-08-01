@@ -68,9 +68,16 @@ class _ColoredFormatter(logging.Formatter):
         except Exception:
             trace_id = ""
         trace = f" {self._WHITE}[{trace_id}]{self._RESET}" if trace_id else ""
+        msg = record.getMessage()
+        # logger.exception / exc_info=True 时把 traceback 堆栈带上。
+        # 此前只输出 message，堆栈被吞，线上"失败原因不可见"没法排障。
+        if record.exc_info:
+            if not record.exc_text:
+                record.exc_text = self.formatException(record.exc_info)
+            msg = f"{msg}\n{record.exc_text}"
         return (
             f"{self._DIM}{record.asctime}{self._RESET} "
-            f"{record.name} {record.levelname}{trace} {record.getMessage()}"
+            f"{record.name} {record.levelname}{trace} {msg}"
         )
 
 

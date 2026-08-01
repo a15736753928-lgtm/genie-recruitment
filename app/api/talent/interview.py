@@ -1740,6 +1740,8 @@ async def list_transcripts(
               "source": t.source,
               "createdAt": t.created_at.strftime("%Y-%m-%d %H:%M:%S") if t.created_at else "",
               "qaCount": counts.get(t.id, 0),
+              # AI 分析是否可用：转写内容非空（后台 ASR 回写 content 后才有）
+              "hasContent": bool(t.content and t.content.strip()),
           }
           for t in transcripts
       ])

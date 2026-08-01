@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.models.recruitment import Candidate
-from app.models.phase1 import ResumeScore
+from app.models.phase1 import ResumeScore, Interview
 from app.models.settings import SystemSetting
 from app.core.security import get_current_user, require_permission, CurrentUser
 from app.core.state_machine import transition, StateError
@@ -372,6 +372,23 @@ async def candidate_decision(
             await transition(db, "candidate", candidate, "invited",
                              actor_id=current.id, actor_name=current.username,
                              reason=body.reason)
+            # 进入 invited(待安排面试)后，自动落一条一面记录，使面试管理页有进度。
+            # 幂等：该候选人+round==r1 已有记录则跳过，避免重复 invite 撞 uq_interview_cand_round。
+            existing_r1 = (await db.execute(
+                select(Interview.id).where(
+                    Interview.candidate_id == candidate.id,
+                    Interview.round == "r1",
+                ).limit(1)
+            )).scalar_one_or_none()
+            if not existing_r1:
+                db.add(Interview(
+                    candidate_id=candidate.id,
+                    position_id=candidate.position_id,
+                    round="r1",
+                    scheduled_at=None,          # 未排期，待 HR 补时间
+                    interviewer_ids=[],          # 面试官在排期确认时补充
+                    status="scheduled",
+                ))
         elif body.action == "reserve":
             await transition(db, "candidate", candidate, "talent_pool",
                              actor_id=current.id, actor_name=current.username,

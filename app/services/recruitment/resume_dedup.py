@@ -37,18 +37,22 @@ def is_same_person(parsed: dict, candidate: Candidate) -> bool:
     return parsed_name == candidate_name
 
 
-async def find_duplicate_candidate(db: AsyncSession, parsed: dict) -> Optional[Candidate]:
-    """按姓名查重：在库内找到同名候选人即视为重复。"""
-    normalized_name = normalize_person_name(parsed.get("name"))
-    if not normalized_name:
+async def find_duplicate_candidate(
+    db: AsyncSession,
+    parsed: dict,
+    content_hash: Optional[str] = None,
+) -> Optional[Candidate]:
+    """按文件内容 SHA256 判重：只有字节完全相同的简历才视为重复。
+
+    不再按姓名判重——同名不同内容的简历（同名不同人 / 同一人多版）会被
+    误判跳过，漏掉候选人。历史数据 resume_file_hash 为空时不判重。
+    """
+    if not content_hash:
         return None
 
     result = await db.execute(
         select(Candidate)
-        .where(func.replace(func.coalesce(Candidate.name, ""), " ", "") == normalized_name)
+        .where(Candidate.resume_file_hash == content_hash)
+        .limit(1)
     )
-    candidates = result.scalars().all()
-    for candidate in candidates:
-        if is_same_person(parsed, candidate):
-            return candidate
-    return None
+    return result.scalar_one_or_none()

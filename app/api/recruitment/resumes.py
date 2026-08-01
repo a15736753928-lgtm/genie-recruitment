@@ -45,6 +45,8 @@ from app.api.recruitment.resume_upload import (
     _run_parse as run_resume_parse,
     _load_candidate as load_candidate,
     fill_candidate_from_parsed,
+    launch_resume_scoring,
+    launch_score_task,
 )
 from app.utils.responses import ok, fail, not_found, conflict
 
@@ -105,14 +107,15 @@ async def _run_reanalyze_in_background(resume_id: str, position_name: str) -> No
 
             await _set_reanalyze_task(resume_id, status="running", progress=30, stage="AI 解析简历中")
             pos_name = position_name or (candidate.position.name if candidate.position else "")
-            error = await run_resume_parse(candidate, pos_name, task_db)
+            error, score_task = await run_resume_parse(candidate, pos_name, task_db)
             if error and not is_candidate_parsed(candidate):
                 await _set_reanalyze_task(resume_id, status="failed", progress=100, message=f"解析失败: {error}")
                 return
             await task_db.flush()
 
-            # 评分（4维+8维+性别）已由 run_resume_parse 内部异步后台触发
+            # 评分（4维+8维+性别）在 commit 之后启动，独立 session 才能读到候选人
             await task_db.commit()
+            launch_score_task(score_task)
             await _set_reanalyze_task(resume_id, status="completed", progress=100, stage="已完成")
             logger.info("后台 reanalyze 完成 candidate=%s", resume_id)
 
@@ -366,6 +369,10 @@ async def upload_resume(
     )
 
     if result["status"] == "success":
+        # 显式 commit：get_db 的 commit 在路由返回后才执行，对后台评分任务太晚
+        # （后台任务用独立 session，读不到未提交的候选人会静默跳过）。
+        await db.commit()
+        launch_resume_scoring(result)
         response_data = result["data"]
         return ok(response_data, message=result["message"])
     return fail(result["statusCode"], result["message"], result.get("data"))
@@ -408,6 +415,8 @@ async def batch_upload_resumes(
                         position_id=position_id,
                     )
                     await task_db.commit()
+                    # 后台评分必须在 commit 之后启动，否则独立 session 读不到候选人
+                    launch_resume_scoring(result)
                     return {
                         "fileName": payload["original_name"],
                         "status": result["status"],
@@ -420,6 +429,7 @@ async def batch_upload_resumes(
                     }
                 except Exception:
                     await task_db.rollback()
+                    logger.exception("批量上传处理失败 fileName=%s", payload["original_name"])
                     raise
 
     total = len(file_payloads)
@@ -515,6 +525,7 @@ async def batch_parse(body: dict, db: AsyncSession = Depends(get_db)):
     if not ids:
         return fail(400, "请提供候选人 ID 列表")
 
+    pending_score_tasks = []
     for cid in ids:
         result = await db.execute(
             select(Candidate)
@@ -525,11 +536,18 @@ async def batch_parse(body: dict, db: AsyncSession = Depends(get_db)):
         if not candidate or not candidate.resume_file:
             continue
 
-        error = await run_resume_parse(
+        error, score_task = await run_resume_parse(
             candidate, candidate.position.name if candidate.position else "", db
         )
         if error:
             logger.warning("Batch parse error for %s: %s", cid, error)
+        if score_task:
+            pending_score_tasks.append(score_task)
+
+    # 后台评分在 commit 之后启动（独立 session 需读到已提交的候选人）
+    await db.commit()
+    for score_task in pending_score_tasks:
+        launch_score_task(score_task)
 
     return ok()
 

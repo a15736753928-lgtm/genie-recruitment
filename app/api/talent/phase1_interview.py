@@ -285,14 +285,14 @@ async def schedule_interview(
     if body.round == "r2" and candidate.status != "round1":
         return fail(409, "候选人状态不符")
 
-    # Check no existing interview for this candidate+round
+    # 该候选人本轮可能已有记录：筛选通过(invite)时自动落一条未排期一面草稿。
+    # 语义 —— 未排期则复用(补时间/面试官)；已排期则拦截重复。
     existing_r = await db.execute(
         select(Interview).where(
             and_(Interview.candidate_id == cand_uid, Interview.round == body.round)
         )
     )
-    if existing_r.scalar_one_or_none():
-        return fail(409, "该候选人本轮面试已安排")
+    existing = existing_r.scalar_one_or_none()
 
     # Check blocking exception
     block_r = await db.execute(
@@ -332,11 +332,23 @@ async def schedule_interview(
     except StateError as e:
         return fail(409, e.message)
 
-    # Create Interview
+    # Create or reuse interview record
     try:
         pos_uid = uuid.UUID(body.position_id)
     except (ValueError, TypeError):
         pos_uid = None
+
+    if existing is not None:
+        # 已有记录：未排期则当作草稿复用(补时间/面试官)，已排期则拒绝重复安排。
+        if existing.scheduled_at:
+            return fail(409, "该候选人本轮面试已排期")
+        existing.scheduled_at = scheduled_at
+        existing.interviewer_ids = body.interviewer_ids
+        if pos_uid:
+            existing.position_id = pos_uid
+        existing.status = "scheduled"
+        await db.flush()
+        return ok(serialize_interview(existing))
 
     iv = Interview(
         candidate_id=cand_uid,
@@ -526,6 +538,10 @@ async def run_ai_analysis(
     )
     transcript = transcript_r.scalar_one_or_none()
     transcript_content = transcript.content if transcript else ""
+
+    # 无录音/转写时禁止硬分析：否则会用候选人简历脑补打分，污染评估结论
+    if not transcript_content or not transcript_content.strip():
+        return fail(422, "尚未上传面试录音/转写，无法进行 AI 分析")
 
     candidate_info = f"姓名: {candidate.name if candidate else '未知'}"
     if candidate and candidate.education:

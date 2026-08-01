@@ -298,7 +298,10 @@ async def infer_gender_from_image_bytes_async(image_bytes: bytes) -> Optional[st
             "只回答一个字：男、女或未知。注意：直接给最终答案，不要解释。",
             [_to_image_url(png)],
         ),
-        max_tokens=100, what="多模态性别识别",
+        # 必须与文字提取一致用 4000：MIMO 是推理模型，reasoning_content 会先占
+        # token，max_tokens=100 时思维链吃光预算 → content 为空 → 触发重试刷屏。
+        # max_tokens 是上限不是实际量，性别只输出一个字，成本几乎不变。
+        max_tokens=4000, what="多模态性别识别",
     )
     return _normalize_gender(raw)
 

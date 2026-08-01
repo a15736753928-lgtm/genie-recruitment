@@ -896,7 +896,7 @@ async def ingest_materials_batch(
     if not material_ids:
         return fail(400, "请提供 materialIds")
 
-    from app.api.recruitment.resume_upload import _upload_one_resume, _load_candidate
+    from app.api.recruitment.resume_upload import _upload_one_resume, _load_candidate, launch_resume_scoring, launch_score_task
     import os
 
     # 材料经 session 间接归属——非 admin 仅能取到本人会话下的材料，别人的 material_id 静默跳过
@@ -1014,6 +1014,8 @@ async def ingest_materials_batch(
                                 "skills": [s.skill for s in (candidate.skills or [])],
                             })
                         await task_db.commit()
+                        # 后台评分在 commit 之后启动，否则独立 session 读不到候选人
+                        launch_resume_scoring(upload_result)
                         return {"mid": mid, "item": item,
                                 "resume_file": candidate.resume_file if candidate else None,
                                 "original_fp": fp}
@@ -1271,8 +1273,9 @@ async def upload_material(
         # 4) Full parse + scoring
         from app.api.recruitment.resumes import load_candidate, run_resume_parse
         candidate = await load_candidate(db, candidate.id)
+        score_task = None
         if candidate:
-            parse_msg = await run_resume_parse(candidate, position_name, db)
+            _, score_task = await run_resume_parse(candidate, position_name, db)
 
         # 5) RAG knowledge-base ingest 已断开（2026-08-01）——知识库/RAG 模块停用
         pass
@@ -1312,6 +1315,10 @@ async def upload_material(
         db.add(material)
         await db.flush()
         await db.refresh(material)
+
+        # 后台评分在 commit 之后启动（独立 session 需读到已提交的候选人）
+        await db.commit()
+        launch_score_task(score_task)
 
         return ok({
               "id": str(material.id),
