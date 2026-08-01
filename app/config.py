@@ -92,9 +92,9 @@ class Settings(BaseSettings):
     ingest_batch_size: int = 64     # embedding batch size
     max_file_size: int = 20 * 1024 * 1024  # 20 MB
 
-    # RAG — OCR (RapidOCR for image/PDF fallback)
+    # 简历 PDF/图片抽取 — 本地 OCR（RapidOCR）优先，不足则回退多模态视觉
     ocr_enabled: bool = True
-    ocr_fallback_threshold: int = 100  # chars below which OCR is triggered
+    ocr_fallback_threshold: int = 100  # OCR 输出低于此字符数视为不可靠，回退视觉
 
     @field_validator("deepseek_model", "vision_model", mode="before")
     @classmethod

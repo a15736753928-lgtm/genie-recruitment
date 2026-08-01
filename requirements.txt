@@ -28,6 +28,7 @@ llama-index-core>=0.12.0
 # Knowledge Graph
 
 # File Processing
+rapidocr_onnxruntime>=1.4.0  # 本地 OCR（混合 OCR+LLM 简历文字保真层）
 python-docx==1.1.2
 PyMuPDF>=1.24.0  # PDF 渲染成图（多模态识别输入，不再用于文字层抽取）
 reportlab>=4.0  # PDF 生成（岗位说明书等正式文档）

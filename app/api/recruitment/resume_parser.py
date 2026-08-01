@@ -47,10 +47,10 @@ def resolve_resume_file_path(stored_path: str) -> Optional[str]:
 
 
 async def extract_text_from_file(file_path: str) -> Tuple[str, Optional[str]]:
-    """Extract text from PDF/image via MIMO multimodal vision; DOCX falls back.
+    """Extract text from PDF/image — 本地 OCR 优先 + MIMO 多模态视觉兜底; DOCX falls back.
 
-    PDF 文字层抽取已移除 —— 无论文本 PDF 还是扫描件，统一渲染成图交给 MIMO
-    多模态识别（单一入口，降低复杂度）。
+    混合 OCR+LLM（2026-08-01 启用）：PDF/图片先走本地 RapidOCR 抽文字（快、免费、
+    字符保真），OCR 输出过短或不可用时回退到 MIMO 多模态视觉，准确率不降。
     """
     with minio_storage.resolved_local_path(file_path) as resolved:
         if not resolved:
@@ -59,6 +59,9 @@ async def extract_text_from_file(file_path: str) -> Tuple[str, Optional[str]]:
         ext = os.path.splitext(resolved)[1].lower()
         try:
             if ext == ".pdf":
+                ocr_text = await _extract_ocr_first(resolved)
+                if ocr_text is not None:
+                    return ocr_text, None
                 from app.services.ai.vision import extract_text_from_vision
                 return await extract_text_from_vision(resolved)
             if ext in (".docx",):
@@ -71,6 +74,9 @@ async def extract_text_from_file(file_path: str) -> Tuple[str, Optional[str]]:
             if ext == ".doc":
                 return "", "暂不支持旧版 .doc 格式，请转换为 .docx 或 PDF 后重新上传"
             if ext in (".jpg", ".jpeg", ".png", ".webp", ".bmp"):
+                ocr_text = await _extract_ocr_first(resolved)
+                if ocr_text is not None:
+                    return ocr_text, None
                 from app.services.ai.vision import extract_text_from_vision
                 return await extract_text_from_vision(resolved)
             if ext in (".txt", ".md"):
@@ -82,6 +88,33 @@ async def extract_text_from_file(file_path: str) -> Tuple[str, Optional[str]]:
         except Exception as e:
             logger.exception("Failed to extract text from %s", resolved)
             return "", f"文件解析失败: {e}"
+
+
+# ── 混合 OCR+LLM 辅助 ──────────────────────────────────────
+
+async def _extract_ocr_first(file_path: str) -> Optional[str]:
+    """本地 RapidOCR 优先抽取；OCR 不可用或文本过短返回 None（调用方回退多模态视觉）。"""
+    from app.config import get_settings
+    s = get_settings()
+    if not s.ocr_enabled:
+        return None
+    from app.services.ai import ocr as ocr_service
+    ext = os.path.splitext(file_path)[1].lower()
+    try:
+        if ext == ".pdf":
+            ocr_text = await asyncio.to_thread(ocr_service.ocr_pdf, file_path)
+        else:
+            with open(file_path, "rb") as fh:
+                ocr_text = await asyncio.to_thread(ocr_service.ocr_image_bytes, fh.read())
+    except Exception as e:
+        logger.warning("本地 OCR 抽取失败，回退多模态: %s", e)
+        return None
+    ocr_text = (ocr_text or "").strip()
+    if len(ocr_text) < s.ocr_fallback_threshold:
+        logger.info("本地 OCR 文本过短（%d 字 < 阈值 %d），回退多模态视觉",
+                    len(ocr_text), s.ocr_fallback_threshold)
+        return None
+    return ocr_text
 
 
 # ── Field normalization ──────────────────────────────────────
