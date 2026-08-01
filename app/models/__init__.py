@@ -21,7 +21,7 @@ from app.models.system import StateTransition, ExceptionQueue
 from app.models.phase1 import (
     RecruitmentRequest, PositionCompetency,
     ResumeScore,
-    Interview, InterviewerScore, InterviewMedia, AIInterviewReport,
+    Interview, InterviewerScore, AIInterviewReport,
     OfferApproval,
 )
 # 第一期 AI 产物表
@@ -54,7 +54,7 @@ __all__ = [
     "StateTransition", "ExceptionQueue",
     "RecruitmentRequest", "PositionCompetency",
     "ResumeScore",
-    "Interview", "InterviewerScore", "InterviewMedia", "AIInterviewReport",
+    "Interview", "InterviewerScore", "AIInterviewReport",
     "OfferApproval",
     "PositionAIArtifact",
     "ProbationPlan", "ProbationWeekReview", "ConfirmationReview",

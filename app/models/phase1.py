@@ -148,8 +148,6 @@ class Interview(Base):
 
     scores = relationship("InterviewerScore", back_populates="interview",
                           cascade="all, delete-orphan")
-    media = relationship("InterviewMedia", back_populates="interview",
-                         cascade="all, delete-orphan")
     ai_report = relationship("AIInterviewReport", back_populates="interview",
                              uselist=False, cascade="all, delete-orphan")
 
@@ -173,23 +171,6 @@ class InterviewerScore(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     interview = relationship("Interview", back_populates="scores")
-
-
-class InterviewMedia(Base):
-    """面试录音/录像 —— 须取得候选人知情同意方可上传。"""
-    __tablename__ = "interview_media"
-
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    interview_id = Column(UUID(as_uuid=True), ForeignKey("interviews.id", ondelete="CASCADE"),
-                          nullable=False, index=True)
-    file_path = Column(String(512), nullable=False)    # MinIO key 或本地路径
-    media_type = Column(String(8), nullable=False)     # audio / video
-    consent_obtained = Column(Boolean, nullable=False, default=False)  # §21.1
-    transcript_id = Column(UUID(as_uuid=True),
-                           ForeignKey("interview_transcripts.id"), nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-    interview = relationship("Interview", back_populates="media")
 
 
 class AIInterviewReport(Base):

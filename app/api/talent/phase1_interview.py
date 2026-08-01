@@ -1,8 +1,7 @@
-"""模块三: 面试安排 / 评分 / 媒体 / AI 分析 / 结论
+"""模块三: 面试安排 / 评分 / AI 分析 / 结论
 
 POST /api/interviews               — 安排面试
 POST /api/interviews/{id}/scores   — 面试官提交评分
-POST /api/interviews/{id}/media    — 上传面试录音/录像
 POST /api/interviews/{id}/ai-analysis — AI 分析
 POST /api/interviews/{id}/conclusion  — 面试结论
 """
@@ -22,7 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.models.recruitment import Candidate, Position
-from app.models.phase1 import Interview, InterviewerScore, InterviewMedia, AIInterviewReport, ResumeScore
+from app.models.phase1 import Interview, InterviewerScore, AIInterviewReport, ResumeScore
 from app.models.interview import InterviewTranscript
 from app.core.security import get_current_user, require_permission, CurrentUser
 from app.core.state_machine import transition, StateError
@@ -458,57 +457,6 @@ async def submit_score(
     })
 
 
-# ── POST /api/interviews/{id}/media ──────────────────────────
-
-@router.post("/interviews/{interview_id}/media")
-async def upload_media(
-    interview_id: str,
-    file: UploadFile = File(...),
-    consentObtained: str = Form(...),
-    db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("media:upload")),
-):
-    consent = consentObtained.lower() in ("true", "1", "yes")
-    if not consent:
-        return fail(422, "需获得候选人知情同意方可上传录音")
-
-    iv = await _load_interview(db, interview_id)
-    if not iv:
-        return not_found("面试记录不存在")
-
-    file_bytes = await file.read()
-    filename = file.filename or "media"
-    ext = os.path.splitext(filename)[1].lower()
-    object_key = f"interviews/{interview_id}/{uuid.uuid4()}{ext}"
-
-    # Detect media type
-    audio_exts = {".mp3", ".wav", ".m4a", ".ogg", ".flac", ".aac", ".opus"}
-    media_type = "audio" if ext in audio_exts else "video"
-
-    # Upload to MinIO
-    try:
-        from app.infrastructure import minio_storage
-        await asyncio.to_thread(
-            minio_storage.upload_bytes, object_key, file_bytes, file.content_type or "application/octet-stream"
-        )
-    except Exception as e:
-        logger.error("media upload failed: %s", e)
-        return fail(500, f"文件存储失败: {e}")
-
-    m = InterviewMedia(
-        interview_id=iv.id,
-        file_path=object_key,
-        media_type=media_type,
-        consent_obtained=True,
-    )
-    db.add(m)
-    await db.flush()
-
-    return ok({
-        "mediaId": str(m.id),
-        "filePath": m.file_path,
-        "mediaType": m.media_type,
-    })
 
 
 # ── POST /api/interviews/{id}/ai-analysis ────────────────────

@@ -1,3 +1,4 @@
+import builtins
 import os
 import re
 import json
@@ -16,6 +17,7 @@ from app.config import get_settings
 from app.infrastructure import minio_storage
 from app.services.system.system_settings import get_system_setting
 from app.services.ai import get_llm_client
+from app.services.ai.speech import transcribe_audio_bytes
 from app.core.state_machine import transition, StateError
 import logging
 from app.utils.responses import ok, fail, not_found, conflict
@@ -65,58 +67,6 @@ async def _fetch_pre_generated_questions(
         .order_by(InterviewQuestion.index_num)
     )
     return list(result.scalars().all())
-
-# ── FunASR singleton (loaded once, reused across all transcribe calls) ──
-_funasr_pipeline = None
-
-
-def _get_funasr_pipeline():
-    """Return the cached FunASR pipeline, creating it on first call.
-
-    附带 VAD（语音活动检测）+ 标点模型：
-    - vad_model: 把长录音先切成一句一句的短片段再逐段识别，避免 Paraformer 对
-      整段音频做 O(T²) self-attention 时一次性申请几十 GB 内存而 OOM（长面试录音必踩）。
-    - punc_model: 给识别结果加标点，问答/片段抽取更准。
-    三个模型首次会各下载一次并缓存到 ~/.cache/modelscope，之后重启从磁盘加载、不再联网下载。
-    """
-    global _funasr_pipeline
-    if _funasr_pipeline is None:
-        from modelscope.pipelines import pipeline
-        from modelscope.utils.constant import Tasks
-        _funasr_pipeline = pipeline(
-            task=Tasks.auto_speech_recognition,
-            model="iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
-            vad_model="iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
-            punc_model="iic/punc_ct-transformer_zh-cn-common-vocab272727-pytorch",
-            # 完全离线环境下跳过 hub 更新检查，直接用本地缓存
-            disable_update=True,
-        )
-    return _funasr_pipeline
-
-
-def _transcribe_audio_bytes(audio_bytes: bytes) -> str:
-    """把音频字节转写成带标点的中文文本（同步，供后台线程 asyncio.to_thread 调用）。
-
-    走 VAD 分段的 FunASR 单例，长录音不会 OOM。识别不到语音时返回占位串。
-    """
-    import tempfile
-    import os as _os
-
-    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-    try:
-        tmp.write(audio_bytes)
-        tmp.close()
-        asr = _get_funasr_pipeline()
-        result = asr(tmp.name)
-        item = result[0] if isinstance(result, list) and result else result
-        text = (item.get("text", "") if isinstance(item, dict) else "").strip()
-        return text or "[转写完成，但未识别到语音内容]"
-    finally:
-        try:
-            _os.unlink(tmp.name)
-        except OSError:
-            pass
-
 
 # ── Helpers ─────────────────────────────────────────────
 
@@ -751,7 +701,7 @@ async def _build_assessment_context(
     return {
         "round": round,
         "transcriptExcerpt": transcript.content or "",
-        "avgQaScore": round(sum(ai_scores) / len(ai_scores), 1) if ai_scores else None,
+        "avgQaScore": builtins.round(sum(ai_scores) / len(ai_scores), 1) if ai_scores else None,
         "candidate": {
             "name": candidate.name,
             "education": candidate.education,
@@ -1598,8 +1548,8 @@ async def _process_transcript_in_background(
                     session, transcript_id,
                     status="transcribing", progress=8, stage="语音转写中",
                 )
-                transcript_text = await asyncio.to_thread(_transcribe_audio_bytes, audio_bytes)
-                logger.info("[%s] 转写完成 chars=%d", log_tag, len(transcript_text))
+                transcript_text = await transcribe_audio_bytes(audio_bytes)
+                logger.info("[%s] 云端转写完成 chars=%d", log_tag, len(transcript_text))
                 await _set_transcript_progress(
                     session, transcript_id,
                     status="extracting", progress=40, stage="转写完成，开始分析",

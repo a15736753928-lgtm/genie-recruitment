@@ -43,7 +43,6 @@ PERMISSION_REGISTRY: dict[str, str] = {
     # 面试
     "interview:manage": "安排面试/出题/结论",
     "interview:score": "面试评分",
-    "media:upload": "上传面试录音录像",
     # 录用
     "offer:approve": "录用审批",
     # 敏感字段
@@ -107,7 +106,7 @@ ROLE_PERMISSIONS: dict[str, list[str]] = {
         "confirmation:approve",
         "talent:view",  # P4
     ],
-    "interviewer": ["resume:view", "interview:score", "media:upload"],
+    "interviewer": ["resume:view", "interview:score"],
     "mentor": [
         "probation:manage", "probation:accept", "mentor:record",
         "training:view", "training:manage", "training:confirm",

@@ -4,8 +4,8 @@
   1. 单一入口 configure_logging()，全应用一种格式，杜绝多套格式混排。
   2. 白名单式降噪：root 抬到 WARNING，只放行自家 genie.* / app.* 到 INFO。
      未知三方库默认沉默，新引入的库不会再往启动日志里刷噪音。
-  3. 已知吵闹的三方库显式压到 WARNING（faiss / modelscope / funasr / …）。
-  4. 禁掉 HuggingFace / tqdm 进度条与 modelscope 冗余日志（靠环境变量，
+  3. 已知吵闹的三方库显式压到 WARNING（faiss / …）。
+  4. 禁掉 HuggingFace / tqdm 进度条与冗余日志（靠环境变量，
      必须在导入这些库之前设置——见 main.py 顶部）。
 
 只面向控制台/开发终端，不引入 structlog/JSON —— 那是集中式日志采集才需要的。
@@ -22,8 +22,6 @@ _APP_LOGGERS = ("genie", "app")
 # 已知会在启动/运行期刷屏的三方库，显式压到 WARNING。
 _NOISY_LOGGERS = (
     "faiss", "faiss.loader",
-    "modelscope",
-    "funasr",
     "sentence_transformers",
     "transformers",
     "milvus_lite", "pymilvus",
