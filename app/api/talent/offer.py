@@ -189,7 +189,8 @@ async def _build_ai_advice(candidate: Candidate, offer: OfferApproval) -> Option
 严格返回纯JSON，不含markdown围栏。"""
 
     try:
-        raw_text = await llm_chat([{"role": "user", "content": prompt}])
+        # evidence/strengths/risks 多数组，512 默认值会被截断 → 复用 ai-analysis 的坑
+        raw_text = await llm_chat([{"role": "user", "content": prompt}], max_tokens=2048)
         raw_text = raw_text.strip()
         raw_dict = extract_json_object(raw_text)
         if raw_dict is None:

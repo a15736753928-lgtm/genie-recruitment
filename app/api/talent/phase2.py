@@ -176,7 +176,7 @@ async def create_plan(
             f"岗位: {emp.department or '技术'}。"
             f"返回 JSON: [{{\"week\":1,\"title\":\"...\",\"focus\":\"...\",\"goals\":[\"...\"],\"trainingItems\":[\"...\"]}},...]"
         )
-        resp = await llm_chat([{"role": "user", "content": prompt}])
+        resp = await llm_chat([{"role": "user", "content": prompt}], max_tokens=2048)
         weeks_data = (extract_json_array(resp) or [])[:total_weeks]
     except Exception:
         weeks_data = []

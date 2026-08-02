@@ -209,7 +209,9 @@ def _run_migrations(connection):
     _cleanup_low_match_status(connection)
     # v5: 面试题来源标记（pre_generated/transcript），区分面试出题与面试评定抽取的题目
     _add_column_if_missing(connection, "interview_questions", "source", "VARCHAR(16) NOT NULL DEFAULT 'pre_generated'")
-    # v6: 唯一约束加入 source，让两类题目各自独立编号互不冲突
+    # v6/v18: 唯一约束加入 source + transcript_id，让面试出题(pre_generated)与转写抽取(transcript)
+    # 两类题目各自独立编号，同一候选人同一轮多次上传转写互不冲突
+    #（旧约束曾致第二次上传 UniqueViolationError: uq_interview_questions_cand_round_source_idx）
     _migrate_interview_questions_unique_constraint(connection)
     # v7: 支持面试评定的多次上传历史记录
     _migrate_transcript_history(connection)
@@ -438,9 +440,18 @@ def _migrate_v16_candidate_status_vocabulary(connection) -> None:
 
 
 def _migrate_interview_questions_unique_constraint(connection) -> None:
-    """把 interview_questions 的唯一约束从 (candidate_id, round, index_num)
-    改为 (candidate_id, round, source, index_num)，让面试出题与面试评定转写抽取
-    两类题目各自独立编号，互不冲突。幂等：新约束已存在则跳过。
+    """把 interview_questions 的唯一约束升级为含 transcript_id 的版本。
+
+    v6 曾把约束从 (candidate_id, round, index_num) 改为 (candidate_id, round, source, index_num)，
+    支持 pre_generated / transcript 两类题目各自独立编号；但 transcript 抽取题仍按 index_num
+    全局编号，同一候选人同一轮第二次上传转写时 index_num=1 直接撞唯一约束
+    （UniqueViolationError: uq_interview_questions_cand_round_source_idx）。
+
+    本次（v18）进一步升级为 (candidate_id, round, source, transcript_id, index_num)：
+    transcript 抽取题按 (transcript_id, index_num) 编号，同一候选人同一轮多次上传互不冲突；
+    pre_generated 题 transcript_id 为 NULL，PG 中 NULL 不参与唯一比较，仍按
+    (candidate_id, round, source, index_num) 判重，语义与 v6 一致。
+    幂等：新约束已存在则跳过（全新库由 create_all 直接建新约束，同样命中 skip）。
     """
     from sqlalchemy import text
 
@@ -458,20 +469,29 @@ def _migrate_interview_questions_unique_constraint(connection) -> None:
         "  SELECT 1 FROM information_schema.table_constraints"
         "  WHERE table_schema = 'public'"
         "    AND table_name = 'interview_questions'"
-        "    AND constraint_name = 'uq_interview_questions_cand_round_source_idx'"
+        "    AND constraint_name = 'uq_interview_questions_cand_round_tid_source_idx'"
         ")"
     )).scalar()
-    if new_constraint_exists:
-        return
 
+    # 旧版约束无条件清理（与「新约束是否存在」解耦）：历史上新约束可能由 create_all /
+    # 手动 ALTER 先行建立而旧约束未被删除，两约束并存时旧约束仍会拦截
+    # (candidate_id, round, source, index_num)，导致同一候选人同一轮第二次上传转写
+    # 直接 UniqueViolationError（uq_interview_questions_cand_round_source_idx）。
+    # 无论新约束是否存在都删旧约束，保证库里至多保留模型定义的那一个。
     connection.execute(text("SET LOCAL lock_timeout = '3s'"))
-    # 删除旧约束（PostgreSQL 默认自动生成的名称）
+    connection.execute(text(
+        "ALTER TABLE interview_questions "
+        "DROP CONSTRAINT IF EXISTS uq_interview_questions_cand_round_source_idx"
+    ))
     connection.execute(text(
         "ALTER TABLE interview_questions "
         "DROP CONSTRAINT IF EXISTS interview_questions_candidate_id_round_index_num_key"
     ))
+    if new_constraint_exists:
+        return
+
     connection.execute(text(
         "ALTER TABLE interview_questions "
-        "ADD CONSTRAINT uq_interview_questions_cand_round_source_idx "
-        "UNIQUE (candidate_id, round, source, index_num)"
+        "ADD CONSTRAINT uq_interview_questions_cand_round_tid_source_idx "
+        "UNIQUE (candidate_id, round, source, transcript_id, index_num)"
     ))

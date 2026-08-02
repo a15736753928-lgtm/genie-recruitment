@@ -19,6 +19,7 @@ from app.services.system.system_settings import get_system_setting
 from app.services.ai import get_llm_client
 from app.services.ai.speech import transcribe_audio_bytes
 from app.core.state_machine import transition, StateError
+from app.core.security import get_current_user, PermissionError_, CurrentUser
 import logging
 from app.utils.responses import ok, fail, not_found, conflict
 from app.utils.llm_json import extract_json_array, extract_json_object
@@ -26,6 +27,25 @@ from app.utils.llm_json import extract_json_array, extract_json_object
 logger = logging.getLogger("genie.interview")
 router = APIRouter(tags=["面试"])
 settings = get_settings()
+
+# ── 鉴权：interview.py 此前全模块零鉴权（全仓已知遗留，2026-08-02 补齐）──
+# 读端点放行任意「面试相关读权」（hr 管理 / 评分 / 简历查看）；
+# 写端点要求 hr 或评分权之一（interviewer/manager 负责评分出题，hr 负责管理）。
+_INTERVIEW_READ_PERMS = ("interview:manage", "interview:score", "resume:view")
+_INTERVIEW_WRITE_PERMS = ("interview:manage", "interview:score")
+
+
+async def _require_interview_read(current: CurrentUser = Depends(get_current_user)) -> CurrentUser:
+    if any(current.has(p) for p in _INTERVIEW_READ_PERMS):
+        return current
+    raise PermissionError_(f"无权限: 需要 {' 或 '.join(_INTERVIEW_READ_PERMS)} 之一")
+
+
+async def _require_interview_write(current: CurrentUser = Depends(get_current_user)) -> CurrentUser:
+    if any(current.has(p) for p in _INTERVIEW_WRITE_PERMS):
+        return current
+    raise PermissionError_(f"无权限: 需要 {' 或 '.join(_INTERVIEW_WRITE_PERMS)} 之一")
+
 
 INTERVIEW_ELIGIBLE_STATUSES = {"invited", "round1", "round2"}
 
@@ -219,6 +239,43 @@ def _extract_json_object(content: str) -> dict:
     return extract_json_object(content) or {}
 
 
+def _deduplicate_qa(items: list[dict], max_items: int = 15) -> list[dict]:
+    """后处理去重：LLM 说去重但经常做不到，这里按问题文本相似度硬去重。
+
+    策略：去掉常见问候/引导前缀，按字符集合 overlap 判定相似性（>70% 视为重复），
+    重复时保留首条（先出现的）。硬限 max_items 条。
+    """
+    _GREETING_RE = re.compile(
+        r"^(你好[，,]?\s*|欢迎.{0,10}(面试|参加|来到)[，,]?\s*"
+        r"|我是负责.{0,20}的面试官[，,]?\s*|接下来.{0,10}|下面.{0,10})"
+    )
+
+    def _norm(q: str) -> set:
+        q = _GREETING_RE.sub("", q)
+        q = re.sub(r"[，。？！、；：\u201c\u201d\u2018\u2019\s]+", "", q)
+        return set(q)
+
+    deduped: list[dict] = []
+    seen: list[set] = []
+    for item in items:
+        q = (item.get("question") or "").strip()
+        if not q:
+            continue
+        tokens = _norm(q)
+        if not tokens:
+            continue
+        is_dup = any(
+            len(tokens & prev) / max(len(tokens), len(prev)) > 0.70
+            for prev in seen if prev
+        )
+        if not is_dup:
+            deduped.append(item)
+            seen.append(tokens)
+        if len(deduped) >= max_items:
+            break
+    return deduped
+
+
 async def extract_qa_from_transcript(transcript_text: str, position_name: str) -> List[dict]:
     """从面试转写文本中抽取「问题 + 回答原文 + 分类」列表。
 
@@ -245,24 +302,30 @@ async def extract_qa_from_transcript(transcript_text: str, position_name: str) -
 - 带时间戳的转写文本，如「00:01:23 面试官：...」
 - 没有说话人标注的连续对话（请根据语义判断哪一段是问、哪一段是答）
 
+**严格限制：最多输出 15 条问答。** 一场45分钟面试，真实独立问题通常不超过15道。超过15道说明你没有去重。
+
 要求：
-1. 只抽取面试中真实发生的一问一答，不要臆造，不要把面试官的引导语单独成题。
-2. 每条包含：question（面试官问题原文，可适当精简但保留原意）、answer（候选人回答原文，保留关键内容，不要省略到失去信息）、category（分类，从「技术能力、项目经验、工程素养、团队协作、架构设计、领导力、沟通表达」中选最贴近的一个）。
-3. 按面试发生顺序输出。
-4. 若文本明显不是面试对话（例如纯简历、纯职位描述、乱码、空白），返回空数组 []。
-5. 严格返回纯 JSON 数组，不要包含任何 markdown 代码围栏、解释文字或前后缀。
+1. **只抽取面试中真实发生的一问一答，不要臆造，不要把面试官的引导语单独成题。**
+2. **question 必须是问题本身**，禁止包含：问候语（如"你好，欢迎参加面试"）、自我介绍（如"我是负责XX岗位的面试官"）、过渡语（如"接下来我们聊一下"）。这些是引导语，不是问题。例如：
+   - ❌ "你好，桂云飞，欢迎参加今天的一面面试，我是负责Agent工程师岗位的面试官，先请你做一个简单的自我介绍吧。"
+   - ✅ "请先做一个简单的自我介绍吧。"
+3. **去重**（极其重要）：同一道问题如果在转写中出现多次（面试官口头重复、引导、过渡后重述），只保留最完整的一次。判断标准：去掉问候语/过渡语后，核心问题相同的只保留一条。
+4. 自我介绍只出现一次——即使面试官在不同时间点多次要求「请先做自我介绍」，也只保留一条最完整的记录。
+5. 每条包含：question（面试官问题原文，去掉问候语/引导语，只保留问题核心）、answer（候选人回答原文，保留关键内容）、category（从「技术能力、项目经验、工程素养、团队协作、架构设计、领导力、沟通表达」中选一个）。
+6. 按面试发生顺序输出。
+7. 若文本明显不是面试对话，返回空数组 []。
+8. 严格返回纯 JSON 数组，不要包含任何 markdown 代码围栏、解释文字或前后缀。
 
-输出格式：
-[{{"question": "面试官问题原文", "answer": "候选人回答原文", "category": "技术能力"}}, ...]
+输出格式（最多15条）：
+[{{"question": "面试官问题（去掉问候语）", "answer": "候选人回答原文", "category": "技术能力"}}, ...]
 
-示例输入：
-面试官：请先做个自我介绍。
-候选人：我叫张三，五年 Java 经验，做过电商后端。
-面试官：讲一下你最近负责的订单系统架构。
-候选人：我们用了微服务，订单服务拆分为...
+错误示例（禁止）：
+- question="你好，欢迎参加面试，我是负责XX岗位的面试官，请先做个自我介绍吧。"  ← 包含问候语
+- question="请先做个自我介绍。" 且出现两次  ← 未去重
 
-示例输出：
-[{{"question": "请先做个自我介绍。", "answer": "我叫张三，五年 Java 经验，做过电商后端。", "category": "沟通表达"}}, {{"question": "讲一下你最近负责的订单系统架构。", "answer": "我们用了微服务，订单服务拆分为...", "category": "架构设计"}}]
+正确示例：
+- question="请先做一个简单的自我介绍吧。", answer="我叫张三...", category="沟通表达"
+- question="讲一下你最近负责的订单系统架构。", answer="我们用了微服务...", category="架构设计"
 
 面试转写文本：
 {transcript_slice}"""
@@ -282,6 +345,7 @@ async def extract_qa_from_transcript(transcript_text: str, position_name: str) -
             raw_content = response.choices[0].message.content or ""
             data = _extract_json_array(raw_content)
             result = [d for d in data if isinstance(d, dict) and d.get("question")]
+            result = _deduplicate_qa(result)
             if result:
                 if attempt > 1:
                     logger.info("[extract_qa] 第 %d 次尝试成功，抽取到 %d 条问答", attempt, len(result))
@@ -779,6 +843,7 @@ async def get_questions(
     category: Optional[str] = Query(None),
     difficulty: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(_require_interview_read),
 ):
     """获取候选人某轮的面试题,支持按分类/难度筛选,并返回全量统计。
 
@@ -795,7 +860,8 @@ async def get_questions(
 
 
 @router.put("/interview/questions")
-async def save_questions(body: dict, db: AsyncSession = Depends(get_db)):
+async def save_questions(body: dict, db: AsyncSession = Depends(get_db),
+                         current: CurrentUser = Depends(_require_interview_write)):
     candidate_id = body.get("candidateId")
     round = body.get("round")
     questions = body.get("questions", [])
@@ -824,7 +890,8 @@ async def save_questions(body: dict, db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/interview/questions/regenerate")
-async def regenerate_questions(body: dict, db: AsyncSession = Depends(get_db)):
+async def regenerate_questions(body: dict, db: AsyncSession = Depends(get_db),
+                               current: CurrentUser = Depends(_require_interview_write)):
     candidate_id = body.get("candidateId")
     round = body.get("round")
 
@@ -847,7 +914,8 @@ async def regenerate_questions(body: dict, db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/interview/questions/{question_id}/replace")
-async def replace_question(question_id: str, body: dict, db: AsyncSession = Depends(get_db)):
+async def replace_question(question_id: str, body: dict, db: AsyncSession = Depends(get_db),
+                           current: CurrentUser = Depends(_require_interview_write)):
     candidate_id = body.get("candidateId")
     round = body.get("round")
 
@@ -925,7 +993,8 @@ async def replace_question(question_id: str, body: dict, db: AsyncSession = Depe
 
 
 @router.post("/interview/questions/batch-delete")
-async def batch_delete_questions(body: dict, db: AsyncSession = Depends(get_db)):
+async def batch_delete_questions(body: dict, db: AsyncSession = Depends(get_db),
+                                 current: CurrentUser = Depends(_require_interview_write)):
     """批量删除面试题,删除后对剩余题目按难度排序重新连续编号。
 
     body: { candidateId, round, questionIds: [uuid str, ...] }
@@ -1004,7 +1073,8 @@ async def batch_delete_questions(body: dict, db: AsyncSession = Depends(get_db))
 
 
 @router.post("/interview/questions/append")
-async def append_question(body: dict, db: AsyncSession = Depends(get_db)):
+async def append_question(body: dict, db: AsyncSession = Depends(get_db),
+                          current: CurrentUser = Depends(_require_interview_write)):
     """AI 生成一道面试题并追加到本轮末尾。
 
     body: { candidateId, round, prompt?, category?, difficulty? }
@@ -1081,6 +1151,7 @@ async def append_question(body: dict, db: AsyncSession = Depends(get_db)):
 async def get_leaderboard(
     category: str = Query(...),
     db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(_require_interview_read),
 ):
     """Get evaluation leaderboard by category (first_result | second_result)."""
     status_map = {
@@ -1189,6 +1260,7 @@ async def get_evaluation(
     round: str = Query("first"),
     transcriptId: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(_require_interview_read),
 ):
     return await query_interview_evaluation(
         db,
@@ -1203,6 +1275,7 @@ async def save_evaluation(
     candidate_id: str,
     body: dict,
     db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(_require_interview_write),
 ):
     round = body.get("round", "first")
     scores = body.get("scores", [])
@@ -1582,6 +1655,8 @@ async def _process_transcript_in_background(
             logger.error("[%s] 后台流水线异常 transcript_id=%s\n%s",
                          log_tag, transcript_id, _tb.format_exc())
             try:
+                # flush 失败后 session 处于 PendingRollback，必须先回滚事务才能复用写失败状态
+                await session.rollback()
                 await _set_transcript_progress(
                     session, transcript_id,
                     status="failed", progress=100, stage="处理失败",
@@ -1597,6 +1672,7 @@ async def upload_transcript(
     file: UploadFile = File(...),
     round: str = Form(...),
     db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(_require_interview_write),
 ):
     # Save to MinIO and parse file. We keep the bytes in memory to both upload
     # to MinIO and extract text via a temp file (no re-download needed).
@@ -1659,6 +1735,7 @@ async def list_transcripts(
     candidate_id: str,
     round: str = Query("first"),
     db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(_require_interview_read),
 ):
     """列出某候选人某轮的所有上传历史记录，按上传时间倒序。
 
@@ -1686,6 +1763,7 @@ async def list_transcripts(
     return ok([
           {
               "id": str(t.id),
+              "round": t.round,
               "filename": t.filename or "transcript",
               "source": t.source,
               "createdAt": t.created_at.strftime("%Y-%m-%d %H:%M:%S") if t.created_at else "",
@@ -1701,6 +1779,7 @@ async def list_transcripts(
 async def delete_transcript(
     transcript_id: str,
     db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(_require_interview_write),
 ):
     """删除一条上传历史记录，级联删除其抽取的题目与评分。"""
     t_result = await db.execute(
@@ -1718,6 +1797,7 @@ async def delete_transcript(
 async def get_transcript_status(
     transcript_id: str,
     db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(_require_interview_read),
 ):
     """轮询一条转写记录的后台处理进度。完成时一并返回综合评定报告。"""
     t_result = await db.execute(
@@ -1742,6 +1822,7 @@ async def transcribe_audio(
     file: UploadFile = File(...),
     round: str = Form(...),
     db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(_require_interview_write),
 ):
     logger.info("[transcribe_audio] 收到音频上传 candidate=%s round=%s file=%s",
                 candidate_id, round, file.filename)
@@ -1752,6 +1833,15 @@ async def transcribe_audio(
     audio_bytes = await file.read()
     if not audio_bytes:
         return fail(400, "音频文件为空")
+
+    # 仅接受音频：MIME 或以扩展名兜底（浏览器/客户端可能把音频标成 octet-stream，
+    # 且 m4a 的 MIME 是 audio/mp4 / audio/x-m4a，统一按 audio/* 放行）。
+    AUDIO_MIME_PREFIX = "audio/"
+    AUDIO_EXTS = (".mp3", ".wav", ".m4a", ".flac", ".aac", ".ogg", ".opus", ".oga", ".wma", ".amr", ".webm")
+    mime = (file.content_type or "").lower()
+    fname_ext = (os.path.splitext(file.filename or "")[1] or "").lower()
+    if not (mime.startswith(AUDIO_MIME_PREFIX) or fname_ext in AUDIO_EXTS):
+        return fail(400, "仅支持上传音频文件（mp3/wav/m4a 等）")
 
     # 建一条 pending 转写记录（content 先空，转写完成后由后台任务回写），
     # 每次上传独立历史记录，可选择/删除，并关联本次抽取的题目与评定报告。
@@ -1798,6 +1888,7 @@ async def generate_assessment_report_endpoint(
     round: str = Query("first"),
     transcriptId: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(_require_interview_write),
 ):
     """手动触发或重新生成全方位面试评定报告。"""
     target_tid = transcriptId
@@ -1828,6 +1919,7 @@ async def submit_evaluation(
     candidate_id: str,
     round_: str = Query("first", alias="round"),
     db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(_require_interview_write),
 ):
     scoring_mode = await get_setting(db, "defaultScoringMode", "ai")
     pass_threshold = int(await get_setting(db, "passScoreThreshold", 75) or 75)
@@ -2012,6 +2104,7 @@ async def ai_score_question(
     question_id: str,
     body: Optional[dict] = None,
     db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(_require_interview_write),
 ):
     # AI 评分开关 + 手动模式拒绝
     ai_scoring = await get_setting(db, "aiInterviewScoring", True)
@@ -2047,6 +2140,7 @@ async def ai_score_question(
 async def get_rankings(
     candidateId: str = Query(...),
     db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(_require_interview_read),
 ):
     """Get same-position candidate rankings for sidebar."""
     # Find the candidate's position

@@ -22,7 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
 from app.models.recruitment import Candidate, Position
 from app.models.phase1 import Interview, InterviewerScore, AIInterviewReport, ResumeScore
-from app.models.interview import InterviewTranscript
+from app.models.interview import InterviewTranscript, InterviewQuestion, InterviewEvaluation
 from app.core.security import get_current_user, require_permission, CurrentUser
 from app.core.state_machine import transition, StateError
 from app.core.exceptions import push_exception, has_blocking_exception
@@ -186,6 +186,17 @@ async def _require_interview_read(current: CurrentUser = Depends(get_current_use
         return current
     from app.core.security import PermissionError_
     raise PermissionError_(f"无权限: 需要 {' 或 '.join(_INTERVIEW_READ_PERMS)} 之一")
+
+
+# 写语义（AI 分析/评定等）：hr 管理 or 面试官/经理评分，any-of。
+_INTERVIEW_WRITE_PERMS = ("interview:manage", "interview:score")
+
+
+async def _require_interview_write(current: CurrentUser = Depends(get_current_user)) -> CurrentUser:
+    if any(current.has(p) for p in _INTERVIEW_WRITE_PERMS):
+        return current
+    from app.core.security import PermissionError_
+    raise PermissionError_(f"无权限: 需要 {' 或 '.join(_INTERVIEW_WRITE_PERMS)} 之一")
 
 
 # ── GET /api/interviews/dimensions ────────────────────────────
@@ -465,7 +476,9 @@ async def submit_score(
 async def run_ai_analysis(
     interview_id: str,
     db: AsyncSession = Depends(get_db),
-    current: CurrentUser = Depends(require_permission("interview:manage")),
+    # AI 分析是面试评分的输入（R1 综合分占 25%），interviewer/manager 评分时也要能跑，
+    # 不能只给 hr（interview:manage）——否则面试官点按钮必 403。
+    current: CurrentUser = Depends(_require_interview_write),
 ):
     iv = await _load_interview(db, interview_id)
     if not iv:
@@ -529,7 +542,9 @@ async def run_ai_analysis(
 严格返回纯JSON，不要包含markdown代码围栏或解释。"""
 
     try:
-        raw_text = await llm_chat([{"role": "user", "content": prompt}])
+        # 输出含 evidence/strengths/risks 多数组 + 8 个布尔字段，512 默认值必被
+        # finish_reason=length 截断 → extract_json_object 返回 None → 落入兜底。
+        raw_text = await llm_chat([{"role": "user", "content": prompt}], max_tokens=4000)
         # Strip code fences
         raw_text = raw_text.strip()
         raw_dict = extract_json_object(raw_text)
@@ -645,10 +660,49 @@ async def run_ai_analysis(
         db.add(report)
     await db.flush()
 
-    return ok(_serialize_ai_report(report))
+    return ok(await _serialize_ai_report(report, db))
 
 
-def _serialize_ai_report(report: AIInterviewReport) -> dict:
+async def _serialize_ai_report(report: AIInterviewReport, db: AsyncSession) -> dict:
+    # 逐题 AI 评分：按「候选人 + 本轮」读取已有 ai_score 的问答（由转写流水线落库），
+    # 挂到报告上供前端在 AI 分析报告卡片做只读展示。iv.round 存 "r1"/"r2"，需映射回 legacy。
+    legacy_round = "first" if report.round == "r1" else "second"
+    q_scores = []
+    if report.candidate_id:
+        # 只取最新一次转写抽取的题目（多次上传累积会导致同一轮出现数十道重复题）
+        latest_tid_r = await db.execute(
+            select(InterviewTranscript.id).where(
+                InterviewTranscript.candidate_id == report.candidate_id,
+                InterviewTranscript.round == legacy_round,
+            ).order_by(InterviewTranscript.created_at.desc()).limit(1)
+        )
+        latest_tid = latest_tid_r.scalar_one_or_none()
+
+        base_filters = [
+            InterviewEvaluation.candidate_id == report.candidate_id,
+            InterviewEvaluation.round == legacy_round,
+            InterviewEvaluation.ai_score.isnot(None),
+        ]
+        if latest_tid:
+            base_filters.append(InterviewQuestion.transcript_id == latest_tid)
+        else:
+            base_filters.append(InterviewQuestion.source == "transcript")
+
+        rows = await db.execute(
+            select(InterviewQuestion, InterviewEvaluation)
+            .join(InterviewEvaluation, InterviewEvaluation.question_id == InterviewQuestion.id)
+            .where(*base_filters)
+            .order_by(InterviewQuestion.index_num)
+        )
+        for question, ev in rows.all():
+            q_scores.append({
+                "questionId": str(question.id),
+                "question": question.content,
+                "category": question.category,
+                "answer": ev.answer,
+                "score": ev.ai_score,
+                "dimensions": ev.ai_dimensions or [],
+            })
     return {
         "reportId": str(report.id),
         "interviewId": str(report.interview_id),
@@ -657,6 +711,7 @@ def _serialize_ai_report(report: AIInterviewReport) -> dict:
         "score": report.score,
         "authenticityScore": report.authenticity_score,
         "advice": report.advice,
+        "questionScores": q_scores,
         "answeredDirectly": report.answered_directly,
         "roleClear": report.role_clear,
         "concreteResult": report.concrete_result,
@@ -686,8 +741,10 @@ async def get_ai_analysis(
         select(AIInterviewReport).where(AIInterviewReport.interview_id == iv.id)
     )).scalar_one_or_none()
     if not report:
-        return not_found("尚未生成 AI 分析")
-    return ok(_serialize_ai_report(report))
+        # 200 + data=null（而非 404）：前端每次进面试页都会调本端点恢复已持久化的报告，
+        # 未生成属常态，走 404 会被 client.ts 拦截器弹「尚未生成 AI 分析」toast 刷屏。
+        return ok(None)
+    return ok(await _serialize_ai_report(report, db))
 
 
 # ── POST /api/interviews/{id}/conclusion ─────────────────────

@@ -10,11 +10,13 @@ from app.database import Base
 
 class InterviewQuestion(Base):
     __tablename__ = "interview_questions"
-    # 唯一约束包含 source：面试出题(pre_generated)与面试评定转写抽取(transcript)
-    # 两类题目各自独立编号，互不冲突。
+    # 唯一约束包含 source 与 transcript_id：面试出题(pre_generated)与面试评定转写抽取(transcript)
+    # 两类题目各自独立编号；transcript 抽取题按 (transcript_id, index_num) 编号，
+    # 同一候选人同一轮多次上传互不冲突（pre_generated 的 transcript_id 为 NULL，
+    # PG 中 NULL 不参与唯一比较，保持各自独立编号）。
     __table_args__ = (
-        UniqueConstraint("candidate_id", "round", "source", "index_num",
-                         name="uq_interview_questions_cand_round_source_idx"),
+        UniqueConstraint("candidate_id", "round", "source", "transcript_id", "index_num",
+                         name="uq_interview_questions_cand_round_tid_source_idx"),
     )
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
