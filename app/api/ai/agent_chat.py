@@ -62,10 +62,51 @@ def _estimate_tokens_msgs(messages: list) -> int:
     return sum(_estimate_tokens(str(getattr(m, "content", "") or "")) for m in messages)
 
 
-def _compact_messages(messages: list, max_tokens: int = 6000) -> tuple[list, int]:
+_ENTITY_EXTRACT_RE = re.compile(
+    r'「([^「」]{2,8})」|'
+    r'([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})',
+    re.I,
+)
+
+
+def _extract_digest(units: list[list]) -> str:
+    """从被压缩丢弃的消息里提取高频实体（中文名 + UUID），供后续轮参考。
+
+    长对话截断会丢掉早期关键事实（候选人名/ID、岗位名）。这里用规则提取
+    「」内的 2~8 字片段和 UUID，拼成一行"早期对话要点"注入 system prompt，
+    让模型在后续轮仍知道早期提过哪些实体（真正的 LLM 滚动摘要是后续演进项，
+    规则版零延迟、不额外烧 token）。
+    """
+    found: list[str] = []
+    seen: set[str] = set()
+    for unit in units:
+        for m in unit:
+            text = str(getattr(m, "content", "") or "")
+            for mt in _ENTITY_EXTRACT_RE.finditer(text):
+                item = (mt.group(1) or mt.group(2) or "").strip()
+                if not item or len(item) > 8:
+                    continue
+                key = item.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                found.append(item)
+                if len(found) >= 8:
+                    break
+            if len(found) >= 8:
+                break
+    if not found:
+        return ""
+    return (
+        "（早期对话已压缩，其中提及过：" + "、".join(found) +
+        "——如后续需要引用这些实体，请以工具查询返回的真实数据为准）"
+    )
+
+
+def _compact_messages(messages: list, max_tokens: int = 6000) -> tuple[list, int, str]:
     """Token-budget truncation: drop oldest messages when over budget.
 
-    Returns (compacted_messages, n_dropped).
+    Returns (compacted_messages, n_dropped, digest).
     Keeps at least the final message (current user turn). Simpler and
     safer than the old CompactionPipeline, which was coupled to LoopState
     and silently corrupted ToolMessage metadata.
@@ -77,12 +118,14 @@ def _compact_messages(messages: list, max_tokens: int = 6000) -> tuple[list, int
     popped from the front message-by-message, a cut could land between
     such a pair and leave an orphaned ToolMessage with no preceding
     tool_calls — which OpenAI-compatible APIs reject outright (400).
+
+    ``digest``：被丢弃消息里提取的实体要点（空串表示本次未发生截断）。
     """
     if not messages:
-        return messages, 0
+        return messages, 0, ""
     total = _estimate_tokens_msgs(messages)
     if total <= max_tokens:
-        return messages, 0
+        return messages, 0, ""
 
     units: list[list] = []
     i, n = 0, len(messages)
@@ -96,16 +139,19 @@ def _compact_messages(messages: list, max_tokens: int = 6000) -> tuple[list, int
                 i += 1
         units.append(unit)
 
+    dropped_units: list[list] = []
     dropped = 0
     # Drop whole units from the front (oldest) but never drop the last unit.
     while len(units) > 1 and total > max_tokens:
         removed_unit = units.pop(0)
+        dropped_units.append(removed_unit)
         for m in removed_unit:
             total -= _estimate_tokens(str(getattr(m, "content", "") or ""))
         dropped += len(removed_unit)
 
+    digest = _extract_digest(dropped_units)
     result = [m for unit in units for m in unit]
-    return result, dropped
+    return result, dropped, digest
 
 
 async def _persist_assistant_turn(
@@ -307,14 +353,19 @@ async def _build_global_overview(db: AsyncSession, current: CurrentUser) -> dict
     return {
         "projectId": None,
         "projectName": None,
+        # 只有 genie 一个真实 agent（其余 AGENT_CONFIGS 仅作为 build_system_prompt 的
+        # 兜底映射保留，无独立工具集/路由）。工作台只展示 genie，避免「多 agent 协作」
+        # 的假象。
         "agents": [
             {
-                "id": aid, "name": cfg["name"], "description": cfg["description"],
-                "status": "就绪" if aid != "genie" else "全能就绪",
+                "id": "genie", "name": AGENT_CONFIGS["genie"]["name"],
+                "description": AGENT_CONFIGS["genie"]["description"],
+                "status": "全能就绪",
                 "tone": "active",
-                "icon": cfg["icon"], "iconBg": cfg["iconBg"], "iconColor": cfg["iconColor"],
-            }
-            for aid, cfg in AGENT_CONFIGS.items()
+                "icon": AGENT_CONFIGS["genie"]["icon"],
+                "iconBg": AGENT_CONFIGS["genie"]["iconBg"],
+                "iconColor": AGENT_CONFIGS["genie"]["iconColor"],
+            },
         ],
         "workflowSteps": [
             {"key": "recruit", "label": "筛选", "count": int(pending_screen), "active": True, "badgeTone": "green"},
@@ -1559,9 +1610,10 @@ async def agent_chat(
                     }
                     break
 
-        # Update session title
+        # Update session title（取首行并清洗，避免换行/首尾空白撑破标题 UI）
         if session.title in ("新对话", None, ""):
-            session.title = display_message[:50] if display_message else "新对话"
+            first_line = (display_message or "").strip().split("\n")[0].strip()
+            session.title = first_line[:50] if first_line else "新对话"
         session_title = session.title or "新对话"
 
         # Fetch conversation history (last 20)
@@ -1609,7 +1661,7 @@ async def agent_chat(
                         }],
                     ))
                     lc_messages.append(ToolMessage(
-                        content=str(tb["result"])[:1000],
+                        content=str(tb["result"])[:3000],
                         tool_call_id=tb["id"],
                         name=tb.get("name", ""),
                     ))
@@ -1662,7 +1714,12 @@ async def agent_chat(
                     if getattr(t, "name", None) not in _INGEST_UPLOAD_TOOLS
                 ]
 
-            system_prompt = build_system_prompt(agent_id, current.permissions)
+            # 能力清单由「实际注入模型的可见工具」反向驱动，与工具 fail-closed 过滤同源，
+            # 保证 AI 宣称的能力严格等于它能调的工具。
+            visible_tool_names = {
+                getattr(t, "name", "") for t in langchain_tools if getattr(t, "name", "")
+            }
+            system_prompt = build_system_prompt(agent_id, visible_tool_names=visible_tool_names)
 
             if ingestion_completed:
                 system_prompt += (
@@ -1672,7 +1729,11 @@ async def agent_chat(
                 )
 
             # ── Context compaction: keep history within token budget ──
-            compacted, _dropped = _compact_messages(lc_messages, max_tokens=6000)
+            # 若发生截断，把被丢弃消息里提取的实体要点注入 system prompt，
+            # 避免长对话早期确立的关键事实（候选人名/ID/岗位名）被静默丢弃。
+            compacted, _dropped, history_digest = _compact_messages(lc_messages, max_tokens=6000)
+            if history_digest:
+                system_prompt += "\n\n[历史要点] " + history_digest
 
             graph = build_agent_graph(langchain_tools, system_prompt)
 
@@ -1699,8 +1760,10 @@ async def agent_chat(
                         correction_msgs = compacted + [
                             AIMessage(content=result.full_content or ""),
                             HumanMessage(content=(
-                                "[系统校验] 以下写操作未能确认生效，请重新检查并在必要时"
-                                f"重新调用对应写工具，确保真正落库：\n{issues_text}"
+                                "[系统校验] 以下写操作未能确认生效。请先检查原因："
+                                "若操作其实已生效（可能只是回读时机太早），不要重复执行；"
+                                "若确实失败，重新调用对应写工具并确认成功：\n"
+                                f"{issues_text}"
                             )),
                         ]
                         retry_result = AgentResult()
@@ -1711,16 +1774,30 @@ async def agent_chat(
                             yield sse_str
                         if retry_result.full_content:
                             result.full_content = retry_result.full_content
-                        if retry_result.tool_blocks:
-                            result.tool_blocks.extend(retry_result.tool_blocks)
-                        # Re-verify after the correction pass.
-                        recheck = await _quality_guard.guard(
-                            tool_calls=retry_result.tool_blocks,
+                        # 最终验证必须覆盖「第一次 + 修正轮」的写操作：
+                        #   - 修正轮重调过的工具名 → 只验证修正轮那次（旧的失败调用若已
+                        #     被后续成功调用覆盖，不应拖累整体结果）；
+                        #   - 修正轮未重调的工具 → 仍验证第一次那次（真实生效则通过、
+                        #     仍失败则如实报告）。
+                        # 这样即使模型无视校验指令直接回复文本（retry 无 tool_blocks），
+                        # 也不会出现「空 tool_blocks → 假通过」——第一次的写操作仍会被回读验证。
+                        retry_blocks = retry_result.tool_blocks or []
+                        first_blocks = list(result.tool_blocks)
+                        retry_names = {b.get("name") for b in retry_blocks if b.get("name")}
+                        unretried = [
+                            b for b in first_blocks
+                            if b.get("name") not in retry_names
+                        ]
+                        if retry_blocks:
+                            result.tool_blocks.extend(retry_blocks)
+                        final_blocks = unretried + retry_blocks
+                        final_check = await _quality_guard.guard(
+                            tool_calls=final_blocks,
                             tool_executor=_verify_executor,
                         )
                         yield sse_event("verification", {
-                            "verified": recheck.passed,
-                            "issues": recheck.issues[:5],
+                            "verified": final_check.passed,
+                            "issues": final_check.issues[:5],
                         })
                     else:
                         yield sse_event("verification", {"verified": True, "issues": []})

@@ -56,14 +56,22 @@ def build_agent_graph(
 
     The agent node prepends the system prompt automatically.
     """
-    llm = create_langchain_llm(streaming=True, temperature=0.7)
+    _model_temperature = 0.7
+    llm = create_langchain_llm(streaming=True, temperature=_model_temperature)
     llm_with_tools = llm.bind_tools(tools)
 
     async def call_model(state: AgentState) -> dict:
         messages = list(state["messages"])
         if not messages or not isinstance(messages[0], SystemMessage):
             messages = [SystemMessage(content=system_prompt)] + messages
-        response = await llm_with_tools.ainvoke(messages)
+        try:
+            response = await llm_with_tools.ainvoke(messages)
+        except Exception:
+            # Provider failover：当前 key 调用失败时，用轮询的下一个 key 重建 LLM
+            # 重试一次（create_langchain_llm 内部会切到下一个 provider/key）。
+            # 仅重试一次，避免在长时间断连场景下叠加 SDK 层重试导致 60+ 秒超时。
+            retry_llm = create_langchain_llm(streaming=True, temperature=_model_temperature)
+            response = await retry_llm.bind_tools(tools).ainvoke(messages)
         return {"messages": [response]}
 
     def should_continue(state: AgentState) -> str:

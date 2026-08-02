@@ -38,6 +38,24 @@ def _expected_update_resume(params: dict) -> dict[str, str]:
     return {"status": STATUS_ALIASES.get(raw, raw)}
 
 
+def _expected_update_position(params: dict) -> dict[str, str]:
+    """update_position 的目标值：fields 里的可写字段。
+
+    format_projected 回读文本会以「字段名: 值」形式输出，值比对即可。
+    长文本（JD 正文等）只比对前 120 字符，避免回读截断导致误判。
+    """
+    fields = params.get("fields") or {}
+    if not isinstance(fields, dict):
+        return {}
+    out = {}
+    for k, v in fields.items():
+        if v is None:
+            continue
+        s = str(v)
+        out[k] = s if len(s) <= 120 else s[:120]
+    return out
+
+
 class WriteVerifier:
     """Post-write verification rules.
 
@@ -60,8 +78,11 @@ class WriteVerifier:
         },
         "update_position": {
             "verify_tool": "get_position",
-            "verify_params": lambda p: {"id": p["id"]},
-            "description": "验证岗位信息更新是否生效",
+            # view=full 必须覆盖全部可写字段（core 视图不含 screeningCriteria/
+            # week1ProjectRequirement 等），否则改这些字段时回读文本里找不到值会误报。
+            "verify_params": lambda p: {"id": p["id"], "view": "full"},
+            "expect": _expected_update_position,
+            "description": "验证岗位信息更新是否生效（比对目标字段值）",
         },
         "create_position": {
             "verify_tool": "list_positions",
@@ -78,13 +99,17 @@ class WriteVerifier:
             "verify_params": lambda p: {"id": p["id"]},
             "description": "验证岗位是否删除成功（期待 404）",
         },
+        # 注：save_questions / save_evaluation 只做「回读可达」，不做 expect 值比对——
+        # get_questions 对尚未进入可面试状态的候选人会返回「暂无题目」（状态 gate），
+        # get_evaluation 对无转写的候选人返回空，值比对会在正常业务下误报失败。
+        # 其路由层失败已由 handler 文本（"保存失败"）捕获，无需第二层 expect。
         "save_questions": {
             "verify_tool": "get_questions",
             "verify_params": lambda p: {
                 "candidateId": p["candidateId"],
                 "round": p["round"],
             },
-            "description": "验证面试题保存是否成功",
+            "description": "验证面试题保存后回读可达",
         },
         "save_evaluation": {
             "verify_tool": "get_evaluation",
@@ -92,7 +117,18 @@ class WriteVerifier:
                 "candidateId": p["candidateId"],
                 "round": p.get("round", "first"),
             },
-            "description": "验证面试评分保存是否成功",
+            "description": "验证面试评分保存后回读可达",
+        },
+        # submit_evaluation 是最危险的破坏性操作（按加权分自动推进/淘汰候选人），
+        # 此前完全无验证规则。目标状态依赖提交结果无法从参数推导 expect，
+        # 至少做「回读可达」确认评定记录确实存在。
+        "submit_evaluation": {
+            "verify_tool": "get_evaluation",
+            "verify_params": lambda p: {
+                "candidateId": p["candidateId"],
+                "round": p.get("round", "first"),
+            },
+            "description": "验证面试评定已提交（回读评定记录可达）",
         },
     }
 

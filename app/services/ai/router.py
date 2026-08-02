@@ -273,7 +273,13 @@ def create_langchain_llm(
             model_kwargs={"extra_body": {"thinking": {"type": "disabled"}}},  # deepseek-v4-flash 关闭思考
         )
 
-    key_id = _round_robin_clients[0]
+    # 轮询选择下一个 key（与 llm_chat 共享 _round_robin_index）：
+    # 让对话 agent 跨对话负载均衡，不再永远打第一个 provider。
+    # 同轮内某 key 失败的 failover 由 graph.py 的 call_model 捕获异常后重建重试。
+    global _round_robin_index
+    idx = _round_robin_index % len(_round_robin_clients)
+    _round_robin_index = (idx + 1) % len(_round_robin_clients)
+    key_id = _round_robin_clients[idx]
     meta = _client_meta.get(key_id)
     if not meta:
         return _fallback_langchain(temperature, streaming)

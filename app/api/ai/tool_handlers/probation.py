@@ -14,13 +14,19 @@ from app.agent.field_profiles import (
 
 async def _list_probation(params: dict, db: AsyncSession) -> str:
     from app.api.talent.probation import list_probation as fn
+    try:
+        page_size = int(params.get("limit", 10) or 10)
+    except (TypeError, ValueError):
+        page_size = 10
     result = await fn(
         department=params.get("department") or "all",
         status=params.get("status") or "all",
         page=1,
-        pageSize=int(params.get("limit", 10) or 10),
+        pageSize=page_size,
         db=db,
     )
+    if result.get("code") != 0:
+        return f"❌ 试用期员工查询失败：{result.get('message', '未知错误')}"
     data = result.get("data", {})
     if not isinstance(data, dict):
         return "查询完成"
@@ -28,7 +34,10 @@ async def _list_probation(params: dict, db: AsyncSession) -> str:
     items = data.get("list") or data.get("employees") or data.get("items") or []
     if not items:
         return f"试用期员工：共 {total} 人（无明细列表）"
-    limit = int(params.get("limit", 15) or 15)
+    try:
+        limit = int(params.get("limit", 15) or 15)
+    except (TypeError, ValueError):
+        limit = 15
     lines = [f"试用期员工：共 {total} 人，以下前 {min(limit, len(items))} 位："]
     for e in items[:limit]:
         lines.append(
@@ -43,6 +52,8 @@ async def _list_probation(params: dict, db: AsyncSession) -> str:
 async def _get_probation_stats(params: dict, db: AsyncSession) -> str:
     from app.api.talent.probation import get_probation_stats as fn
     result = await fn(db=db)
+    if result.get("code") != 0:
+        return f"❌ 试用期统计查询失败：{result.get('message', '未知错误')}"
     d = result.get("data", {})
     # 路由返回的 key 仍是 total/assessing/passed/failed，但口径已是新词表：
     # assessing = training+probation+pending_confirmation，passed = formal，

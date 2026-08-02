@@ -15,6 +15,8 @@ from app.agent.field_profiles import (
 async def _list_positions(params: dict, db: AsyncSession) -> str:
     from app.api.recruitment.positions import list_positions as fn
     result = await fn(db=db)
+    if result.get("code") != 0:
+        return f"❌ 岗位列表查询失败：{result.get('message', '未知错误')}"
     data = result["data"]
     lines = [f"共 {len(data)} 个岗位："]
     for p in data:
@@ -163,7 +165,9 @@ async def _get_position_questions(params: dict, db: AsyncSession) -> str:
 
     round_val = normalize_interview_round(params.get("round") or "first")
     result = await fn(position_id=params["positionId"], round=round_val, db=db)
-    qs = result.get("data", [])
+    if result.get("code") != 0:
+        return f"❌ 岗位题库查询失败：{result.get('message', '未知错误')}"
+    qs = result.get("data", []) or []
     if not qs:
         return f"岗位题库（{round_val}）暂无题目"
     lines = [f"岗位题库（{round_val}）共 {len(qs)} 道题："]

@@ -139,7 +139,7 @@ async def _update_resume(params: dict, db: AsyncSession) -> str:
     # hired 只能由「录用审批通过」自动生成(会同时创建 Employee 记录)，
     # 对话侧禁止直接把候选人改成 hired，否则会出现"候选人显示已录用但无员工档案"的脏数据。
     if fields.get("status") == "hired":
-        return "无法直接将候选人标记为已录用：请通过「录用审批」流程操作，审批通过后会自动生成员工档案。"
+        return "❌ 无法直接将候选人标记为已录用：请通过「录用审批」流程操作，审批通过后会自动生成员工档案。"
 
     result = await fn(resume_id=params["id"], body=fields, db=db)
     if result["code"] == 0:
@@ -161,6 +161,27 @@ async def _upload_resume(params: dict, db: AsyncSession) -> str:
     object_key = params["fileKey"]
     file_name = params["fileName"]
     position_id = params["positionId"]
+
+    # 归属校验：fileKey 必须是当前用户会话下已上传的素材（AgentMaterial），
+    # 防止模型读到任意 MinIO object_key 的内容。走 quality_guard 验证路径
+    # （_verify_executor 不传 current_user）时 contextvar 为 None → 跳过（验证只读不改）。
+    from app.api.ai.tool_executor import get_current_user_for_tools
+    cu = get_current_user_for_tools()
+    if cu is not None:
+        from app.models.agent_session import AgentMaterial, AgentSession
+        from app.core.permissions import WILDCARD_PERMISSION
+        mat = (
+            await db.execute(
+                select(AgentMaterial).where(AgentMaterial.file_path == object_key)
+            )
+        ).scalar_one_or_none()
+        if mat is None:
+            return f"❌ 上传简历失败：fileKey {object_key} 不是当前会话已上传的素材，无法读取"
+        if mat.session_id is not None:
+            sess = await db.get(AgentSession, mat.session_id)
+            if sess is not None and sess.owner_id is not None and sess.owner_id != cu.id and not cu.has(WILDCARD_PERMISSION):
+                return "❌ 上传简历失败：该素材不属于当前用户，无法读取"
+
     tmp_path = await asyncio.to_thread(minio_storage.download_to_temp, object_key)
     try:
         with open(tmp_path, "rb") as f:

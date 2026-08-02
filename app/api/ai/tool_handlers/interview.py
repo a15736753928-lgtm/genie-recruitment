@@ -21,6 +21,8 @@ async def _get_questions(params: dict, db: AsyncSession) -> str:
     result = await query_interview_questions(
         db, candidate_id=candidate_id, round=round_key,
     )
+    if result.get("code") != 0:
+        return f"❌ 面试题查询失败：{result.get('message', '未知错误')}"
     data = result.get("data", {}) or {}
     questions = data.get("questions", [])
     if questions:
@@ -73,6 +75,8 @@ async def _get_evaluation(params: dict, db: AsyncSession) -> str:
         round=round_key,
         transcript_id=params.get("transcriptId"),
     )
+    if result.get("code") != 0:
+        return f"❌ 面试评定查询失败：{result.get('message', '未知错误')}"
     data = result.get("data", {}) or {}
     scores = data.get("questions", [])
     if not scores:
@@ -104,6 +108,10 @@ async def _get_evaluation(params: dict, db: AsyncSession) -> str:
 async def _ai_score_question(params: dict, db: AsyncSession) -> str:
     from app.api.talent.interview import ai_score_question as fn
     result = await fn(question_id=params["questionId"], body={"answer": params.get("answer", "")}, db=db)
+    # 路由在「AI 评分开关关闭 / 手动评分模式」返回 fail(403)、题目不存在返回
+    # not_found——不检查 code 会把失败包装成"AI评分：0 分"，必须显式检查。
+    if result.get("code") != 0:
+        return f"❌ AI评分失败：{result.get('message', '未知错误')}"
     data = result.get("data", {})
     return f"AI评分：{data.get('score', 0)} 分"
 
@@ -111,10 +119,15 @@ async def _ai_score_question(params: dict, db: AsyncSession) -> str:
 async def _get_leaderboard(params: dict, db: AsyncSession) -> str:
     from app.api.talent.interview import get_leaderboard as fn
     result = await fn(category=params["category"], db=db)
+    if result.get("code") != 0:
+        return f"❌ 排行榜查询失败：{result.get('message', '未知错误')}"
     data = result.get("data", []) or []
     if not data:
         return "排行榜暂无数据"
-    limit = int(params.get("limit", 20) or 20)
+    try:
+        limit = int(params.get("limit", 20) or 20)
+    except (TypeError, ValueError):
+        limit = 20
     lines = [f"排行榜（{params.get('category', '')}）共 {len(data)} 人，前 {min(limit, len(data))} 名："]
     for i, r in enumerate(data[:limit], 1):
         lines.append(
@@ -187,6 +200,8 @@ async def _submit_evaluation(params: dict, db: AsyncSession) -> str:
 async def _get_rankings(params: dict, db: AsyncSession) -> str:
     from app.api.talent.interview import get_rankings as fn
     result = await fn(candidateId=params["candidateId"], db=db)
+    if result.get("code") != 0:
+        return f"❌ 排名查询失败：{result.get('message', '未知错误')}"
     data = result.get("data", [])
     if not data:
         return "暂无同岗位排名数据"

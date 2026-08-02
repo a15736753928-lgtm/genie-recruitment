@@ -785,6 +785,104 @@ TOOL_PERMISSIONS: dict[str, str] = {
 }
 
 
+# ── 工具分组 → 能力描述（AI 能力清单的唯一真源）─────────────────
+# 价值：build_capability_lines 据此把「当前用户可见的工具集」渲染成 AI 能正确
+#       回答的能力清单——AI 宣称的每项能力都有对应工具支撑，不再像旧方案那样
+#       按角色权限点宣称一堆对话里根本不存在的模块功能（录用/期权/培训/任务等）。
+# 规则：
+#   - 每个登录用户可见的工具必须且只能归入一个能力段；段名即 AI 对外宣称的能力。
+#   - 同组工具的 TOOL_PERMISSIONS 权限点必须一致（_validate_capability_groups
+#     启动时强制校验），避免命中低权限读工具却宣称该组的写能力（如只有 salary:view
+#     的用户不能因此宣称"可调整薪资"）。
+#   - 新增工具：在 TOOL_PERMISSIONS 登记权限的同时，必须把工具名归入对应能力段，
+#     否则启动即报错（fail-closed，杜绝清单漂移）。
+_CAPABILITY_GROUPS: tuple[tuple[str, frozenset[str], str], ...] = (
+    # (能力段名, 组内工具名集合, 能力描述)
+    ("岗位查询", frozenset({"list_positions", "get_position"}),
+     "浏览与查询招聘岗位"),
+    ("运营看板", frozenset({"get_operations_dashboard"}),
+     "查看招聘运营统计汇总（候选人/简历数量、状态分布、平均匹配分）"),
+    ("简历查看", frozenset({"list_resumes", "get_resume", "get_rankings"}),
+     "查询/查看候选人简历与匹配分，按岗位/状态/关键词找人，查看同岗位排名"),
+    ("简历处置", frozenset({"update_resume", "upload_resume", "batch_parse_resumes",
+                            "reanalyze_resume", "delete_resume"}),
+     "上传、删除、重新解析简历，并按初筛结果更新候选人状态"),
+    ("岗位管理", frozenset({"create_position", "update_position", "delete_position"}),
+     "创建/更新/删除招聘岗位，管理 JD 与岗位题库"),
+    ("面试出题", frozenset({"save_position_questions", "generate_questions",
+                            "save_questions", "replace_question"}),
+     "生成、保存、替换一面二面面试题目（出题会覆盖旧题）"),
+    ("面试评定", frozenset({"get_position_questions", "get_questions", "get_evaluation",
+                            "ai_score_question", "save_evaluation", "submit_evaluation",
+                            "get_leaderboard"}),
+     "查看候选人题单与岗位题库，录入候选人回答、AI 评分，查看排行榜并提交面试结论"),
+    ("试用期管理", frozenset({"list_probation", "get_probation_stats", "get_probation_employee",
+                              "create_probation_employee", "create_probation_task",
+                              "update_probation_task", "ai_evaluate_probation",
+                              "update_probation_status", "manual_review_probation"}),
+     "查看试用期员工与周任务，新增/跟踪周任务，AI 自动或手动评估"),
+    ("绩效查看", frozenset({"list_performance", "get_performance_stats",
+                            "get_department_performance", "get_grade_distribution",
+                            "get_quarter_trends"}),
+     "查看绩效统计、部门绩效、等级分布与季度趋势"),
+    ("发起考核", frozenset({"initiate_appraisal"}),
+     "发起季度绩效考核"),
+    ("薪资查看", frozenset({"get_bonus_info"}),
+     "查看员工薪资与奖金"),
+    ("薪资调整", frozenset({"update_bonus"}),
+     "调整员工薪资与奖金"),
+    ("系统管理", frozenset({"get_settings", "update_settings"}),
+     "查看与修改系统配置"),
+)
+
+
+def _validate_capability_groups() -> None:
+    """启动校验：能力分组必须覆盖 TOOL_PERMISSIONS 全部工具，且同组权限一致。
+
+    fail-closed：新增工具忘记归组、或误把不同权限的工具塞进同一能力段，
+    都会在启动时直接报错，杜绝能力清单与可见工具集漂移。
+    """
+    covered: set[str] = set()
+    for label, names, _desc in _CAPABILITY_GROUPS:
+        unknown = names - set(GENERAL_TOOL_NAMES)
+        if unknown:
+            raise ValueError(
+                f"能力分组[{label}]引用了未注册工具: {sorted(unknown)}"
+            )
+        perms = {TOOL_PERMISSIONS.get(n) for n in names}
+        if len(perms) > 1:
+            raise ValueError(
+                f"能力分组[{label}]内工具权限不一致: {sorted(perms)}"
+            )
+        covered |= names
+    ungrouped = set(TOOL_PERMISSIONS) - covered
+    if ungrouped:
+        raise ValueError(
+            "以下工具未归入任何能力分组（请在 tools.py 的 _CAPABILITY_GROUPS 登记）: "
+            f"{sorted(ungrouped)}"
+        )
+
+
+_validate_capability_groups()
+
+
+def build_capability_lines(visible_tool_names: set[str] | None = None) -> list[str]:
+    """按当前用户可见工具名集合生成 AI 能力清单。
+
+    visible_tool_names 为 None → 渲染全部能力段（未接权限的内部调用兜底，等价 admin）；
+    否则仅渲染「组内任一工具可见」的能力段——AI 宣称的能力严格等于它能调的工具，
+    与 get_tools_for_agent 的 fail-closed 过滤同源。空集 → 无能力段（由调用方补基础句）。
+    """
+    if visible_tool_names is None:
+        visible_tool_names = set(GENERAL_TOOL_NAMES)
+    visible = set(visible_tool_names)
+    return [
+        f"- **{label}**：{desc}"
+        for label, names, desc in _CAPABILITY_GROUPS
+        if names & visible
+    ]
+
+
 def get_tools_for_agent(agent_id: str = "genie", current_user=None) -> List[dict]:
     """Get the list of tool definitions for a specific agent type.
 

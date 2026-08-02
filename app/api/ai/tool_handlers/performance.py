@@ -7,12 +7,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 async def _list_performance(params: dict, db: AsyncSession) -> str:
     from app.api.talent.performance import list_performance as fn
+    try:
+        page_size = int(params.get("limit", 10) or 10)
+    except (TypeError, ValueError):
+        page_size = 10
     result = await fn(
         quarter=params.get("quarter"),
         page=1,
-        pageSize=int(params.get("limit", 10) or 10),
+        pageSize=page_size,
         db=db,
     )
+    if result.get("code") != 0:
+        return f"❌ 绩效查询失败：{result.get('message', '未知错误')}"
     data = result.get("data", {})
     if not isinstance(data, dict):
         return "查询完成"
@@ -20,7 +26,10 @@ async def _list_performance(params: dict, db: AsyncSession) -> str:
     items = data.get("list") or data.get("records") or data.get("items") or []
     if not items:
         return f"绩效数据：共 {total} 条记录（无明细）"
-    limit = int(params.get("limit", 15) or 15)
+    try:
+        limit = int(params.get("limit", 15) or 15)
+    except (TypeError, ValueError):
+        limit = 15
     lines = [f"绩效数据（{params.get('quarter','')}）：共 {total} 条，前 {min(limit, len(items))} 条："]
     for r in items[:limit]:
         lines.append(
@@ -35,6 +44,8 @@ async def _list_performance(params: dict, db: AsyncSession) -> str:
 async def _get_performance_stats(params: dict, db: AsyncSession) -> str:
     from app.api.talent.performance import get_performance_stats as fn
     result = await fn(quarter=params["quarter"], db=db)
+    if result.get("code") != 0:
+        return f"❌ 绩效统计查询失败：{result.get('message', '未知错误')}"
     d = result.get("data", {})
     return f"绩效统计：参与 {d.get('participants', 0)} 人，平均分 {d.get('avgScore', 0)}，优秀 {d.get('excellentCount', 0)}，待改进 {d.get('needsImprovement', 0)}"
 
@@ -42,6 +53,8 @@ async def _get_performance_stats(params: dict, db: AsyncSession) -> str:
 async def _get_department_performance(params: dict, db: AsyncSession) -> str:
     from app.api.talent.performance import get_department_performance as fn
     result = await fn(quarter=params["quarter"], db=db)
+    if result.get("code") != 0:
+        return f"❌ 部门绩效查询失败：{result.get('message', '未知错误')}"
     data = result.get("data", [])
     if not data:
         return f"部门绩效（{params.get('quarter','')}）：无数据"
@@ -55,7 +68,9 @@ async def _get_department_performance(params: dict, db: AsyncSession) -> str:
 async def _get_grade_distribution(params: dict, db: AsyncSession) -> str:
     from app.api.talent.performance import get_grade_distribution as fn
     result = await fn(quarter=params["quarter"], db=db)
-    data = result.get("data", [])
+    if result.get("code") != 0:
+        return f"❌ 等级分布查询失败：{result.get('message', '未知错误')}"
+    data = result.get("data", []) or []
     parts = [f"{g['grade']}:{g['count']}" for g in data]
     return f"等级分布：{', '.join(parts)}"
 
@@ -63,6 +78,8 @@ async def _get_grade_distribution(params: dict, db: AsyncSession) -> str:
 async def _get_bonus_info(params: dict, db: AsyncSession) -> str:
     from app.api.talent.performance import get_bonus_info as fn
     result = await fn(quarter=params["quarter"], db=db)
+    if result.get("code") != 0:
+        return f"❌ 奖金信息查询失败：{result.get('message', '未知错误')}"
     d = result.get("data", {})
     return f"奖金池：总额 {d.get('totalPool', 0)}，已分配 {d.get('distributed', 0)}，待分配 {d.get('pending', 0)}"
 
@@ -70,7 +87,9 @@ async def _get_bonus_info(params: dict, db: AsyncSession) -> str:
 async def _get_quarter_trends(params: dict, db: AsyncSession) -> str:
     from app.api.talent.performance import get_quarter_trends as fn
     result = await fn(db=db)
-    data = result.get("data", [])
+    if result.get("code") != 0:
+        return f"❌ 季度趋势查询失败：{result.get('message', '未知错误')}"
+    data = result.get("data", []) or []
     if not data:
         return "季度趋势：无数据"
     # 路由只返回 {quarter, score, isCurrent}（score 即该季度平均分），没有参与人数。

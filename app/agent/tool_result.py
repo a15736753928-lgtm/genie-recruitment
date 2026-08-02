@@ -138,13 +138,18 @@ class ToolResult:
         with markers like ``❌`` / ``失败：`` / ``错误``. We detect those so the
         frontend and verification badge get a real success/failure signal
         instead of a hardcoded ``True``.
+
+        失败判定的优先级（2026-08-02 增强）：
+          1. ``❌`` 是强失败信号——全文本任意位置出现即判失败。约定所有新增/
+             修复的失败返回路径统一带 ``❌`` 前缀，杜绝"失败被包装成成功"。
+          2. 其余 marker 只查文本前 40 字符（保守，避免成功结果中偶然出现的
+             "失败/错误"等词造成误判）。
         """
         text = result_text or ""
-        # Only treat as failure when a marker appears near the start — avoids
-        # false positives when a successful result merely mentions the word
-        # (e.g. a list that contains "查询失败的记录: 0").
-        head = text[:40]
-        is_failure = any(m in head for m in cls._FAILURE_MARKERS)
+        is_failure = "❌" in text
+        if not is_failure:
+            head = text[:40]
+            is_failure = any(m in head for m in cls._FAILURE_MARKERS)
         return cls(
             success=not is_failure,
             tool_name=tool_name,

@@ -15,6 +15,8 @@ from app.agent.field_profiles import (
 async def _get_settings(params: dict, db: AsyncSession) -> str:
     from app.api.system.settings import get_settings as fn
     result = await fn(db=db)
+    if result.get("code") != 0:
+        return f"❌ 系统设置查询失败：{result.get('message', '未知错误')}"
     data = result.get("data", {}) or {}
     view, fields, purpose = parse_fields_param(params)
     selected = resolve_fields(
