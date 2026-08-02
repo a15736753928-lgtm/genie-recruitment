@@ -22,7 +22,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
 from app.models.recruitment import Candidate, Position
 from app.models.phase1 import Interview, InterviewerScore, AIInterviewReport, ResumeScore
-from app.models.interview import InterviewTranscript, InterviewQuestion, InterviewEvaluation
+from app.models.interview import (
+    InterviewTranscript,
+    InterviewQuestion,
+    InterviewEvaluation,
+    InterviewSegmentEvaluation,
+)
 from app.core.security import get_current_user, require_permission, CurrentUser
 from app.core.state_machine import transition, StateError
 from app.core.exceptions import push_exception, has_blocking_exception
@@ -703,6 +708,29 @@ async def _serialize_ai_report(report: AIInterviewReport, db: AsyncSession) -> d
                 "score": ev.ai_score,
                 "dimensions": ev.ai_dimensions or [],
             })
+
+    # 片段评分（自我介绍 / 反问环节）：与逐题 Q&A 分开返回，计分权重体系不同
+    # （submit_evaluation 中 Q&A 80% / 自我介绍 10% / 反问 10%）。反问环节的问题
+    # 由候选人提问、面试官回答，不能混进逐题 AI 评分。
+    segments: dict = {}
+    if report.candidate_id:
+        seg_filters = [
+            InterviewSegmentEvaluation.candidate_id == report.candidate_id,
+            InterviewSegmentEvaluation.round == legacy_round,
+        ]
+        if latest_tid:
+            seg_filters.append(InterviewSegmentEvaluation.transcript_id == latest_tid)
+        seg_rows = await db.execute(
+            select(InterviewSegmentEvaluation).where(*seg_filters)
+        )
+        for s in seg_rows.scalars().all():
+            segments[s.segment_type] = {
+                "segmentType": s.segment_type,
+                "content": s.content or "",
+                "aiScore": s.ai_score,
+                "aiDimensions": s.ai_dimensions or [],
+                "hrScore": s.hr_score,
+            }
     return {
         "reportId": str(report.id),
         "interviewId": str(report.interview_id),
@@ -712,6 +740,7 @@ async def _serialize_ai_report(report: AIInterviewReport, db: AsyncSession) -> d
         "authenticityScore": report.authenticity_score,
         "advice": report.advice,
         "questionScores": q_scores,
+        "segments": segments,
         "answeredDirectly": report.answered_directly,
         "roleClear": report.role_clear,
         "concreteResult": report.concrete_result,

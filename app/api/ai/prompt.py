@@ -49,7 +49,7 @@ def _load_all() -> str:
 AGENT_CONFIGS = {
     "genie": {
         "name": "Genie 全能助手",
-        "description": "通过对话框完成招聘系统所有操作：简历筛选、面试出题、面试评定、试用期考核、绩效管理、知识库管理、系统设置",
+        "description": "通过对话框，按你的账号权限完成招聘系统各环节操作",
         "icon": "search",
         "iconBg": "#e8f4fd",
         "iconColor": "#2196f3",
@@ -85,15 +85,39 @@ AGENT_CONFIGS = {
 }
 
 
-def build_system_prompt(agent_id: str = "genie") -> str:
+def build_system_prompt(agent_id: str = "genie", permissions: set[str] | None = None) -> str:
     """Build the full system prompt for a given agent.
 
     Loads prompt text from the ``prompts/`` directory, then interpolates
     the agent's name and description via ``str.format()``.
+
+    ``permissions``：当前用户的权限点并集。非空时按权限收敛 AI 的可见能力清单
+    （见 core/permissions.py 的 build_capability_lines），避免 system prompt
+    把用户本无权操作的功能全部宣称出来；传 None（未接权限的调用方）时保持全量
+    能力，作为兜底以免误裁。
     """
     agent_info = AGENT_CONFIGS.get(agent_id, AGENT_CONFIGS["genie"])
     template = _load_all()
+    capabilities = _render_capabilities(permissions)
     return template.format(
         name=agent_info["name"],
         description=agent_info["description"],
+        capabilities=capabilities,
     )
+
+
+def _render_capabilities(permissions: set[str] | None) -> str:
+    """渲染 AI 可见能力清单。
+
+    permissions 为空集/None → 全量能力（旧行为，兜底）；否则按权限收敛。
+    """
+    from app.core.permissions import build_capability_lines, WILDCARD_PERMISSION
+
+    if not permissions:
+        # 未接权限的调用方（如内部路径）→ 等价于 admin 通配，渲染全部能力段
+        permissions = {WILDCARD_PERMISSION}
+    lines = build_capability_lines(permissions)
+    if not lines:
+        # 极端情况：用户无任何业务权限点 → 仍给一句基础定位，避免空白段
+        return "- 查询系统信息、处理你能访问的招聘事项；如需更多权限请联系管理员"
+    return "\n".join(lines)

@@ -311,21 +311,33 @@ async def extract_qa_from_transcript(transcript_text: str, position_name: str) -
    - ✅ "请先做一个简单的自我介绍吧。"
 3. **去重**（极其重要）：同一道问题如果在转写中出现多次（面试官口头重复、引导、过渡后重述），只保留最完整的一次。判断标准：去掉问候语/过渡语后，核心问题相同的只保留一条。
 4. 自我介绍只出现一次——即使面试官在不同时间点多次要求「请先做自我介绍」，也只保留一条最完整的记录。
-5. 每条包含：question（面试官问题原文，去掉问候语/引导语，只保留问题核心）、answer（候选人回答原文，保留关键内容）、category（从「技术能力、项目经验、工程素养、团队协作、架构设计、领导力、沟通表达」中选一个）。
-6. 按面试发生顺序输出。
-7. 若文本明显不是面试对话，返回空数组 []。
-8. 严格返回纯 JSON 数组，不要包含任何 markdown 代码围栏、解释文字或前后缀。
+5. **排除反问环节（最关键，务必遵守）**：反问环节 = 面试结尾候选人向面试官提问、面试官解答的对话，
+   通常由面试官说「你还有什么想问我的吗」「你有什么问题想问我吗」「要不要问我几个问题」等引出。
+   这类对话的提问方是候选人、回答方是面试官，方向与普通问答相反，**一律不要抽取**（反问环节由专门的评分模块独立评估）。
+   判断方法：若某句「问题」由候选人说出、面试官回答，即属反问环节，跳过。例如：
+   - ❌ question="这个岗位目前主要的业务场景是什么？"（候选人问面试官，不是面试官问候选人）
+   - ❌ question="团队目前的技术栈主要是什么？"（同上，方向反了）
+6. **每条必须输出 `questioner` 字段**：标注本条的提问方，只能是 `"面试官"` 或 `"候选人"`。
+   - 普通问答（面试官提问、候选人回答）填 `"面试官"`。
+   - 反问环节（候选人提问、面试官回答）填 `"候选人"`——后端会据此丢弃该条目。
+   - **不得省略该字段，也不得填其他值。**
+7. 其余字段：question（问题原文，去掉问候语/引导语，只保留问题核心）、answer（回答原文，保留关键内容）、category（从「技术能力、项目经验、工程素养、团队协作、架构设计、领导力、沟通表达」中选一个）。
+8. 按面试发生顺序输出。
+9. 若文本明显不是面试对话，返回空数组 []。
+10. 严格返回纯 JSON 数组，不要包含任何 markdown 代码围栏、解释文字或前后缀。
 
 输出格式（最多15条）：
-[{{"question": "面试官问题（去掉问候语）", "answer": "候选人回答原文", "category": "技术能力"}}, ...]
+[{{"question": "问题原文", "answer": "回答原文", "category": "技术能力", "questioner": "面试官"}}, ...]
 
 错误示例（禁止）：
 - question="你好，欢迎参加面试，我是负责XX岗位的面试官，请先做个自我介绍吧。"  ← 包含问候语
 - question="请先做个自我介绍。" 且出现两次  ← 未去重
+- question="这个岗位目前主要的业务场景是什么？", questioner="候选人"  ← 反问环节（候选人问面试官），后端会丢弃，必须跳过
+- question="团队目前的技术栈主要是什么？", questioner="候选人"  ← 同上，方向反了
 
 正确示例：
-- question="请先做一个简单的自我介绍吧。", answer="我叫张三...", category="沟通表达"
-- question="讲一下你最近负责的订单系统架构。", answer="我们用了微服务...", category="架构设计"
+- question="请先做一个简单的自我介绍吧。", answer="我叫张三...", category="沟通表达", questioner="面试官"
+- question="讲一下你最近负责的订单系统架构。", answer="我们用了微服务...", category="架构设计", questioner="面试官"
 
 面试转写文本：
 {transcript_slice}"""
@@ -344,7 +356,13 @@ async def extract_qa_from_transcript(transcript_text: str, position_name: str) -
             )
             raw_content = response.choices[0].message.content or ""
             data = _extract_json_array(raw_content)
-            result = [d for d in data if isinstance(d, dict) and d.get("question")]
+            # 反问环节（提问人为候选人、回答人是面试官）在此剔除，避免混入逐题 AI 评分。
+            # prompt 已要求每条输出 questioner；字段缺失时默认视为面试官提问（放行，与旧行为一致）。
+            result = [
+                d for d in data
+                if isinstance(d, dict) and d.get("question")
+                and str(d.get("questioner") or "面试官").strip() != "候选人"
+            ]
             result = _deduplicate_qa(result)
             if result:
                 if attempt > 1:

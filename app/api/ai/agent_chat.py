@@ -1662,7 +1662,7 @@ async def agent_chat(
                     if getattr(t, "name", None) not in _INGEST_UPLOAD_TOOLS
                 ]
 
-            system_prompt = build_system_prompt(agent_id)
+            system_prompt = build_system_prompt(agent_id, current.permissions)
 
             if ingestion_completed:
                 system_prompt += (
