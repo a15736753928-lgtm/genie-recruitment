@@ -47,7 +47,7 @@ async def _require_interview_write(current: CurrentUser = Depends(get_current_us
     raise PermissionError_(f"无权限: 需要 {' 或 '.join(_INTERVIEW_WRITE_PERMS)} 之一")
 
 
-INTERVIEW_ELIGIBLE_STATUSES = {"invited", "round1", "round2"}
+INTERVIEW_ELIGIBLE_STATUSES = {"round1", "round2"}
 
 
 def normalize_interview_round(round: str) -> str:

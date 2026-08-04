@@ -10,6 +10,19 @@ import time
 from app.config import get_settings
 from app.log_config import configure_logging
 
+# ── 禁用代理直连 LLM API（必须在任何 openai client 创建之前设置）──
+# Windows 系统代理（如 127.0.0.1:7890）会让 httpx/openai SDK 走代理访问
+# api.deepseek.com / api.xiaomimimo.com，代理连不上时抛 APIConnectionError
+# → SSE 流没内容，前端表现为对话"卡死"（实测 trust_env=True 走代理失败、
+# 直连成功）。NO_PROXY 强制这些域直连；保留用户已有的 NO_PROXY 配置。
+_NO_PROXY_EXTRA = "api.deepseek.com,api.xiaomimimo.com,localhost,127.0.0.1,0.0.0.0"
+_existing_no_proxy = os.environ.get("NO_PROXY", "").strip()
+os.environ["NO_PROXY"] = (
+    _existing_no_proxy + "," + _NO_PROXY_EXTRA
+    if _existing_no_proxy
+    else _NO_PROXY_EXTRA
+)
+
 # ── Early UTF-8 setup (before uvicorn takes over) ──
 # On Windows the default stdout/stderr encoding is often GBK and chokes on
 # emoji/box-drawing characters used in startup logs. Force UTF-8 so logs
@@ -105,6 +118,35 @@ async def lifespan(app: FastAPI):
                     await session.rollback()
                     logger.warning("欢迎页推荐定时刷新失败: %s", e)
 
+        async def _scheduled_offer_expiry_scan():
+            """Offer 超期扫描：超时未接受 → 自动失效 + 候选人视为放弃归人才库。"""
+            from app.services.offer.scheduler import offer_expiry_scan
+            async with async_session_factory() as session:
+                try:
+                    n = await offer_expiry_scan(session)
+                    await session.commit()
+                    if n:
+                        logger.info("Offer 过期扫描: %d 单自动失效", n)
+                except Exception as e:
+                    await session.rollback()
+                    logger.warning("Offer 过期扫描失败: %s", e)
+
+        async def _scheduled_offer_reminders():
+            """Offer 提醒：审批人待审批提醒 + HR 快到期提醒（log_only）。"""
+            from app.services.offer.scheduler import (
+                check_offer_pending_approval_reminders, check_offer_expiring_reminders,
+            )
+            async with async_session_factory() as session:
+                try:
+                    n1 = await check_offer_pending_approval_reminders(session)
+                    n2 = await check_offer_expiring_reminders(session)
+                    await session.commit()
+                    if n1 or n2:
+                        logger.info("Offer 提醒: 待审批 %d / 快到期 %d", n1, n2)
+                except Exception as e:
+                    await session.rollback()
+                    logger.warning("Offer 提醒任务失败: %s", e)
+
         from datetime import datetime, timedelta
 
         scheduler = AsyncIOScheduler()
@@ -118,9 +160,12 @@ async def lifespan(app: FastAPI):
             id="welcome_prompts",
             next_run_time=datetime.now() + timedelta(seconds=15),
         )
+        # Offer：每小时扫一次过期；每天 09:05 跑提醒
+        scheduler.add_job(_scheduled_offer_expiry_scan, "interval", hours=1, id="offer_expiry_scan")
+        scheduler.add_job(_scheduled_offer_reminders, "cron", hour=9, minute=5, id="offer_reminders")
         scheduler.start()
         logger.info(
-            "✓ 定时任务已注册 (清理 02:00 / 面试提醒 09:00 / 欢迎页推荐 每30分钟) (%s)",
+            "✓ 定时任务已注册 (清理 02:00 / 面试提醒 09:00 / 欢迎页推荐 每30分钟 / Offer过期 每小时 / Offer提醒 09:05) (%s)",
             _elapsed(),
         )
     except Exception as e:
@@ -283,6 +328,7 @@ from app.api.recruitment import requests as recruitment_requests_router, scoring
 # 人才评估
 from app.api.talent import interview, probation, performance, phase1_interview, phase2 as phase2_probation, phase4 as phase4_talent
 from app.api.talent import offer as offer_router_module
+from app.api.talent import offer_public as offer_public_router_module
 # 知识库/RAG 路由已断开（2026-08-01）——knowledge_base 与 rag 模块停用，文件保留待定去留
 # AI 功能 — 唯一 Agent 入口（v1/v2/v3 已合并，agent_chat_v2 已删除）
 from app.api.ai import agent_chat as ai_agent
@@ -307,6 +353,7 @@ app.include_router(interview.router, prefix="/api")
 app.include_router(phase1_interview.router, prefix="/api")
 app.include_router(probation.router, prefix="/api")
 app.include_router(offer_router_module.router, prefix="/api")
+app.include_router(offer_public_router_module.router)  # 公开候选人确认页(无 /api 前缀, 无鉴权)
 app.include_router(phase2_probation.router, prefix="/api")  # 第二期: 试用期+培训+带教
 app.include_router(points_router.router, prefix="/api")    # 第三期: 任务积分奖惩申诉
 app.include_router(phase4_talent.router, prefix="/api")    # 第四期: 人才池/晋级/期权/看板

@@ -70,10 +70,10 @@ class Candidate(Base):
     email = Column(String(128))
     position_id = Column(UUID(as_uuid=True), ForeignKey("positions.id"))
     score = Column(Integer, default=0)
-    status = Column(String(32), nullable=False, default="new")
+    status = Column(String(32), nullable=False, default="job_hunting")
     # 合法值与迁移见 app/core/state_machine.py TRANSITIONS["candidate"]:
-    # new / parsed / pending_screen / pending_materials / invited /
-    # round1 / round2 / pending_offer / hired / talent_pool / rejected
+    #   job_hunting(求职中) / round1(一面中) / round2(二面中) / pending_offer(待发Offer)
+    #   / hired(已录用,仅Offer审批) / rejected(未通过) / talent_pool(已失效,入人才池)
     # 一律通过 core.state_machine.transition() 变更，不允许直接赋值。
     resume_file = Column(String(512))
     resume_file_hash = Column(String(64), nullable=True, index=True)
@@ -85,6 +85,9 @@ class Candidate(Base):
     # Interview tracking
     interviewer = Column(String(64), nullable=True)
     interview_round = Column(String(8), nullable=True)
+    # 主档版本号（2026-08-03, _migrate_v20）：reanalyze / 手动编辑时递增，
+    # Offer 等派生记录存创建时的版本，用于数据一致性提示与溯源。
+    profile_version = Column(Integer, nullable=False, default=1)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

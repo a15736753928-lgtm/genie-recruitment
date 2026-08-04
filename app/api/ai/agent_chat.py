@@ -214,7 +214,7 @@ async def _persist_assistant_turn(
                     extra_body={"thinking": {"type": "disabled"}},  # deepseek-v4-flash 关闭思考
                     messages=[{"role": "user", "content": title_prompt}],
                     temperature=0.7,
-                    max_tokens=32,
+                    max_tokens=512,
                 )
                 new_title = title_resp.choices[0].message.content.strip().strip('"').strip("'")
                 if new_title and len(new_title) > 1:
@@ -325,14 +325,14 @@ async def _build_global_overview(db: AsyncSession, current: CurrentUser) -> dict
     业务统计数字（待筛简历等）保持全局；active_task 收窄到 current 可见会话范围，
     避免把别人的进行中任务显示在工作台。
     """
-    pending_screen = (await db.execute(
-        select(func.count()).select_from(Candidate).where(
-            Candidate.status.in_(["new", "parsed", "pending_screen", "pending_materials"])
-        )
+    # 新词表：求职中 = job_hunting（含原 new/parsed/pending_screen/pending_materials）；
+    # 面试中 = round1 + round2（invited 已删除，筛选通过直接一面）。
+    job_hunting = (await db.execute(
+        select(func.count()).select_from(Candidate).where(Candidate.status == "job_hunting")
     )).scalar() or 0
     interview_count = (await db.execute(
         select(func.count()).select_from(Candidate).where(
-            Candidate.status.in_(["invited", "round1", "round2"])
+            Candidate.status.in_(["round1", "round2"])
         )
     )).scalar() or 0
     # 「待发 offer」必须统计 pending_offer；此前统计的是 invited（刚邀约面试），
@@ -368,13 +368,13 @@ async def _build_global_overview(db: AsyncSession, current: CurrentUser) -> dict
             },
         ],
         "workflowSteps": [
-            {"key": "recruit", "label": "筛选", "count": int(pending_screen), "active": True, "badgeTone": "green"},
+            {"key": "recruit", "label": "筛选", "count": int(job_hunting), "active": True, "badgeTone": "green"},
             {"key": "interview", "label": "面试", "count": int(interview_count), "active": interview_count > 0, "badgeTone": "blue"},
             {"key": "training", "label": "试用", "count": 0, "active": False, "badgeTone": "gray"},
             {"key": "performance", "label": "绩效", "count": 0, "active": False, "badgeTone": "gray"},
         ],
         "stats": [
-            {"key": "resumes", "label": "待处理简历", "value": int(pending_screen), "hint": "待筛选", "hintTone": "up"},
+            {"key": "resumes", "label": "求职中", "value": int(job_hunting), "hint": "待筛选", "hintTone": "up"},
             {"key": "interviews", "label": "待面试", "value": int(interview_count), "hint": "流程中", "hintTone": "default"},
             {"key": "offers", "label": "待发offer", "value": int(pending_offer), "hint": "二面已通过", "hintTone": "default"},
             {"key": "positions", "label": "在招岗位", "value": int(position_count), "hint": "持续招聘", "hintTone": "up"},
@@ -925,7 +925,7 @@ async def materials_from_candidates(
             "position": candidate.position.name if candidate.position else "",
             "positionId": str(candidate.position_id) if candidate.position_id else "",
             "score": candidate.score or 0,
-            "status": candidate.status or "new",
+            "status": candidate.status or "job_hunting",
             "skills": [s.skill for s in (candidate.skills or [])],
         })
 
@@ -993,7 +993,7 @@ async def ingest_materials_batch(
                     "position": candidate.position.name if candidate.position else "",
                     "positionId": str(candidate.position_id) if candidate.position_id else "",
                     "score": candidate.score or 0,
-                    "status": candidate.status or "new",
+                    "status": candidate.status or "job_hunting",
                     "skills": [s.skill for s in (candidate.skills or [])],
                 }
                 continue
@@ -1061,7 +1061,7 @@ async def ingest_materials_batch(
                                 "position": candidate.position.name if candidate.position else "",
                                 "positionId": str(candidate.position_id) if candidate.position_id else "",
                                 "score": candidate.score or 0,
-                                "status": candidate.status or "new",
+                                "status": candidate.status or "job_hunting",
                                 "skills": [s.skill for s in (candidate.skills or [])],
                             })
                         await task_db.commit()
@@ -1084,7 +1084,7 @@ async def ingest_materials_batch(
                                 "position": candidate.position.name if candidate.position else "",
                                 "positionId": str(candidate.position_id) if candidate.position_id else "",
                                 "score": candidate.score or 0,
-                                "status": candidate.status or "new",
+                                "status": candidate.status or "job_hunting",
                                 "skills": [s.skill for s in (candidate.skills or [])],
                             })
                         await task_db.commit()
@@ -1314,7 +1314,7 @@ async def upload_material(
         candidate = Candidate(
             name=parsed.get("name") or filename,
             position_id=resolved_position_id,
-            status="new",
+            status="job_hunting",
             resume_file=object_key,
             upload_time=date.today(),
         )
@@ -1354,7 +1354,7 @@ async def upload_material(
                 "position": position_name,
                 "positionId": resolved_position_id,
                 "score": candidate.score or 0,
-                "status": candidate.status or "new",
+                "status": candidate.status or "job_hunting",
                 "skills": [s.skill for s in (candidate.skills or [])],
             }
 
@@ -1719,7 +1719,13 @@ async def agent_chat(
             visible_tool_names = {
                 getattr(t, "name", "") for t in langchain_tools if getattr(t, "name", "")
             }
-            system_prompt = build_system_prompt(agent_id, visible_tool_names=visible_tool_names)
+            # 叠加当前账号角色专属段（prompts/roles/<role>.txt）——身份/职责视角/
+            # 话术按角色差异化，工具可见性仍由 visible_tool_names 同源驱动。
+            system_prompt = build_system_prompt(
+                agent_id,
+                visible_tool_names=visible_tool_names,
+                role_codes=current.roles,
+            )
 
             if ingestion_completed:
                 system_prompt += (

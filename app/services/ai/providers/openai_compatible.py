@@ -1,6 +1,7 @@
 """OpenAI 兼容协议 Provider（DeepSeek、OpenAI、Ollama 等）。"""
 from __future__ import annotations
 
+import httpx
 import logging
 from typing import Any
 
@@ -53,9 +54,11 @@ class OpenAICompatibleAdapter:
             base_url=provider.get("baseUrl") or provider.get("base_url", ""),
             temperature=temperature,
             streaming=streaming,
-            timeout=60,
+            # 连接超时 10s 快速暴露网络失败，读取超时放宽到 120s（LLM 生成本就慢）
+            timeout=httpx.Timeout(connect=10.0, read=120.0, write=60.0, pool=10.0),
             max_retries=2,
-            model_kwargs={"extra_body": {"thinking": {"type": "disabled"}}},  # deepseek-v4-flash 关闭思考
+            max_tokens=8192,  # 对话 agent 输出上限拉满，避免 reasoning/长回复被截断成空内容
+            extra_body={"thinking": {"type": "disabled"}},  # deepseek-v4-flash 关闭思考（显式传参，避免 model_kwargs 触发 UserWarning）
         )
 
     @staticmethod

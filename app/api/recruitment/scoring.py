@@ -252,14 +252,8 @@ async def score_candidate(
     score_obj = await _save_score(db, candidate, raw, position_id=pid, thresholds=thresholds)
     await db.flush()
 
-    # 评分完成即进入待筛选池。
-    if candidate.status in ("new", "parsed"):
-        try:
-            await transition(db, "candidate", candidate, "pending_screen",
-                             actor_id=current.id, actor_name=current.username,
-                             skip_block_check=True)
-        except StateError as e:
-            logger.warning("候选人 %s 打分后无法进入待筛选: %s", cid, e.message)
+    # 评分在入库后统一后台执行；新模型下候选人入库即 job_hunting，评分不改变状态，
+    # 无需再迁移（旧逻辑 new/parsed→pending_screen 已随状态合并废弃）。
 
     return ok(serialize_score(score_obj, current))
 
@@ -364,16 +358,9 @@ async def candidate_decision(
     # 状态迁移
     try:
         if body.action == "invite":
-            # new/parsed 须先经过 pending_screen，才能迁到 invited
-            if candidate.status in ("new", "parsed"):
-                await transition(db, "candidate", candidate, "pending_screen",
-                                 actor_id=current.id, actor_name=current.username,
-                                 reason="自动推进至待筛选")
-            await transition(db, "candidate", candidate, "invited",
-                             actor_id=current.id, actor_name=current.username,
-                             reason=body.reason)
-            # 进入 invited(待安排面试)后，自动落一条一面记录，使面试管理页有进度。
-            # 幂等：该候选人+round==r1 已有记录则跳过，避免重复 invite 撞 uq_interview_cand_round。
+            # 筛选通过 → 保持求职中（待安排一面），仅自动落一面草稿。
+            # 真正进入"一面中(round1)"由 phase1_interview 安排一面时迁移，
+            # 避免与 schedule r1 的 job_hunting→round1 迁移冲突。
             existing_r1 = (await db.execute(
                 select(Interview.id).where(
                     Interview.candidate_id == candidate.id,
@@ -390,6 +377,7 @@ async def candidate_decision(
                     status="scheduled",
                 ))
         elif body.action == "reserve":
+            # 已失效 / 暂缓 → 归入人才池留档
             await transition(db, "candidate", candidate, "talent_pool",
                              actor_id=current.id, actor_name=current.username,
                              reason=body.reason)
@@ -399,11 +387,12 @@ async def candidate_decision(
                              reason=body.reason)
         elif body.action == "transfer":
             candidate.position_id = target_position
-            await transition(db, "candidate", candidate, "pending_screen",
+            await transition(db, "candidate", candidate, "job_hunting",
                              actor_id=current.id, actor_name=current.username,
                              reason=body.reason, skip_block_check=True)
         elif body.action == "supplement":
-            await transition(db, "candidate", candidate, "pending_materials",
+            # 补材料不再有独立状态；并入求职中，补料诉求由材料字段/列表标记承载
+            await transition(db, "candidate", candidate, "job_hunting",
                              actor_id=current.id, actor_name=current.username,
                              reason=body.material_note or body.reason,
                              skip_block_check=True)

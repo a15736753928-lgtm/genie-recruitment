@@ -24,6 +24,10 @@ from app.models.phase1 import (
     Interview, InterviewerScore, AIInterviewReport,
     OfferApproval,
 )
+# Offer 管理模块附属表
+from app.models.offer_module import (
+    OfferTemplate, OfferApprovalFlow, OfferApprovalRecord, OfferAttachment,
+)
 # 第一期 AI 产物表
 from app.models.phase1_ai import PositionAIArtifact
 # 第二期业务表
@@ -56,6 +60,7 @@ __all__ = [
     "ResumeScore",
     "Interview", "InterviewerScore", "AIInterviewReport",
     "OfferApproval",
+    "OfferTemplate", "OfferApprovalFlow", "OfferApprovalRecord", "OfferAttachment",
     "PositionAIArtifact",
     "ProbationPlan", "ProbationWeekReview", "ConfirmationReview",
     "TrainingCourse", "EmployeeTrainingProgress", "MentorRecord",

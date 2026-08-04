@@ -56,6 +56,8 @@ class AnthropicAdapter:
             api_key=api_key_plain,
             temperature=temperature,
             streaming=streaming,
+            # Anthropic API 强制要求显式 max_tokens，缺省会 400
+            max_tokens=8192,
         )
 
     @staticmethod

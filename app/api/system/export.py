@@ -14,16 +14,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.database import get_db
-from app.models.recruitment import Candidate
+from app.models.recruitment import Candidate, Position
 from app.models.interview import InterviewEvaluation
 from app.models.performance import PerformanceRecord
 from app.models.probation import Employee
+from app.models.phase1 import OfferApproval
+from app.core.security import get_current_user, CurrentUser, PermissionError_
 from app.services.system.system_settings import get_system_setting
 from app.utils.responses import fail
 
 router = APIRouter(tags=["数据导出"])
 
-SUPPORTED_MODULES = {"resumes", "interviews", "probation", "performance"}
+SUPPORTED_MODULES = {"resumes", "interviews", "probation", "performance", "offers"}
 
 
 def _to_csv(headers: Sequence[str], rows: List[List[Any]]) -> bytes:
@@ -53,7 +55,11 @@ def _to_xlsx(headers: Sequence[str], rows: List[List[Any]]) -> bytes:
 
 
 @router.get("/export/{module}")
-async def export_module(module: str, db: AsyncSession = Depends(get_db)):
+async def export_module(
+    module: str,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(get_current_user),
+):
     if module not in SUPPORTED_MODULES:
         return fail(400, f"不支持的导出模块，可选：{', '.join(sorted(SUPPORTED_MODULES))}")
 
@@ -112,7 +118,7 @@ async def export_module(module: str, db: AsyncSession = Depends(get_db)):
             ]
             for e in items
         ]
-    else:  # performance
+    elif module == "performance":
         result = await db.execute(
             select(PerformanceRecord).options(selectinload(PerformanceRecord.employee))
         )
@@ -130,6 +136,43 @@ async def export_module(module: str, db: AsyncSession = Depends(get_db)):
             ]
             for r in items
         ]
+    else:  # offers —— 需要 Offer 读权限；薪资列按 salary:view 掩码
+        if not (current.has("offer:approve") or current.has("resume:view")
+                or current.has("recruitment_request:confirm")):
+            raise PermissionError_("无权限: 导出 Offer 列表")
+        show_salary = current.has("salary:view")
+        result = await db.execute(select(OfferApproval).order_by(OfferApproval.created_at.desc()))
+        offers = result.scalars().all()
+        headers = ["id", "candidateName", "positionName", "department", "status",
+                   "expectedOnboardDate", "salary", "channel", "backgroundCheckRequired",
+                   "operator", "createdAt"]
+        rows = []
+        for o in offers:
+            cand = None
+            cand_r = await db.execute(select(Candidate).where(Candidate.id == o.candidate_id))
+            cand = cand_r.scalar_one_or_none()
+            pos = None
+            if o.position_id:
+                pos_r = await db.execute(select(Position).where(Position.id == o.position_id))
+                pos = pos_r.scalar_one_or_none()
+            comp = (o.compensation or {})
+            salary = ""
+            if show_salary:
+                salary = " / ".join(str(v) for v in
+                                    [comp.get("base_salary"), comp.get("performance_salary")]
+                                    if v)
+                if not salary and o.suggested_salary:
+                    salary = o.suggested_salary
+            else:
+                salary = "***"
+            rows.append([
+                str(o.id), cand.name if cand else "", pos.name if pos else "",
+                o.department or (pos.department if pos else ""), o.status or "",
+                o.expected_onboard_date.isoformat() if o.expected_onboard_date else "",
+                salary, o.channel or "", "是" if o.background_check_required else "否",
+                str(o.created_by) if o.created_by else "",
+                o.created_at.isoformat() if o.created_at else "",
+            ])
 
     ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     if export_format == "csv":

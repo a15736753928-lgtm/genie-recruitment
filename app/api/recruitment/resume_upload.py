@@ -175,7 +175,7 @@ async def _upload_one_resume(
     candidate = Candidate(
         name=original_name,
         position_id=resolved_position_id,
-        status="new",
+        status="job_hunting",
         resume_file=object_key,
         resume_file_hash=content_hash,
         upload_time=date.today(),

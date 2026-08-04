@@ -111,6 +111,9 @@ async def _run_reanalyze_in_background(resume_id: str, position_name: str) -> No
             if error and not is_candidate_parsed(candidate):
                 await _set_reanalyze_task(resume_id, status="failed", progress=100, message=f"解析失败: {error}")
                 return
+            # 主档版本递增：reanalyze 覆盖式更新候选人信息，下游 Offer 快照
+            # 需感知"内容已更新"，提示审批人刷新预填。
+            candidate.profile_version = (candidate.profile_version or 1) + 1
             await task_db.flush()
 
             # 评分（4维+8维+性别）在 commit 之后启动，独立 session 才能读到候选人
@@ -592,6 +595,9 @@ async def update_resume(
     for field in ["name", "gender", "age", "education", "experience", "phone", "email", "ethnicity"]:
         if field in body:
             setattr(candidate, field, body[field])
+
+    # 主档信息被手动修改 → 版本递增，下游 Offer 快照可感知数据已更新
+    candidate.profile_version = (candidate.profile_version or 1) + 1
 
     if "ethnicity" in body:
         candidate.ethnicity = normalize_ethnicity(candidate.ethnicity)

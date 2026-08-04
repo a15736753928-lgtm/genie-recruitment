@@ -42,6 +42,13 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "exportFormat": "xlsx",
     "webhookEnabled": False,
     "webhookUrl": "",
+    # ── SMTP 邮件发送(Offer 一键发候选人邮箱；未配置则降级为返回链接由 HR 复制) ──
+    "smtpHost": "",
+    "smtpPort": 465,
+    "smtpUseSsl": True,
+    "smtpUser": "",
+    "smtpPassword": "",
+    "smtpFrom": "",
     # ── 业务规则阈值 ──
     # 这些曾被 seed_data.py 写成一 key 一行的独立 SystemSetting 记录，由 3 个各写一份的
     # 私有 helper 直接查表读取；而管理员在设置页保存时走的是 PUT /settings，只会更新

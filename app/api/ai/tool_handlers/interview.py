@@ -35,10 +35,10 @@ async def _get_questions(params: dict, db: AsyncSession) -> str:
         return "\n".join(lines)
 
     cand = (await db.execute(select(Candidate).where(Candidate.id == candidate_id))).scalar_one_or_none()
-    if cand and cand.status in ("new", "parsed", "pending_screen"):
+    if cand and cand.status == "job_hunting":
         return (
-            f"暂无{round_label}面试题。候选人当前为「待筛选」，需先通过初筛（状态改为 invited）"
-            f"后再生成{round_label}面试题；或使用 generate_questions 强制出题。"
+            f"暂无{round_label}面试题。候选人当前为「求职中」，需先邀约一面"
+            f"（状态改为 round1）后再生成{round_label}面试题；或使用 generate_questions 强制出题。"
         )
     return f"暂无{round_label}面试题，请使用 generate_questions 生成"
 
@@ -118,7 +118,14 @@ async def _ai_score_question(params: dict, db: AsyncSession) -> str:
 
 async def _get_leaderboard(params: dict, db: AsyncSession) -> str:
     from app.api.talent.interview import get_leaderboard as fn
-    result = await fn(category=params["category"], db=db)
+    # category 容错：模型常按工具描述传「一面/二面」，路由只认 first_result/second_result，
+    # 传错会 fail(400) → 模型看到失败反复重试同一调用 → 工具循环（实测 manager 连续调 16 次）。
+    category = (params.get("category") or "").strip()
+    if category in ("first", "一面", "first_result"):
+        category = "first_result"
+    elif category in ("second", "二面", "second_result"):
+        category = "second_result"
+    result = await fn(category=category, db=db)
     if result.get("code") != 0:
         return f"❌ 排行榜查询失败：{result.get('message', '未知错误')}"
     data = result.get("data", []) or []

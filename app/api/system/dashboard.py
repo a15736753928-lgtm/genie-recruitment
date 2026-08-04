@@ -17,9 +17,7 @@ async def query_recruitment_summary(db: AsyncSession) -> dict:
     total_positions = (await db.execute(select(func.count()).select_from(Position))).scalar() or 0
     total_employees = (await db.execute(select(func.count()).select_from(Employee))).scalar() or 0
 
-    # 按状态机词表逐状态统计，不再用「jobHunting/passed/failed」那套已废弃的口径
-    # （旧口径把 invited 叫「已通过」、把 new+parsed+pending_screen 合称「求职中」，
-    #  且完全没有 pending_offer / hired / talent_pool，分状态数加起来对不上总数）。
+    # 按状态机词表逐状态统计（2026-08-02 起按新业务词表：求职中/一面/二面/待发offer/已录用/未通过/已失效）。
     rows = (await db.execute(
         select(Candidate.status, func.count()).group_by(Candidate.status)
     )).all()
@@ -28,17 +26,16 @@ async def query_recruitment_summary(db: AsyncSession) -> dict:
     def n(*statuses: str) -> int:
         return sum(by_status.get(s, 0) for s in statuses)
 
-    pending_screen = n("new", "parsed", "pending_screen", "pending_materials")
-    invited = n("invited")
-    round1 = n("round1")
-    round2 = n("round2")
-    pending_offer = n("pending_offer")
-    hired = n("hired")
-    talent_pool = n("talent_pool")
-    rejected = n("rejected")
+    job_hunting = n("job_hunting")              # 求职中（含原 new/parsed/pending_screen/pending_materials）
+    round1 = n("round1")                         # 一面中
+    round2 = n("round2")                         # 二面中
+    pending_offer = n("pending_offer")           # 待发offer
+    hired = n("hired")                           # 已录用
+    talent_pool = n("talent_pool")               # 已失效（人才池留档）
+    rejected = n("rejected")                     # 未通过
 
-    # 「在面试流程中」= 已邀约 + 一面 + 二面
-    total_interviews = invited + round1 + round2
+    # 「在面试流程中」= 一面 + 二面
+    total_interviews = round1 + round2
 
     avg_score_result = (await db.execute(select(func.avg(Candidate.score)).select_from(Candidate)))
     avg_score = round(float(avg_score_result.scalar() or 0), 1)
@@ -48,8 +45,7 @@ async def query_recruitment_summary(db: AsyncSession) -> dict:
         "totalPositions": int(total_positions),
         "totalEmployees": int(total_employees),
         "totalInterviews": int(total_interviews),
-        "pendingScreen": pending_screen,
-        "invited": invited,
+        "jobHunting": job_hunting,
         "round1": round1,
         "round2": round2,
         "pendingOffer": pending_offer,
@@ -98,8 +94,7 @@ async def get_operations(db: AsyncSession = Depends(get_db)):
     summary = await query_recruitment_summary(db)
     total_resumes = summary["totalCandidates"]
     total_employees = summary["totalEmployees"]
-    pending_screen = summary["pendingScreen"]
-    invited = summary["invited"]
+    job_hunting = summary["jobHunting"]
     round1 = summary["round1"]
     round2 = summary["round2"]
     pending_offer = summary["pendingOffer"]
@@ -113,7 +108,7 @@ async def get_operations(db: AsyncSession = Depends(get_db)):
               "text": f"当前系统共有 {total_resumes} 份简历，{total_employees} 名在职员工。候选人平均匹配度 {avg_score} 分。",
               "stats": [
                   {"label": "候选人总数", "value": str(total_resumes), "meta": "累计入库", "tone": "blue"},
-                  {"label": "已邀约", "value": str(invited), "meta": "待安排面试", "tone": "green"},
+                  {"label": "求职中", "value": str(job_hunting), "meta": "待筛选", "tone": "green"},
                   {"label": "一面中", "value": str(round1), "meta": "面试进行中", "tone": "blue"},
                   {"label": "二面中", "value": str(round2), "meta": "深度评估", "tone": "purple"},
               ],
@@ -129,14 +124,13 @@ async def get_operations(db: AsyncSession = Depends(get_db)):
               {
                   "role": "招聘专员",
                   "stage": "简历筛选",
-                  "reason": f"有 {pending_screen} 份简历待筛选",
-                  "advice": "建议尽快筛选并安排面试",
+                  "reason": f"有 {job_hunting} 份简历在求职中待筛选",
+                  "advice": "建议尽快筛选并安排一面",
                   "actions": ["批量筛选", "AI 自动匹配"],
               },
-          ] if pending_screen > 10 else [],
+          ] if job_hunting > 10 else [],
           "funnel": [
-              {"name": "待筛选", "value": pending_screen, "ratio": round(pending_screen / max(total_resumes, 1) * 100)},
-              {"name": "已邀约", "value": invited, "ratio": round(invited / max(total_resumes, 1) * 100)},
+              {"name": "求职中", "value": job_hunting, "ratio": round(job_hunting / max(total_resumes, 1) * 100)},
               {"name": "一面中", "value": round1, "ratio": round(round1 / max(total_resumes, 1) * 100)},
               {"name": "二面中", "value": round2, "ratio": round(round2 / max(total_resumes, 1) * 100)},
               {"name": "待发 Offer", "value": pending_offer, "ratio": round(pending_offer / max(total_resumes, 1) * 100)},

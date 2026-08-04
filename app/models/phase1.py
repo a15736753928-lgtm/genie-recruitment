@@ -6,7 +6,7 @@ AI 输出存为 JSON 列,格式遵循 app.schemas.ai_advice.AIAdvice (snake_case
 import uuid
 from datetime import datetime
 from sqlalchemy import (
-    Column, String, Integer, Text, DateTime, Boolean, Numeric, JSON,
+    Column, String, Integer, Text, DateTime, Date, Boolean, Numeric, JSON,
     ForeignKey, UniqueConstraint, Index,
 )
 from sqlalchemy.dialects.postgresql import UUID
@@ -206,10 +206,14 @@ class AIInterviewReport(Base):
 # ═══════════════════════════════════════════════
 
 class OfferApproval(Base):
-    """录用审批单 —— AI 建议 + 五分加权 + 经理审批。
+    """Offer 管理主表 —— 候选人聘用 offer 全生命周期。
 
-    审批决策: 仅经理(manager)可批准,AI 只产建议。
-    人工确认硬约束: offer/淘汰/入职均需此接口写入终态,AI 不直接写。
+    状态机(2026-08-02 起 8 态):
+      draft(待HR发起) → pending_approval(待审批) → approved(审批通过·可发送)
+        → sent(已发送) → accepted(已接受) / declined(候选人拒绝)
+      approved/sent → expired(超时·视为放弃) / voided(已作废，含审批不通过与HR撤销)
+    一律经 core.state_machine.transition() 变更，禁止直接赋值。
+    旧 6 态(pending/approved/rejected/conditional)由 _migrate_v19 映射迁移。
     """
     __tablename__ = "offer_approvals"
 
@@ -239,17 +243,77 @@ class OfferApproval(Base):
     conversion_criteria = Column(Text, nullable=True)
     elimination_criteria = Column(Text, nullable=True)
 
-    # 审批人(经理一人审批,原型口径 managerOnly)
+    # 审批人(末级审批人回填；历史单步审批的 approver_id 保留)
     approver_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
     approved_at = Column(DateTime, nullable=True)
     reject_reason = Column(Text, nullable=True)
 
-    # AI 建议结果 vs 人工最终结果
+    # AI 建议结果 vs 人工最终决定
     ai_result = Column(String(16), nullable=True)   # priority/recommend/conditional/reserve/reject
     result = Column(String(16), nullable=True)      # 人工最终决定
 
-    status = Column(String(16), nullable=False, default="pending")
-    # pending / approved / rejected
+    # ── Offer 管理模块扩展字段(2026-08-02, _migrate_v19) ──
+    # 核心聘用信息
+    expected_onboard_date = Column(Date, nullable=True)      # 预计入职日期(列表筛选)
+    probation_months = Column(Integer, nullable=True)        # 试用期月数 1/3/6 → Employee.probation_end_date
+    work_location = Column(String(128), nullable=True)       # 工作地点
+    department = Column(String(64), nullable=True)           # 部门快照(防岗位改部门后 Offer 漂移)
+    channel = Column(String(32), nullable=True)              # 招聘渠道(列表筛选)
+    background_check_required = Column(Boolean, nullable=False, default=False)
+    background_check_result = Column(Text, nullable=True)
+
+    # ── 候选人信息自动流转（2026-08-03, _migrate_v20）──
+    # 9 项审批内容的预填来源标记（JSON: {字段: 来源})，来源 ∈
+    # resume_ai(简历AI解析) / offer_ai(Offer AI建议) / recruitment_request(需求单)
+    # / position(岗位配置) / manual(人工)。用于前端"引用 vs 补录"展示与数据溯源。
+    prefill_source = Column(JSON, nullable=True)
+    # 创建草稿时引用的候选人主档版本号（候选人信息变更后用于一致性提示）
+    profile_version = Column(Integer, nullable=True)
+
+    # 发起/编辑/提交
+    created_by = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)  # 招聘负责人
+    updated_by = Column(UUID(as_uuid=True), nullable=True)
+    submitted_at = Column(DateTime, nullable=True)
+    submitted_by = Column(UUID(as_uuid=True), nullable=True)
+
+    # 审批流(可配置, 见 offer_approval_flows)
+    approval_flow_id = Column(UUID(as_uuid=True), ForeignKey("offer_approval_flows.id"), nullable=True)
+    current_approval_step = Column(Integer, nullable=False, default=0)  # 0 基 → records.step-1
+
+    # 模板
+    template_id = Column(UUID(as_uuid=True), ForeignKey("offer_templates.id"), nullable=True)
+
+    # 发送 + 候选人线上确认(token 即凭据)
+    sent_at = Column(DateTime, nullable=True)
+    sent_by = Column(UUID(as_uuid=True), nullable=True)
+    sent_channel = Column(String(16), nullable=True)         # email | sms
+    confirm_token = Column(String(96), nullable=True, unique=True, index=True)
+    token_expires_at = Column(DateTime, nullable=True)
+    token_used_at = Column(DateTime, nullable=True)
+    viewed_at = Column(DateTime, nullable=True)              # 候选人打开链接时间(操作日志要素)
+    validity_days = Column(Integer, nullable=False, default=7)  # 有效期 3-7 天
+    expires_at = Column(DateTime, nullable=True)             # = sent_at + validity_days
+
+    # 作废/失效/拒绝
+    void_reason = Column(Text, nullable=True)                # 作废原因(审批不通过/HR撤销)
+    voided_by = Column(UUID(as_uuid=True), nullable=True)
+    voided_at = Column(DateTime, nullable=True)
+    expired_at = Column(DateTime, nullable=True)
+    decline_reason = Column(Text, nullable=True)             # 候选人拒绝原因(与审批 reject_reason 分离)
+
+    # 接受后回填 → 待入职档案跳转
+    employee_id = Column(UUID(as_uuid=True), ForeignKey("employees.id"), nullable=True)
+
+    # 结构化薪酬/岗位/条款(整列受 salary:view 掩码的是 compensation)
+    compensation = Column(JSON, nullable=True)
+    # {base_salary, performance_salary, allowance, annual_bonus_note, salary_tax_flag(pre/post),
+    #  social_security_base, social_security_start_month, total_remark}
+    employment_terms = Column(JSON, nullable=True)
+    # {contract_type(fixed/non_fixed), work_mode(fulltime/outsourcing), description}
+    other_terms = Column(JSON, nullable=True)
+    # {report_materials, probation_requirements, non_compete_nda, remark}
+
+    status = Column(String(16), nullable=False, default="draft")
 
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

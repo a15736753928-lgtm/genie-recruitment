@@ -106,8 +106,12 @@ async def _get_resume(params: dict, db: AsyncSession) -> str:
 
 
 # 中文口语 → 状态机词表(state_machine.py TRANSITIONS["candidate"])的英文 key。
-# 注意：不提供"已入职/入职"别名 —— hired 只能由 Offer 审批通过后自动生成
-# （见 app/api/talent/offer.py），不允许对话侧直接把候选人改成 hired。
+# 注意：不提供"已入职/入职"别名 —— hired 只能由「候选人接受Offer」流程自动生成
+# （见 app/api/talent/offer.py 的 accept_offer），不允许对话侧直接把候选人改成 hired。
+# 2026-08-02：随候选人状态合并且删掉 invited/pending_screen 等中间态——
+#   求职中=job_hunting（入库即此态，筛选通过直接进一面 round1）；
+#   已失效/失效=进入人才池 talent_pool（爽约/去别家/中途放弃等非淘汰性流失）；
+#   已发offer=offer_sent（发Offer后等待候选人确认，接受才入职）。
 # 模块级导出：app/agent_os/quality/verifier.py 做写后回读值比对时要复用同一张表。
 STATUS_ALIASES = {
     "淘汰": "rejected",
@@ -115,13 +119,19 @@ STATUS_ALIASES = {
     "一面未通过": "rejected",
     "二面未通过": "rejected",
     "初筛不通过": "rejected",
-    "求职中": "pending_screen",
-    "待筛选": "pending_screen",
-    "初筛通过": "invited",
+    "求职中": "job_hunting",
+    "待筛选": "job_hunting",
+    "初筛通过": "round1",           # 筛选通过直接一面，已无独立 invited 态
     "一面中": "round1",
     "二面中": "round2",
     "待发offer": "pending_offer",
     "待发Offer": "pending_offer",
+    "已发offer": "offer_sent",      # 发Offer后等待候选人确认
+    "已发Offer": "offer_sent",
+    "Offer已发": "offer_sent",
+    "已失效": "talent_pool",        # 非淘汰性流失归入人才池
+    "失效": "talent_pool",
+    "人才池": "talent_pool",
 }
 
 

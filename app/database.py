@@ -1,3 +1,4 @@
+import json
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase
 from app.config import get_settings
@@ -264,6 +265,23 @@ def _run_migrations(connection):
     _ensure_index_if_missing(
         connection, "ix_agent_sessions_owner_id", "agent_sessions", "owner_id"
     )
+    # v19: Offer 管理模块 —— 8 态状态机 + 附属表 + 存量映射
+    _migrate_v19_offer_module(connection)
+    # v20: 候选人信息自动流转 —— Offer 预填来源标记 + 主档版本号
+    _migrate_v20_offer_prefill(connection)
+
+
+def _migrate_v20_offer_prefill(connection) -> None:
+    """v20: 候选人信息自动流转。
+
+    offer_approvals 新增两列：
+      prefill_source  JSON — 9 项审批内容的预填来源标记（前端溯源展示）
+      profile_version INTEGER — 创建草稿时引用的候选人主档版本（一致性提示）
+    纯 ADD COLUMN，不动存量数据；存量 Offer 无标记视为 manual。
+    """
+    _add_column_if_missing(connection, "offer_approvals", "prefill_source", "JSON")
+    _add_column_if_missing(connection, "offer_approvals", "profile_version", "INTEGER")
+    _add_column_if_missing(connection, "candidates", "profile_version", "INTEGER NOT NULL DEFAULT 1")
 
 
 def _migrate_v17_confirmation_override(connection) -> None:
@@ -275,6 +293,128 @@ def _migrate_v17_confirmation_override(connection) -> None:
     _add_column_if_missing(connection, "confirmation_reviews", "override_reason", "TEXT")
     _add_column_if_missing(connection, "confirmation_reviews", "override_by", "UUID")
     _add_column_if_missing(connection, "confirmation_reviews", "override_at", "TIMESTAMP")
+
+
+# 标准审批流的固定 UUID（迁移幂等种子 + 存量回填引用）
+STANDARD_FLOW_ID = "00000000-0000-0000-0000-000000000001"
+
+
+def _migrate_v19_offer_module(connection) -> None:
+    """v19: Offer 管理模块 —— OfferApproval 扩展列 + 4 张附属表 + 存量状态映射。
+
+    新表由 create_all 自动建（init_db 先 create_all 后迁移）；此处补列、种子、
+    存量映射与回填。旧 offer 状态映射：
+      pending → pending_approval（已建待批）
+      approved → sent（旧 approve=发送）
+      rejected → voided（旧审批拒绝录用；reject_reason → void_reason）
+      conditional → approved（附条件通过视为通过）
+      accepted / declined 不变
+    """
+    from sqlalchemy import text
+
+    _add_column_if_missing(connection, "offer_approvals", "expected_onboard_date", "DATE")
+    _add_column_if_missing(connection, "offer_approvals", "probation_months", "INTEGER")
+    _add_column_if_missing(connection, "offer_approvals", "work_location", "VARCHAR(128)")
+    _add_column_if_missing(connection, "offer_approvals", "department", "VARCHAR(64)")
+    _add_column_if_missing(connection, "offer_approvals", "channel", "VARCHAR(32)")
+    _add_column_if_missing(connection, "offer_approvals", "background_check_required", "BOOLEAN NOT NULL DEFAULT FALSE")
+    _add_column_if_missing(connection, "offer_approvals", "background_check_result", "TEXT")
+    _add_column_if_missing(connection, "offer_approvals", "created_by", "UUID")
+    _add_column_if_missing(connection, "offer_approvals", "updated_by", "UUID")
+    _add_column_if_missing(connection, "offer_approvals", "submitted_at", "TIMESTAMP")
+    _add_column_if_missing(connection, "offer_approvals", "submitted_by", "UUID")
+    _add_column_if_missing(connection, "offer_approvals", "approval_flow_id", "UUID")
+    _add_column_if_missing(connection, "offer_approvals", "current_approval_step", "INTEGER NOT NULL DEFAULT 0")
+    _add_column_if_missing(connection, "offer_approvals", "template_id", "UUID")
+    _add_column_if_missing(connection, "offer_approvals", "sent_at", "TIMESTAMP")
+    _add_column_if_missing(connection, "offer_approvals", "sent_by", "UUID")
+    _add_column_if_missing(connection, "offer_approvals", "sent_channel", "VARCHAR(16)")
+    _add_column_if_missing(connection, "offer_approvals", "confirm_token", "VARCHAR(96)")
+    _add_column_if_missing(connection, "offer_approvals", "token_expires_at", "TIMESTAMP")
+    _add_column_if_missing(connection, "offer_approvals", "token_used_at", "TIMESTAMP")
+    _add_column_if_missing(connection, "offer_approvals", "viewed_at", "TIMESTAMP")
+    _add_column_if_missing(connection, "offer_approvals", "validity_days", "INTEGER NOT NULL DEFAULT 7")
+    _add_column_if_missing(connection, "offer_approvals", "expires_at", "TIMESTAMP")
+    _add_column_if_missing(connection, "offer_approvals", "void_reason", "TEXT")
+    _add_column_if_missing(connection, "offer_approvals", "voided_by", "UUID")
+    _add_column_if_missing(connection, "offer_approvals", "voided_at", "TIMESTAMP")
+    _add_column_if_missing(connection, "offer_approvals", "expired_at", "TIMESTAMP")
+    _add_column_if_missing(connection, "offer_approvals", "employee_id", "UUID")
+    _add_column_if_missing(connection, "offer_approvals", "decline_reason", "TEXT")
+    _add_column_if_missing(connection, "offer_approvals", "compensation", "JSON")
+    _add_column_if_missing(connection, "offer_approvals", "employment_terms", "JSON")
+    _add_column_if_missing(connection, "offer_approvals", "other_terms", "JSON")
+
+    # 确认链接 token 唯一索引 + 同一候选人部分唯一在途索引
+    connection.execute(text("SET LOCAL lock_timeout = '3s'"))
+    connection.execute(text(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_offer_confirm_token ON offer_approvals (confirm_token)"
+    ))
+    connection.execute(text(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_offer_active_per_candidate ON offer_approvals (candidate_id) "
+        "WHERE status IN ('draft','pending_approval','approved','sent')"
+    ))
+
+    # 标准审批流种子（固定 UUID，幂等；steps 用绑定参数避免 text() 把 JSON 内 ":1" 当绑定占位）
+    standard_steps = json.dumps([
+        {"step": 1, "role_code": "manager", "role_name": "部门负责人", "approver_id": None},
+        {"step": 2, "role_code": "hr", "role_name": "HR负责人", "approver_id": None},
+        {"step": 3, "role_code": "ceo", "role_name": "总经理", "approver_id": None},
+    ], ensure_ascii=False)
+    connection.execute(text("SET LOCAL lock_timeout = '3s'"))
+    connection.execute(text(
+        "INSERT INTO offer_approval_flows (id, name, code, is_default, enabled, description, steps, created_at, updated_at) "
+        "SELECT :fid, '标准审批流', 'standard', TRUE, TRUE, '部门负责人→HR负责人→总经理', :steps, NOW(), NOW() "
+        "WHERE NOT EXISTS (SELECT 1 FROM offer_approval_flows WHERE code = 'standard')"
+    ), {"fid": STANDARD_FLOW_ID, "steps": standard_steps})
+
+    # 存量状态映射
+    connection.execute(text(
+        "UPDATE offer_approvals SET status = 'pending_approval' WHERE status = 'pending'"
+    ))
+    connection.execute(text(
+        "UPDATE offer_approvals SET status = 'sent' WHERE status = 'approved'"
+    ))
+    connection.execute(text(
+        "UPDATE offer_approvals SET status = 'voided', void_reason = COALESCE(void_reason, reject_reason), "
+        "voided_at = COALESCE(voided_at, approved_at) WHERE status = 'rejected'"
+    ))
+    connection.execute(text(
+        "UPDATE offer_approvals SET status = 'approved' WHERE status = 'conditional'"
+    ))
+
+    # 回填审批流引用与当前步骤
+    connection.execute(text(
+        "UPDATE offer_approvals SET approval_flow_id = :fid, current_approval_step = 0 "
+        "WHERE approval_flow_id IS NULL"
+    ), {"fid": STANDARD_FLOW_ID})
+
+    # 回填逐级审批记录（每单一条；有记录的单跳过，幂等）
+    connection.execute(text("SET LOCAL lock_timeout = '3s'"))
+    connection.execute(text(
+        "INSERT INTO offer_approval_records "
+        "(id, offer_id, step, role_code, role_name, approver_id, approver_name, action, opinion, decided_at, status, created_at) "
+        "SELECT gen_random_uuid(), o.id, 1, 'manager', '部门负责人', o.approver_id, NULL, 'approve', NULL, o.approved_at, 'approved', NOW() "
+        "FROM offer_approvals o "
+        "WHERE o.status IN ('sent','accepted','approved') "
+        "AND NOT EXISTS (SELECT 1 FROM offer_approval_records r WHERE r.offer_id = o.id)"
+    ))
+    connection.execute(text(
+        "INSERT INTO offer_approval_records "
+        "(id, offer_id, step, role_code, role_name, approver_id, approver_name, action, opinion, decided_at, status, created_at) "
+        "SELECT gen_random_uuid(), o.id, 1, 'manager', '部门负责人', o.approver_id, NULL, 'reject', o.void_reason, o.approved_at, 'rejected', NOW() "
+        "FROM offer_approvals o "
+        "WHERE o.status = 'voided' AND o.approver_id IS NOT NULL AND o.approved_at IS NOT NULL "
+        "AND NOT EXISTS (SELECT 1 FROM offer_approval_records r WHERE r.offer_id = o.id)"
+    ))
+    connection.execute(text(
+        "INSERT INTO offer_approval_records "
+        "(id, offer_id, step, role_code, role_name, approver_id, approver_name, action, opinion, decided_at, status, created_at) "
+        "SELECT gen_random_uuid(), o.id, 1, 'manager', '部门负责人', NULL, NULL, NULL, NULL, NULL, 'pending', NOW() "
+        "FROM offer_approvals o "
+        "WHERE o.status = 'pending_approval' "
+        "AND NOT EXISTS (SELECT 1 FROM offer_approval_records r WHERE r.offer_id = o.id)"
+    ))
 
 
 def _migrate_v15_direct_manager_name(connection) -> None:
@@ -366,12 +506,12 @@ def _migrate_transcript_history(connection) -> None:
 
 
 def _cleanup_low_match_status(connection) -> None:
-    """把 candidates.status = 'low_match' 的历史脏数据恢复为 'pending_screen'。
+    """把 candidates.status = 'low_match' 的历史脏数据恢复为 'job_hunting'。
 
     low_match 曾被用作 AI 评分低于阈值时的标记，但它不在状态机合法词表
     （app/core/state_machine.py TRANSITIONS["candidate"]）中，会在界面上
     原样显示成英文串。低匹配信息已通过 screening_ai_score/score 保留，
-    状态本身回归合法值即可。
+    状态本身回归合法值（求职中）即可。
     """
     from sqlalchemy import text
 
@@ -385,28 +525,28 @@ def _cleanup_low_match_status(connection) -> None:
         return
 
     connection.execute(text(
-        "UPDATE candidates SET status = 'pending_screen' WHERE status = 'low_match'"
+        "UPDATE candidates SET status = 'job_hunting' WHERE status = 'low_match'"
     ))
 
 
 def _migrate_v16_candidate_status_vocabulary(connection) -> None:
-    """把 candidates.status 里残留的旧词表值统一改写为状态机合法词表。
+    """把 candidates.status 统一改写为 2026-08-02 新状态机合法词表。
 
-    历史上 AI 对话模块 / 简历上传接口曾使用另一套词表
-    （job_hunting/passed/first_interview/second_interview/failed/expired），
-    与 app/core/state_machine.py 的状态机词表
-    （new/parsed/pending_screen/invited/round1/round2/pending_offer/hired/
-    talent_pool/rejected）同表混存。此外还有更早的历史遗留值
-    （pending_interview/onboarded/probation/offer_pending，其中 offer_pending
-    是 pending_offer 的拼写颠倒）。这些非法值不在状态机迁移表内，会导致：
-    - 前端状态徽章渲染为 undefined（标签表只认状态机词表）
-    - AI 上传的简历进不了筛选流程（scoring.py 只放行 new/parsed）
-    - 二面通过的候选人进不了录用审批（offer.py 要求 pending_offer）
-    此迁移是幂等的，每次启动都会执行，不会影响已经是合法值的行。
+    候选人状态机已按业务词表重构（app/core/state_machine.py TRANSITIONS["candidate"]）：
+        job_hunting(求职中,合并原 new/parsed/pending_screen/pending_materials，
+                    入库即此态) / round1(一面中,吸收原 invited) / round2(二面中)
+        / pending_offer(待发Offer) / hired(已录用,仅Offer审批产生)
+        / rejected(未通过) / talent_pool(已失效,非淘汰性流失入人才池)。
 
-    passed 的映射存在语义上的一次性判断：本项目 AI 提示词(prompts/system.txt)
-    明确 passed 表示"初筛已通过"而非"全部面试通过/已入职"，故统一映射为
-    invited（初筛通过待安排面试），而不是 hired。
+    本迁移把存量数据归一到新词表：
+    - new/parsed/pending_screen/pending_materials/invited → job_hunting
+    - 旧词表 job_hunting/passed/pending_interview（初筛通过待安排）→ job_hunting
+    - first_interview/second_interview → round1/round2
+    - failed（淘汰）、expired（旧义"已失效"，现归入人才池）→ 分别 rejected/talent_pool
+    - onboarded/probation（已入职旧义）→ hired
+    - offer_pending（pending_offer 拼写颠倒）→ pending_offer
+
+    此迁移是幂等的，每次启动都会执行，不影响已为新合法值的行。
     """
     from sqlalchemy import text
 
@@ -419,15 +559,19 @@ def _migrate_v16_candidate_status_vocabulary(connection) -> None:
     if not table_exists:
         return
 
-    # 旧值 -> 状态机合法值。执行顺序无关紧要，每条各自独立生效。
+    # 旧值 -> 新词表。执行顺序无关紧要，每条各自独立生效。
     mapping = {
-        "job_hunting": "pending_screen",
-        "passed": "invited",
+        "new": "job_hunting",
+        "parsed": "job_hunting",
+        "pending_screen": "job_hunting",
+        "pending_materials": "job_hunting",
+        "invited": "job_hunting",
+        "passed": "job_hunting",
+        "pending_interview": "job_hunting",
         "first_interview": "round1",
         "second_interview": "round2",
         "failed": "rejected",
-        "expired": "rejected",
-        "pending_interview": "invited",
+        "expired": "talent_pool",   # 已失效 -> 人才池留档
         "onboarded": "hired",
         "probation": "hired",
         "offer_pending": "pending_offer",

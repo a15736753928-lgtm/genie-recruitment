@@ -83,7 +83,9 @@ PERMISSION_REGISTRY: dict[str, str] = {
 
 # ── 角色 -> 权限点集合(种子) ──
 # 只读全局能力用具体权限点表达;通配由 security.require_permission 对 admin 处理。
-_ALL_READ = ["resume:view", "audit:view"]
+# audit:view(操作日志) 是纯安全审计资产，只给 admin，不放进 _ALL_READ——
+# 否则 ceo/hr/manager 等"被审计对象"能看到自己的操作记录，违背"审计者≠被审计者"。
+_ALL_READ = ["resume:view"]
 
 ROLE_PERMISSIONS: dict[str, list[str]] = {
     "ceo": _ALL_READ + [
@@ -95,16 +97,18 @@ ROLE_PERMISSIONS: dict[str, list[str]] = {
         "position:publish", "position:manage",
         "resume:view", "resume:decide",
         "interview:manage",
-        "salary:view", "salary:manage", "audit:view",
+        "salary:view", "salary:manage",
+        "offer:approve",   # 录用/发 Offer 归 HR（2026-08-02）
         "probation:manage", "training:view", "training:manage",
         "task:view", "points:confirm",
         "talent:view", "talent:manage", "equity:view",  # P4
     ],
     "manager": [
         "recruitment_request:create", "recruitment_request:confirm",
-        "offer:approve", "interview:score", "salary:view",
+        "interview:score", "salary:view",
         "confirmation:approve",
         "talent:view",  # P4
+        # offer:approve 已移交 HR（2026-08-02），经理不再参与录用/发Offer
     ],
     "interviewer": ["resume:view", "interview:score"],
     "mentor": [

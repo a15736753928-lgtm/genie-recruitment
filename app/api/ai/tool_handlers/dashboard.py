@@ -6,19 +6,19 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 # 候选人状态词表（与 app/core/state_machine.py TRANSITIONS["candidate"] 一致）。
-# 顺序即展示顺序。
+# 顺序即展示顺序。2026-08-02 起按业务词表：
+#   job_hunting 求职中（合并原 new/parsed/pending_screen/pending_materials，入库即此态）
+#   round1 一面中（吸收原 invited，筛选通过直接一面）
+#   round2 二面中 / pending_offer 待发Offer / hired 已录用
+#   talent_pool 已失效（人才池留档）/ rejected 未通过
 _CANDIDATE_STATUS_LABELS: list[tuple[str, str]] = [
-    ("new", "新建未解析"),
-    ("parsed", "已解析待初筛"),
-    ("pending_screen", "待筛选"),
-    ("pending_materials", "待补充材料"),
-    ("invited", "初筛通过待安排面试"),
+    ("job_hunting", "求职中"),
     ("round1", "一面中"),
     ("round2", "二面中"),
     ("pending_offer", "待发Offer"),
     ("hired", "已录用"),
-    ("talent_pool", "人才池"),
-    ("rejected", "未通过/淘汰"),
+    ("talent_pool", "已失效"),
+    ("rejected", "未通过"),
 ]
 
 
@@ -33,9 +33,9 @@ async def _get_operations_dashboard(params: dict, db: AsyncSession) -> str:
     rows = (await db.execute(
         select(Candidate.status, func.count()).group_by(Candidate.status)
     )).all()
-    counts = {(s or "new"): int(n) for s, n in rows}
+    counts = {(s or "unknown"): int(n) for s, n in rows}
 
-    in_flight = sum(counts.get(k, 0) for k in ("invited", "round1", "round2"))
+    in_flight = sum(counts.get(k, 0) for k in ("round1", "round2"))
     parts = [
         f"{label} {counts.get(key, 0)}"
         for key, label in _CANDIDATE_STATUS_LABELS
@@ -48,7 +48,7 @@ async def _get_operations_dashboard(params: dict, db: AsyncSession) -> str:
     return (
         f"招聘运营概览：当前系统共有 {summary['totalCandidates']} 位候选人（简历），"
         f"{summary['totalPositions']} 个岗位，{in_flight} 位在面试流程中"
-        f"（invited/round1/round2），{summary['totalEmployees']} 名在职员工，"
+        f"（一面/二面），{summary['totalEmployees']} 名在职员工，"
         f"平均匹配度 {summary['avgScore']} 分。\n"
         f"候选人状态分布：{('，'.join(parts)) if parts else '暂无候选人'}。"
     )

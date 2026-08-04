@@ -295,7 +295,7 @@ async def schedule_interview(
         return not_found("候选人不存在")
 
     # Validate candidate status by round
-    if body.round == "r1" and candidate.status != "invited":
+    if body.round == "r1" and candidate.status != "job_hunting":
         return fail(409, "候选人状态不符")
     if body.round == "r2" and candidate.status != "round1":
         return fail(409, "候选人状态不符")

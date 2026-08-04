@@ -1,9 +1,10 @@
 from datetime import datetime
 import uuid
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc
 from app.database import get_db
+from app.core.security import require_permission, get_current_user, CurrentUser
 from app.models.settings import SystemSetting, AuditLog
 from app.services.system.system_settings import (
     DEFAULT_SETTINGS,
@@ -65,8 +66,15 @@ async def trigger_cleanup(db: AsyncSession = Depends(get_db)):
 # ── Audit log ──────────────────────────────────────────
 
 @router.get("/settings/audit-log")
-async def list_audit_log(db: AsyncSession = Depends(get_db)):
-    """获取系统设置操作审计日志（最近 50 条，按时间倒序）。"""
+async def list_audit_log(
+    current: CurrentUser = Depends(require_permission("audit:view")),
+    db: AsyncSession = Depends(get_db),
+):
+    """获取系统设置操作审计日志（最近 50 条，按时间倒序）。
+
+    操作日志是安全审计资产，仅系统管理员(admin)可见；admin 因持 system:manage
+    被通配放行，此依赖对 admin 不构成额外限制。
+    """
     result = await db.execute(
         select(AuditLog).order_by(desc(AuditLog.created_at)).limit(50)
     )
@@ -102,3 +110,73 @@ async def append_audit_log(body: dict, db: AsyncSession = Depends(get_db)):
           "action": log.action,
           "section": log.section or "",
       })
+
+
+# ── 公司信息 ────────────────────────────────────────────
+# 复用 SystemSetting 表（key="company_info"），读=登录可见，写=仅系统管理员。
+
+COMPANY_INFO_KEY = "company_info"
+
+COMPANY_INFO_FIELDS = [
+    "companyName", "shortName", "description",
+    "creditCode", "legalPerson", "registeredCapital",
+    "foundedAt", "industry", "headcount", "address",
+    "phone", "email", "website", "logoUrl",
+    "financingStage", "tags", "welfare",
+    # 招聘扩展字段（2026-08-04）：雇主品牌与招聘联系
+    "companyType", "workAddress", "recruitmentContact", "recruitmentEmail",
+    "products", "culture", "honors",
+]
+
+
+@router.get("/company-info")
+async def get_company_info(
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """获取公司信息（登录即可读）。未配置时返回空模板。"""
+    result = await db.execute(
+        select(SystemSetting).where(SystemSetting.key == COMPANY_INFO_KEY)
+    )
+    setting = result.scalar_one_or_none()
+    data = setting.value if setting and setting.value else {}
+    return ok({k: data.get(k, "") for k in COMPANY_INFO_FIELDS})
+
+
+@router.put("/company-info")
+async def update_company_info(
+    body: dict,
+    current: CurrentUser = Depends(require_permission("system:manage")),
+    db: AsyncSession = Depends(get_db),
+):
+    """更新公司信息（仅系统管理员；admin 持 system:manage 通配放行）。
+
+    只接收白名单字段，忽略未知键；写操作落审计日志（section="company"）。
+    """
+    clean = {k: body.get(k) for k in COMPANY_INFO_FIELDS if k in body}
+    if not clean:
+        raise HTTPException(status_code=400, detail="没有可更新的公司信息字段")
+
+    result = await db.execute(
+        select(SystemSetting).where(SystemSetting.key == COMPANY_INFO_KEY)
+    )
+    setting = result.scalar_one_or_none()
+    if setting:
+        merged = {**(setting.value or {}), **clean}
+        setting.value = merged
+    else:
+        setting = SystemSetting(key=COMPANY_INFO_KEY, value=clean)
+        db.add(setting)
+
+    # 审计日志（管理员本人操作，非"审计者≠被审计者"冲突场景）
+    log = AuditLog(
+        id=f"log-{uuid.uuid4().hex[:12]}",
+        time=iso_utc(datetime.utcnow()),
+        actor=current.username,
+        action="更新公司信息",
+        section="company",
+    )
+    db.add(log)
+
+    await db.flush()
+    return ok(clean)

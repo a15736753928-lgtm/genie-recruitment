@@ -71,8 +71,8 @@ TOOL_REGISTRY = {
                 "id": {"type": "string", "description": "候选人ID"},
                 "status": {
                     "type": "string",
-                    "enum": ["new", "parsed", "pending_screen", "invited", "round1", "round2", "pending_offer", "hired", "talent_pool", "rejected"],
-                    "description": "pending_screen=待筛选, invited=初筛通过待安排面试, round1=一面中, round2=二面中, pending_offer=待发Offer, hired=已录用, rejected=未通过/淘汰, talent_pool=人才池",
+                    "enum": ["job_hunting", "round1", "round2", "pending_offer", "rejected", "talent_pool"],
+                    "description": "求职中=job_hunting, 一面中=round1, 二面中=round2, 待发Offer=pending_offer, 未通过=rejected, 已失效(入人才池)=talent_pool。注意：hired 不能由 AI 直接设置（仅 Offer 审批通过自动生成）；round1/round2/pending_offer/rejected/talent_pool 均可从求职中迁入",
                 },
                 "fields": {"type": "object", "description": "要更新的其他字段"},
             },

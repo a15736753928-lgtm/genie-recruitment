@@ -31,25 +31,26 @@ class StateError(Exception):
 TRANSITIONS: dict[str, dict[str, list[str | None]]] = {
     "candidate": {
         # to_status: [合法 from_status, ...] (None=初始)
-        "new":              [None],
-        "parsed":           ["new"],
-        # AI 评分是解析与初筛的合并动作，简历入库后可能直接从 new 打分进筛选池，
-        # 不一定先落 parsed。只允许 parsed 会让候选人永远卡在 new，整条筛选链断掉。
-        "pending_screen":   ["new", "parsed"],
-        "pending_materials":["pending_screen", "pending_materials"],
-        "invited":          ["pending_screen", "pending_materials"],
-        "round1":           ["invited"],
-        "round2":           ["round1"],
-        "pending_offer":    ["round2", "round1"],
-        "hired":            ["pending_offer"],
-        "talent_pool":      [
-            "pending_screen", "pending_materials", "invited",
-            "round1", "round2", "pending_offer",   # 任何非终止可进人才池
-        ],
-        "rejected":         [
-            "pending_screen", "pending_materials", "invited",
-            "round1", "round2", "pending_offer",
-        ],
+        # 2026-08-02 重构：按业务词表合并存储——
+        #   job_hunting  求职中（合并旧 new/parsed/pending_screen/pending_materials，入库即此态）
+        #   round1       一面中（吸收旧 invited：筛选通过直接进一面，不再单独"待安排"态）
+        #   round2       二面中
+        #   pending_offer 待发offer（二面通过，等 HR 审批发offer）
+        #   offer_sent   已发Offer待确认（HR「发送」后，等候选人答复；接受→hired，拒绝/超时→talent_pool）
+        #   hired        已录用（候选人接受 Offer 后入职，终态）
+        #   rejected     未通过（初筛/一面/二面淘汰，终态）
+        #   talent_pool  已失效（业务名"已失效"，非淘汰性流失归入人才池留档，含 Offer 超时视为放弃）
+        # job_hunting 兼容 round1/round2/pending_offer/offer_sent/talent_pool 回迁（转岗/取消等横切动作）。
+        "job_hunting":   [None, "round1", "round2", "pending_offer", "offer_sent", "talent_pool"],
+        "round1":        ["job_hunting"],
+        "round2":        ["round1"],
+        # 2026-08-02 Offer 模块：talent_pool/offer_sent 回流 → 支持「作废/拒绝/超时后重新发起」
+        "pending_offer": ["round2", "round1", "talent_pool", "offer_sent", "job_hunting"],
+        "offer_sent":    ["pending_offer"],      # HR「发送」Offer 后，等候选人答复
+        "hired":         ["offer_sent"],         # 候选人接受 Offer 后入职
+        "rejected":      ["job_hunting", "round1", "round2", "pending_offer", "offer_sent"],
+        # 已失效 = 非淘汰性流失（爽约/去别家/Offer超时视为放弃/中途放弃），统一归入人才池留档
+        "talent_pool":   ["job_hunting", "round1", "round2", "pending_offer", "offer_sent"],
     },
     "employee": {
         # 完整生命周期(第二期会用全部迁移)
@@ -86,11 +87,20 @@ TRANSITIONS: dict[str, dict[str, list[str | None]]] = {
         "rework":          ["pending_accept"],
         "closed":          ["passed", "rework"],
     },
+    # Offer 8 态（2026-08-02 重构，旧 pending/approved/rejected/conditional 由 _migrate_v19 映射）
+    #   draft(待HR发起) → pending_approval(待审批) → approved(审批通过·可发送) → sent(已发送)
+    #     → accepted(候选人已接受,终态) / declined(候选人拒绝,终态)
+    #   approved/sent → expired(超时·视为放弃,终态) / voided(已作废: 审批不通过/HR撤销,终态)
+    #   draft/pending_approval → voided(撤销/审批不通过)
     "offer": {
-        "pending":       [None],
-        "approved":      ["pending"],
-        "rejected":      ["pending"],
-        "conditional":   ["pending"],
+        "draft":            [None],                    # 新建保存(草稿)
+        "pending_approval": ["draft"],                 # 提交审批
+        "approved":         ["pending_approval"],      # 逐级审批全部通过(可发送)
+        "sent":             ["approved"],              # HR 发送(生成 token, 候选人→offer_sent)
+        "accepted":         ["sent"],                  # 候选人接受(终态, 触发生成 Employee)
+        "declined":         ["sent"],                  # 候选人拒绝(终态, 候选人→talent_pool)
+        "expired":          ["approved", "sent"],      # 超有效期自动失效(终态, 候选人→talent_pool)
+        "voided":           ["draft", "pending_approval", "approved", "sent"],  # 审批不通过/HR撤销
     },
     "recruitment_request": {
         "draft":           [None],

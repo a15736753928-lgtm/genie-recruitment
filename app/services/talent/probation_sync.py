@@ -11,6 +11,7 @@ from sqlalchemy.orm import selectinload
 from app.models.probation import Employee, ProbationTask
 from app.models.recruitment import Candidate
 from app.services.system.system_settings import get_system_setting
+from app.services.talent.employee_builder import build_employee_from_candidate
 
 # Candidate statuses that should appear on the probation assessment page.
 # 与状态机(app/core/state_machine.py TRANSITIONS["candidate"])对齐：
@@ -63,17 +64,17 @@ async def ensure_employee_for_candidate(
     if candidate.position and candidate.position.department:
         department = candidate.position.department
 
-    emp = Employee(
-        candidate_id=candidate.id,
+    # 统一构建器：身份信息（name/gender/age/phone/email）从候选人主档拷贝，
+    # 与 offer_public 路径保持一致，避免两条入职路径字段漂移。
+    emp = build_employee_from_candidate(
+        candidate,
         position_id=candidate.position_id,
-        name=candidate.name,
-        gender=candidate.gender,
-        age=candidate.age,
         department=department,
         onboard_date=join,
-        probation_end_date=probation_end,
-        status="pending_onboard",
+        probation_months=None,
     )
+    # 兜底路径用系统设置的试用期天数，而不是 Offer 的月数
+    emp.probation_end_date = probation_end
     db.add(emp)
     await db.flush()
     await _default_probation_tasks(db, emp, join)
