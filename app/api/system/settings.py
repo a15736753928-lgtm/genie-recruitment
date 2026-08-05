@@ -126,6 +126,11 @@ COMPANY_INFO_FIELDS = [
     # 招聘扩展字段（2026-08-04）：雇主品牌与招聘联系
     "companyType", "workAddress", "recruitmentContact", "recruitmentEmail",
     "products", "culture", "honors",
+    # 招聘版字段（2026-08-04）：经营状态 / 股权 / 财务概况 / 风险 / 资质
+    "businessStatus", "controller", "insuredCount",
+    "revenueScale", "profitable",
+    "riskStatus", "riskNotes",
+    "qualifications",
 ]
 
 

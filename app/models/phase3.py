@@ -29,6 +29,7 @@ class WorkTask(Base):
     collaborator_ids = Column(JSON, nullable=True)                  # [user_id, ...]
     start_at = Column(DateTime, nullable=True)
     deadline = Column(DateTime, nullable=True)
+    submitted_at = Column(DateTime, nullable=True)          # 员工提交验收时间(按时交付率)
     priority = Column(String(8), nullable=False, default="normal")  # low/normal/high/urgent
     difficulty = Column(String(8), nullable=True)                   # easy/medium/hard/expert
     level = Column(String(2), nullable=False, default="D")          # S/A/B/C/D

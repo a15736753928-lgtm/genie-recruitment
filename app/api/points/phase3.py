@@ -293,6 +293,7 @@ async def submit_task(task_id: str, body: dict, current: CurrentUser = Depends(r
     if not t: return not_found("任务不存在")
     if t.status != "in_progress": return fail(409, "只有进行中的任务可提交")
     t.deliverables = body.get("deliverables") or t.deliverables
+    t.submitted_at = datetime.utcnow()          # 记录实际提交时间(按时交付率口径)
     try:
         await transition(db, "work_task", t, "pending_accept", actor_id=current.id, actor_name=current.username, skip_block_check=True)
     except StateError as e:

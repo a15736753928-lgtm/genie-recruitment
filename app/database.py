@@ -269,6 +269,10 @@ def _run_migrations(connection):
     _migrate_v19_offer_module(connection)
     # v20: 候选人信息自动流转 —— Offer 预填来源标记 + 主档版本号
     _migrate_v20_offer_prefill(connection)
+    # v21: 工作任务实际提交时间(按时交付率口径)
+    _migrate_v21_worktask_submitted_at(connection)
+    # v22: 正式员工人才池 —— 画像培训/项目字段 + 能力标签状态化(申请/确认/拒绝)
+    _migrate_v22_talent_pool(connection)
 
 
 def _migrate_v20_offer_prefill(connection) -> None:
@@ -282,6 +286,33 @@ def _migrate_v20_offer_prefill(connection) -> None:
     _add_column_if_missing(connection, "offer_approvals", "prefill_source", "JSON")
     _add_column_if_missing(connection, "offer_approvals", "profile_version", "INTEGER")
     _add_column_if_missing(connection, "candidates", "profile_version", "INTEGER NOT NULL DEFAULT 1")
+
+
+def _migrate_v21_worktask_submitted_at(connection) -> None:
+    """v21: 工作任务新增 submitted_at —— 员工提交验收的实际完成时间。
+
+    按时交付率 = passed 任务中 submitted_at <= deadline 的占比(人才画像指标)。
+    纯 ADD COLUMN；历史任务无 submitted_at，按时率从新任务起算。
+    """
+    _add_column_if_missing(connection, "work_tasks", "submitted_at", "TIMESTAMP NULL")
+
+
+def _migrate_v22_talent_pool(connection) -> None:
+    """v22: 正式员工人才池。
+
+    talent_profiles 新增培训/项目聚合字段(PRD 人才画像 15 项指标补齐)：
+      training_rate NUMERIC / training_summary JSON / project_count INT / project_experience JSON
+    ability_tags 状态化(申请→证据→主管确认)：
+      status(pending/confirmed/rejected) 存量默认 confirmed(历史标签视为已确认)
+      requested_by(申请人) / reject_reason(拒绝原因)
+    """
+    _add_column_if_missing(connection, "talent_profiles", "training_rate", "NUMERIC(5,2)")
+    _add_column_if_missing(connection, "talent_profiles", "training_summary", "JSON")
+    _add_column_if_missing(connection, "talent_profiles", "project_count", "INTEGER NOT NULL DEFAULT 0")
+    _add_column_if_missing(connection, "talent_profiles", "project_experience", "JSON")
+    _add_column_if_missing(connection, "ability_tags", "status", "VARCHAR(16) NOT NULL DEFAULT 'confirmed'")
+    _add_column_if_missing(connection, "ability_tags", "requested_by", "UUID NULL")
+    _add_column_if_missing(connection, "ability_tags", "reject_reason", "VARCHAR(255)")
 
 
 def _migrate_v17_confirmation_override(connection) -> None:

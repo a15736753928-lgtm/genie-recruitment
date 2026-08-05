@@ -42,6 +42,12 @@ class TalentProfile(Base):
     penalty_count = Column(Integer, default=0)
     rework_rate = Column(Numeric(5, 2), nullable=True)
 
+    # 培训与项目(第四期聚合, 正式员工人才池)
+    training_rate = Column(Numeric(5, 2), nullable=True)        # 培训完成率
+    training_summary = Column(JSON, nullable=True)              # [{title, completed, score}]
+    project_count = Column(Integer, default=0)                  # 参与项目数
+    project_experience = Column(JSON, nullable=True)            # [{projectId, name, assignedAt}]
+
     # 能力与协作
     trainable_skills = Column(JSON, nullable=True)              # [str]
     assignable_tasks = Column(JSON, nullable=True)              # [{level, count}]
@@ -71,6 +77,9 @@ class AbilityTag(Base):
     tag = Column(String(64), nullable=False)
     level = Column(String(2), nullable=False, default="L1")    # L1-L5
     evidence = Column(JSON, nullable=False)                    # [{type,ref}] 非空
+    status = Column(String(16), nullable=False, default="confirmed")  # pending / confirmed / rejected
+    requested_by = Column(UUID(as_uuid=True), nullable=True)   # 申请人 FK users
+    reject_reason = Column(String(255), nullable=True)          # 拒绝原因
     confirmed_by = Column(UUID(as_uuid=True), nullable=True)
     confirmed_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)

@@ -13,9 +13,9 @@ from sqlalchemy import select, func, and_, or_, String  # String: skills JSON �
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.models.phase4 import TalentProfile, AbilityTag, PromotionRecord, EquityRecord
+from app.models.phase4 import TalentProfile, AbilityTag, PromotionRecord, EquityRecord, ProjectAssignment
 from app.models.phase3 import PointRecord, WorkTask, RewardPenaltyRecord
-from app.models.phase2 import MentorRecord
+from app.models.phase2 import MentorRecord, EmployeeTrainingProgress
 from app.models.probation import Employee
 from app.core.security import get_current_user, require_permission, CurrentUser
 from app.core.exceptions import push_exception
@@ -42,11 +42,24 @@ def _serialize_profile(p: TalentProfile) -> dict:
             "canMentor": p.can_mentor,
             "promotionReadiness": float(p.promotion_readiness) if p.promotion_readiness else None,
             "talentRisk": p.talent_risk, "aiAnalysis": p.ai_analysis,
+            "trainingRate": float(p.training_rate) if p.training_rate else None,
+            "trainingSummary": p.training_summary,
+            "projectCount": p.project_count,
+            "projectExperience": p.project_experience,
             "createdAt": iso_utc(p.created_at)}
 
-def _serialize_tag(t: AbilityTag) -> dict:
+def _serialize_tag(t: AbilityTag, current: Optional[CurrentUser] = None, employee: Optional[Employee] = None) -> dict:
+    """canConfirm: 当前用户是否为该员工直属主管(且申请待处理)。"""
+    can_confirm = bool(
+        employee and current
+        and t.status == "pending"
+        and employee.manager_id == current.id
+    )
     return {"id": str(t.id), "employeeId": str(t.employee_id), "tag": t.tag, "level": t.level,
-            "evidence": t.evidence, "confirmedBy": str(t.confirmed_by) if t.confirmed_by else None,
+            "evidence": t.evidence, "status": t.status,
+            "requestedBy": str(t.requested_by) if t.requested_by else None,
+            "rejectReason": t.reject_reason, "canConfirm": can_confirm,
+            "confirmedBy": str(t.confirmed_by) if t.confirmed_by else None,
             "confirmedAt": iso_utc(t.confirmed_at)}
 
 def _serialize_promotion(pr: PromotionRecord) -> dict:
@@ -116,6 +129,13 @@ async def refresh_talent_profile(
     profile.task_success_rate = round(passed / max(total_tasks, 1) * 100, 2)
     profile.rework_rate = round(rework / max(total_tasks, 1) * 100, 2)
 
+    # 按时交付率 & 一次验收通过率(正式员工人才池口径)
+    passed_tasks = [t for t in all_tasks if t.status == "passed"]
+    on_time = sum(1 for t in passed_tasks if t.submitted_at and t.deadline and t.submitted_at <= t.deadline)
+    first_pass = sum(1 for t in passed_tasks if t.rework_count == 0)
+    profile.on_time_rate = round(on_time / max(len(passed_tasks), 1) * 100, 2)
+    profile.first_pass_rate = round(first_pass / max(len(passed_tasks), 1) * 100, 2)
+
     # 奖惩
     rew = (await db.execute(
         select(func.count()).select_from(RewardPenaltyRecord).where(
@@ -144,6 +164,26 @@ async def refresh_talent_profile(
     if emp:
         profile.department = emp.department
         profile.current_position = emp.position_id and str(emp.position_id) or None
+
+    # 培训记录(员工入职培训进度)
+    training = (await db.execute(
+        select(EmployeeTrainingProgress).where(EmployeeTrainingProgress.employee_id == eid)
+    )).scalar_one_or_none()
+    if training:
+        profile.training_rate = float(training.overall_rate) if training.overall_rate is not None else None
+        profile.training_summary = training.courses
+
+    # 项目经验
+    assignments = (await db.execute(
+        select(ProjectAssignment).where(ProjectAssignment.employee_id == eid)
+    )).scalars().all()
+    profile.project_count = len(assignments)
+    profile.project_experience = [
+        {"projectId": str(a.project_id),
+         "name": a.project.name if a.project else None,
+         "assignedAt": iso_utc(a.assigned_at) if a.assigned_at else None}
+        for a in assignments
+    ]
 
     await db.flush()
     return ok(_serialize_profile(profile))
@@ -198,8 +238,9 @@ async def update_profile(employee_id: str, body: dict, current: CurrentUser = De
 async def list_tags(employee_id: str, current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     try: eid = uuid.UUID(employee_id)
     except ValueError: return ok([])
+    employee = (await db.execute(select(Employee).where(Employee.id == eid))).scalar_one_or_none()
     rows = (await db.execute(select(AbilityTag).where(AbilityTag.employee_id == eid))).scalars().all()
-    return ok([_serialize_tag(t) for t in rows])
+    return ok([_serialize_tag(t, current=current, employee=employee) for t in rows])
 
 
 class CreateTagRequest(BaseModel):
@@ -208,9 +249,17 @@ class CreateTagRequest(BaseModel):
     evidence: list   # 非空
 
 @router.post("/employees/{employee_id}/ability-tags")
-async def add_tag(employee_id: str, body: CreateTagRequest, current: CurrentUser = Depends(require_permission("talent:manage")), db: AsyncSession = Depends(get_db)):
+async def add_tag(employee_id: str, body: CreateTagRequest, current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """提交能力标签申请(带证据)。创建即 pending，须由员工直属主管确认后生效。
+
+    申请守卫: 员工本人 / 该员工直属主管 / HR(talent:manage)。
+    """
     try: eid = uuid.UUID(employee_id)
     except ValueError: return not_found("无效ID")
+    employee = (await db.execute(select(Employee).where(Employee.id == eid))).scalar_one_or_none()
+    if not employee: return not_found("员工不存在")
+    if not (employee.manager_id == current.id or employee.id == current.employee_id or current.has("talent:manage")):
+        return fail(403, "仅员工本人、直属主管或 HR 可提交能力升级申请")
     if not body.evidence or len(body.evidence) == 0:
         return fail(422, "能力标签必须提供证据(evidence 不可为空)")
     dup = (await db.execute(
@@ -221,11 +270,75 @@ async def add_tag(employee_id: str, body: CreateTagRequest, current: CurrentUser
         if dup.level > body.level:
             return fail(422, f"能力标签只升不降({dup.level} > {body.level})")
         dup.level = body.level; dup.evidence = body.evidence
+        # 再次升级需重新走确认
+        dup.status = "pending"; dup.requested_by = current.id
+        dup.confirmed_by = None; dup.confirmed_at = None; dup.reject_reason = None
         await db.flush()
-        return ok(_serialize_tag(dup))
-    tag = AbilityTag(employee_id=eid, tag=body.tag, level=body.level, evidence=body.evidence, confirmed_by=current.id, confirmed_at=datetime.utcnow())
+        return ok(_serialize_tag(dup, current=current, employee=employee))
+    tag = AbilityTag(
+        employee_id=eid, tag=body.tag, level=body.level, evidence=body.evidence,
+        status="pending", requested_by=current.id,
+    )
     db.add(tag); await db.flush()
-    return ok(_serialize_tag(tag))
+    await write_audit(db, actor=current.username, action=f"申请能力标签: {body.tag} L{body.level}", section="talent")
+    return ok(_serialize_tag(tag, current=current, employee=employee))
+
+
+class RejectTagRequest(BaseModel):
+    model_config = {"populate_by_name": True}
+    reason: Optional[str] = Field(None, alias="reason")
+
+
+async def _get_tag_for_decision(employee_id: str, tag_id: str, db: AsyncSession):
+    """查员工 + 标签,任一不存在返回 None 三元组。"""
+    try:
+        eid = uuid.UUID(employee_id); tid = uuid.UUID(tag_id)
+    except ValueError:
+        return None, None, None
+    employee = (await db.execute(select(Employee).where(Employee.id == eid))).scalar_one_or_none()
+    tag = (await db.execute(
+        select(AbilityTag).where(AbilityTag.id == tid, AbilityTag.employee_id == eid)
+    )).scalar_one_or_none()
+    return employee, tag, eid
+
+
+def _is_manager_or_admin(employee: Employee, current: CurrentUser) -> bool:
+    """仅直属主管(或 admin)可确认/拒绝能力升级。"""
+    return bool(employee and (employee.manager_id == current.id or current.has("system:manage")))
+
+
+@router.post("/employees/{employee_id}/ability-tags/{tag_id}/confirm")
+async def confirm_tag(employee_id: str, tag_id: str, current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """主管确认能力标签;若标签等级高于画像当前等级则同步提升(只升不降)。"""
+    employee, tag, eid = await _get_tag_for_decision(employee_id, tag_id, db)
+    if not tag: return not_found("标签不存在")
+    if not employee: return not_found("员工不存在")
+    if not _is_manager_or_admin(employee, current):
+        return fail(403, "仅该员工的直属主管可确认能力标签")
+    if tag.status != "pending": return fail(409, "该申请已处理")
+    tag.status = "confirmed"; tag.confirmed_by = current.id; tag.confirmed_at = datetime.utcnow()
+    profile = (await db.execute(select(TalentProfile).where(TalentProfile.employee_id == eid))).scalar_one_or_none()
+    if profile and tag.level > (profile.ability_level or "L1"):
+        profile.ability_level = tag.level
+    await db.flush()
+    await write_audit(db, actor=current.username, action=f"确认能力标签: {tag.tag} L{tag.level}", section="talent")
+    return ok(_serialize_tag(tag, current=current, employee=employee))
+
+
+@router.post("/employees/{employee_id}/ability-tags/{tag_id}/reject")
+async def reject_tag(employee_id: str, tag_id: str, body: Optional[RejectTagRequest] = None, current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    employee, tag, _ = await _get_tag_for_decision(employee_id, tag_id, db)
+    if not tag: return not_found("标签不存在")
+    if not employee: return not_found("员工不存在")
+    if not _is_manager_or_admin(employee, current):
+        return fail(403, "仅该员工的直属主管可拒绝能力标签")
+    if tag.status != "pending": return fail(409, "该申请已处理")
+    tag.status = "rejected"
+    tag.reject_reason = body.reason if body else None
+    tag.confirmed_by = current.id; tag.confirmed_at = datetime.utcnow()
+    await db.flush()
+    await write_audit(db, actor=current.username, action=f"拒绝能力标签: {tag.tag}", section="talent")
+    return ok(_serialize_tag(tag, current=current, employee=employee))
 
 
 @router.delete("/employees/{employee_id}/ability-tags/{tag_id}")

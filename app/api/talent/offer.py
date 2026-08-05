@@ -16,6 +16,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 import secrets
@@ -24,7 +25,7 @@ from datetime import datetime, timedelta, date
 from typing import Any, Optional, List
 
 from fastapi import APIRouter, Depends, Query, Request, UploadFile, File, Form
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select, and_, or_, func
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -33,6 +34,7 @@ from app.database import get_db
 from app.models.recruitment import Candidate, Position, CandidateAIAnalysis
 from app.models.phase1 import Interview, OfferApproval, ResumeScore, RecruitmentRequest
 from app.models.probation import Employee
+from app.models.settings import SystemSetting
 from app.models.offer_module import (
     OfferTemplate, OfferApprovalFlow, OfferApprovalRecord, OfferAttachment,
 )
@@ -43,6 +45,7 @@ from app.utils.audit import write_audit
 from app.utils.clock import iso_utc
 from app.services.ai import llm_chat
 from app.utils.llm_json import extract_json_object
+from app.services.offer.offer_pdf import build_offer_vars, fill_template_pdf
 
 logger = logging.getLogger("genie.offer")
 router = APIRouter(tags=["Offer管理"])
@@ -240,6 +243,22 @@ async def _load_position(db: AsyncSession, position_id) -> Optional[Position]:
         return None
     r = await db.execute(select(Position).where(Position.id == uid))
     return r.scalar_one_or_none()
+
+
+async def _load_company_info(db: AsyncSession) -> dict:
+    """读取公司信息（SystemSetting key=company_info，读=登录可见）。"""
+    r = await db.execute(select(SystemSetting).where(SystemSetting.key == "company_info"))
+    setting = r.scalar_one_or_none()
+    return setting.value if setting and setting.value else {}
+
+
+async def _render_offer_pdf(offer, db: AsyncSession) -> bytes:
+    """模板填充生成 Offer 正式 PDF（同步 fill 放线程池，避免阻塞事件循环）。"""
+    candidate = await _load_candidate(db, offer.candidate_id)
+    position = await _load_position(db, offer.position_id)
+    company = await _load_company_info(db)
+    data = build_offer_vars(offer, candidate, position, company)
+    return await asyncio.to_thread(fill_template_pdf, data)
 
 
 async def _safe_transition(db, entity_type, entity, to_status, *, actor_id=None, actor_name="系统", reason=None):
@@ -1304,98 +1323,41 @@ async def export_offer_pdf(
     db: AsyncSession = Depends(get_db),
     current: CurrentUser = Depends(_require_offer_read),
 ):
-    """Offer 完整内容 PDF 导出（reportlab，复用中文字体注册）。"""
+    """Offer 正式 PDF 导出：模板填充（PyMuPDF 在 Offer 通用模板上写入字段值）。"""
     offer = await _load_offer(db, offer_id)
     if not offer:
         return not_found("Offer 不存在")
-    candidate = await _load_candidate(db, offer.candidate_id)
-    position = await _load_position(db, offer.position_id)
-
-    from app.services.job_description_pdf import _register_chinese_fonts
-    from reportlab.lib.pagesizes import A4
-    from reportlab.lib.units import mm
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
-    from reportlab.lib import colors
-    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
-    from app.services.job_description_pdf import _FONT_NAME, _FONT_NAME_BOLD
-
-    _register_chinese_fonts()
-    buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=A4, topMargin=20 * mm, bottomMargin=20 * mm,
-                            leftMargin=18 * mm, rightMargin=18 * mm)
-    styles = getSampleStyleSheet()
-    styles.add(ParagraphStyle("T", fontName=_FONT_NAME_BOLD, fontSize=18, leading=24, alignment=1))
-    styles.add(ParagraphStyle("H", fontName=_FONT_NAME_BOLD, fontSize=12, leading=16, spaceBefore=5 * mm,
-                              spaceAfter=3 * mm, textColor=colors.HexColor("#2563eb")))
-    styles.add(ParagraphStyle("B", fontName=_FONT_NAME, fontSize=10, leading=16, spaceAfter=2 * mm))
-    styles.add(ParagraphStyle("C", fontName=_FONT_NAME, fontSize=9, leading=13))
-
-    elements = [Paragraph("录 用 通 知 书", styles["T"]),
-                Paragraph(f"{candidate.name if candidate else ''} 先生/女士", styles["B"]),
-                HRFlowable(width="100%", thickness=1, color=colors.HexColor("#2563eb")), Spacer(1, 3 * mm)]
-
-    def info_table(data: list[tuple[str, str]]) -> Table:
-        rows = []
-        for i in range(0, len(data), 2):
-            row = []
-            for j in range(2):
-                if i + j < len(data):
-                    k, v = data[i + j]
-                    row += [Paragraph(f"<b>{k}</b>", styles["C"]), Paragraph(str(v), styles["C"])]
-                else:
-                    row += ["", ""]
-            rows.append(row)
-        t = Table(rows, colWidths=[28 * mm, 52 * mm, 28 * mm, 52 * mm])
-        t.setStyle(TableStyle([
-            ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#e2e8f0")),
-            ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#f8fafc")),
-            ("BACKGROUND", (2, 0), (2, -1), colors.HexColor("#f8fafc")),
-            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ]))
-        return t
-
-    elements.append(Paragraph("一、候选人信息", styles["H"]))
-    elements.append(info_table([
-        ("姓名", candidate.name if candidate else "—"), ("电话", candidate.phone or "—"),
-        ("邮箱", candidate.email or "—"), ("应聘岗位", position.name if position else "—"),
-        ("所属部门", offer.department or (position.department if position else "—")),
-        ("工作地点", offer.work_location or "—"),
-        ("预计入职", offer.expected_onboard_date.isoformat() if offer.expected_onboard_date else "—"),
-        ("试用期", f"{offer.probation_months} 个月" if offer.probation_months else "—"),
-    ]))
-
-    comp = offer.compensation or {}
-    rows = [("基本工资", comp.get("base_salary", "—")), ("绩效工资", comp.get("performance_salary", "—")),
-            ("补贴", comp.get("allowance", "—")), ("年终奖说明", comp.get("annual_bonus_note", "—")),
-            ("薪资口径", "税前" if comp.get("salary_tax_flag") == "pre" else ("税后" if comp.get("salary_tax_flag") == "post" else "—")),
-            ("社保基数", comp.get("social_security_base", "—")),
-            ("社保缴纳起始", comp.get("social_security_start_month", "—"))]
-    elements.append(Paragraph("二、薪酬福利", styles["H"]))
-    elements.append(info_table(rows))
-
-    terms = offer.employment_terms or {}
-    contract = "固定期限" if terms.get("contract_type") == "fixed" else ("无固定期限" if terms.get("contract_type") == "non_fixed" else "—")
-    mode = "全职" if terms.get("work_mode") == "fulltime" else ("外包" if terms.get("work_mode") == "outsourcing" else "—")
-    elements.append(Paragraph("三、岗位约定", styles["H"]))
-    elements.append(info_table([("劳动合同类型", contract), ("工作模式", mode)]))
-
-    other = offer.other_terms or {}
-    elements.append(Paragraph("四、其他条款", styles["H"]))
-    for label, key in (("报到所需材料", "report_materials"), ("试用期要求", "probation_requirements"),
-                       ("竞业/保密提示", "non_compete_nda"), ("备注", "remark")):
-        if other.get(key):
-            elements.append(Paragraph(f"<b>{label}：</b>{other[key]}", styles["B"]))
-
-    elements.append(Spacer(1, 10 * mm))
-    elements.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#94a3b8")))
-    elements.append(Paragraph("HR 签字：______________   日期：______________", styles["C"]))
-
-    doc.build(elements)
-    buffer.seek(0)
-    return StreamingResponse(
-        io.BytesIO(buffer.read()),
+    try:
+        pdf = await _render_offer_pdf(offer, db)
+    except Exception:
+        logger.exception("Offer PDF 生成失败 offer=%s", offer_id)
+        return fail(500, "Offer PDF 生成失败，请检查模板文件与中文字体配置")
+    return Response(
+        content=pdf,
         media_type="application/pdf",
         headers={"Content-Disposition": f'attachment; filename="offer_{offer.id}.pdf"'},
+    )
+
+
+@router.get("/offers/{offer_id}/preview")
+async def preview_offer_pdf(
+    offer_id: str,
+    db: AsyncSession = Depends(get_db),
+    current: CurrentUser = Depends(_require_offer_read),
+):
+    """Offer PDF 预览（inline，供前端内嵌展示）。"""
+    offer = await _load_offer(db, offer_id)
+    if not offer:
+        return not_found("Offer 不存在")
+    try:
+        pdf = await _render_offer_pdf(offer, db)
+    except Exception:
+        logger.exception("Offer PDF 预览生成失败 offer=%s", offer_id)
+        return fail(500, "Offer PDF 生成失败，请检查模板文件与中文字体配置")
+    return Response(
+        content=pdf,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="offer_{offer.id}.pdf"'},
     )
 
 
