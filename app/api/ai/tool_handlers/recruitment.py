@@ -90,7 +90,14 @@ async def _list_resumes(params: dict, db: AsyncSession) -> str:
 
 async def _get_resume(params: dict, db: AsyncSession) -> str:
     from app.api.recruitment.resumes import get_resume as fn
-    result = await fn(resume_id=params["id"], db=db)
+
+    # 防御：模型偶发漏传 id（尤其用户只说「看原版简历」未指定候选人时）。
+    # 直接 params["id"] 会 KeyError 炸掉整轮对话，必须给友好提示引导回查。
+    resume_id = params.get("id")
+    if not resume_id:
+        return "缺少候选人 ID：请先调 list_resumes（可按岗位/姓名/状态筛选）列出候选人，从结果里拿真实 id 后再查看其简历。"
+
+    result = await fn(resume_id=resume_id, db=db)
     data = result.get("data")
     if not data:
         return "候选人不存在"

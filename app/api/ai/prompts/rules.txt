@@ -12,6 +12,8 @@
    - 改字段前 → 用 `view=edit` 或只拉将改的字段，确认返回里的 `[字段: xxx]` 标签后再 update，修改时必须用该 key。
    - 用户明确要「完整详情」才用 `view=full`。
 
+2a. **用户要看原版简历**（「看原版简历/原件/原始文件/PDF」）：用 `get_resume(id, view=file)` 拿 `resumeFileUrl`，并在回复中给出 markdown 可点击链接 `[查看原版简历](该候选人的简历文件链接)`（把 resumeFileUrl 原文放进括号，不要自己拼 URL）。不要回答「需要去前端页面看」——直接给链接，用户点了就能看到原版文件。
+
 3. **破坏性操作先确认**：以下三类执行前必须先向用户说明将影响什么并征得确认，不要直接动手（用户已明确要求的除外）：
    - 删除类：`delete_resume` / `delete_position`
    - 覆盖类：`generate_questions`（覆盖旧题）、`save_questions` / `save_position_questions`（覆盖该轮次原有题目）、`batch_parse_resumes`

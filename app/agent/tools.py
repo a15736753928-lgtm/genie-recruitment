@@ -32,7 +32,7 @@ TOOL_REGISTRY = {
             "读取单个候选人详情",
             "看完整简历/匹配分/技能/经历；view=full 看全量",
             "岗位题库(get_position_questions)、候选人题单(get_questions)、改状态",
-            "「查看吴佳熙完整简历」→ get_resume(id, view=full)",
+            "「查看吴佳熙完整简历」→ get_resume(id, view=full)；「看原版简历/原件/原始文件」→ get_resume(id, view=file) 拿 resumeFileUrl 并在回复中给出可点击链接",
         ),
         "parameters": {
             "type": "object",
@@ -40,7 +40,7 @@ TOOL_REGISTRY = {
                 "id": {"type": "string", "description": "候选人 UUID（必须是 list_resumes 返回的真实 id）"},
                 "view": {
                     "type": "string",
-                    "description": "summary|core|detail|contact|screening|file|full，默认 detail",
+                    "description": "summary|core|detail|contact|screening|file|full，默认 detail。用户要看原版简历/原件/原始文件时用 file（返回 resumeFileUrl）",
                 },
                 "fields": {
                     "type": "array",
