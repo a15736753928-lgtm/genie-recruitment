@@ -26,19 +26,57 @@ TEMPLATE_PATH = Path(__file__).parent / "templates" / "offer_template.pdf"
 _FILL_COLOR = (0.02, 0.25, 0.65)
 _ISSUE_COLOR = (0.05, 0.05, 0.05)
 
-# ── 中文字体：优先微软雅黑（与模板字体一致），缺失时回退 PyMuPDF 内置 china-s ──
-_CANDIDATE_FONTS = [
-    r"C:\Windows\Fonts\msyh.ttc",
-    r"C:\Windows\Fonts\msyh.ttf",
-    r"C:\Windows\Fonts\simhei.ttf",
-    r"C:\Windows\Fonts\simsun.ttc",
-]
-_FONT_FILE = next((f for f in _CANDIDATE_FONTS if Path(f).exists()), None)
-_FONT_NAME = "cjk" if _FONT_FILE else "china-s"
+# ── 中文字体：优先用微软雅黑（与模板字体一致）──
+# msyh.ttc 是 TTF 集合，PyMuPDF 直接嵌入时 pdfjs 渲染成方块；用 fontTools 提取单个 TTF
+# 后再嵌入可正常渲染且字体与模板完全一致。fontTools 缺失或提取失败回退内置 china-s。
+def _extract_yahei_bytes() -> bytes | None:
+    msyh = r"C:\Windows\Fonts\msyh.ttc"
+    if not Path(msyh).exists():
+        return None
+    try:
+        from fontTools.ttLib import TTFont
+        f = TTFont(msyh, fontNumber=0)
+        buf = io.BytesIO()
+        f.save(buf)
+        return buf.getvalue()
+    except Exception:
+        logger.warning("提取微软雅黑 TTF 失败，回退内置字体", exc_info=True)
+        return None
+
+
+_YAHEI_BYTES = _extract_yahei_bytes()
+_TEMP_FONT_FILE: str | None = None  # 提取的雅黑 TTF 落盘路径（insert_text 需 fontfile）
 
 
 def _load_font() -> fitz.Font:
-    return fitz.Font(fontfile=_FONT_FILE) if _FONT_FILE else fitz.Font("china-s")
+    return fitz.Font(fontbuffer=_YAHEI_BYTES) if _YAHEI_BYTES else fitz.Font("china-s")
+
+
+def _ensure_font_file() -> str | None:
+    """把提取的雅黑 TTF 写到 ai_temp（insert_text 需要文件路径），复用缓存文件。"""
+    global _TEMP_FONT_FILE
+    if _TEMP_FONT_FILE and Path(_TEMP_FONT_FILE).exists():
+        return _TEMP_FONT_FILE
+    if not _YAHEI_BYTES:
+        return None
+    p = Path(__file__).resolve().parents[3] / "ai_temp" / "msyh_font.ttf"
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(_YAHEI_BYTES)
+        _TEMP_FONT_FILE = str(p)
+        return _TEMP_FONT_FILE
+    except Exception:
+        logger.warning("写入雅黑字体文件失败，回退内置字体", exc_info=True)
+        return None
+
+
+def _insert(page, point, text: str, size: float, color) -> None:
+    """统一插入文本：雅黑（标准 TrueType 嵌入）优先，回退 china-s。"""
+    fp = _ensure_font_file()
+    if fp:
+        page.insert_text(point, text, fontsize=size, fontname="yahei", fontfile=fp, color=color)
+    else:
+        page.insert_text(point, text, fontsize=size, fontname="china-s", color=color)
 
 
 # ── 字段定位表 ──
@@ -172,15 +210,13 @@ def fill_template_pdf(data: dict) -> bytes:
 
     # 2) 写入值
     for pno, (x, y), value, size, color in after_items:
-        doc[pno].insert_text((x, y), value, fontsize=size,
-                             fontname=_FONT_NAME, fontfile=_FONT_FILE, color=color)
+        _insert(doc[pno], (x, y), value, size, color)
     for pno, items in redact_items.items():
         page = doc[pno]
         for rect, value, size, maxw in items:
             v, s = _fit_text(font, value, size, maxw)
             y = rect.y1 + (-3 if size >= 12 else -2)
-            page.insert_text((rect.x0, y), v, fontsize=s,
-                             fontname=_FONT_NAME, fontfile=_FONT_FILE, color=_ISSUE_COLOR)
+            _insert(page, (rect.x0, y), v, s, _ISSUE_COLOR)
 
     buf = io.BytesIO()
     doc.save(buf, garbage=3, deflate=True)
