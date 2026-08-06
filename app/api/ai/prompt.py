@@ -92,8 +92,74 @@ def _load_role_sections(role_codes: list[str] | None) -> str:
 
 
 # ── Agent Configurations ──────────────────────────────────
+# 8 个角色各有独立 agent 入口，agent_id = role_code。
+# 与 prompts/roles/<role>.txt 一一对应，工具集由 permissions fail-closed 驱动。
 
 AGENT_CONFIGS = {
+    "hr": {
+        "name": "HR 招聘助手",
+        "description": "负责招聘全流程：岗位发布、简历筛选、面试安排、Offer 流程",
+        "icon": "user-search",
+        "iconBg": "#e8f4fd",
+        "iconColor": "#2196f3",
+    },
+    "ceo": {
+        "name": "公司负责人助手",
+        "description": "查看人才全局概况、审批核心岗位晋级与期权决策",
+        "icon": "crown",
+        "iconBg": "#fff3e0",
+        "iconColor": "#ff9800",
+    },
+    "manager": {
+        "name": "部门负责人助手",
+        "description": "提交用人需求、确认岗位标准、审批录用与转正",
+        "icon": "users",
+        "iconBg": "#e8f5e9",
+        "iconColor": "#4caf50",
+    },
+    "interviewer": {
+        "name": "面试官助手",
+        "description": "查看简历、生成面试题、结构化评分与录音上传",
+        "icon": "mic",
+        "iconBg": "#fce4ec",
+        "iconColor": "#e91e63",
+    },
+    "mentor": {
+        "name": "带教人助手",
+        "description": "制定培训任务、评价新员工、提交带教记录",
+        "icon": "graduation-cap",
+        "iconBg": "#e8f5e9",
+        "iconColor": "#66bb6a",
+    },
+    "project_lead": {
+        "name": "项目负责人助手",
+        "description": "发布工作任务、验收成果、确认积分与处理申诉",
+        "icon": "list-todo",
+        "iconBg": "#e0f2f1",
+        "iconColor": "#26a69a",
+    },
+    "employee": {
+        "name": "员工助手",
+        "description": "查看试用任务、培训进度、积分明细与申诉",
+        "icon": "user",
+        "iconBg": "#f3e5f5",
+        "iconColor": "#ab47bc",
+    },
+    "admin": {
+        "name": "系统管理员助手",
+        "description": "配置权限规则、业务阈值、AI 模型与审计策略",
+        "icon": "settings",
+        "iconBg": "#eceff1",
+        "iconColor": "#607d8b",
+    },
+    "equity_committee": {
+        "name": "期权委员会助手",
+        "description": "期权审批联签、查看人才池与期权候选人",
+        "icon": "gem",
+        "iconBg": "#fff9c4",
+        "iconColor": "#f9a825",
+    },
+    # 旧 genie/recruit/interview/training/performance 保留向后兼容，未知 id 兜底 employee。
     "genie": {
         "name": "Genie 全能助手",
         "description": "通过对话框，按你的账号权限完成招聘系统各环节操作",
@@ -153,7 +219,7 @@ def build_system_prompt(
     叠加到共享提示词之后，实现各角色不同的对话模式。角色段只改对话人格，
     不改变工具可见性与共享工作规则。传 None 保持纯共享提示词（向后兼容）。
     """
-    agent_info = AGENT_CONFIGS.get(agent_id, AGENT_CONFIGS["genie"])
+    agent_info = AGENT_CONFIGS.get(agent_id, AGENT_CONFIGS["employee"])
     template = _load_all()
     capabilities = _render_capabilities(visible_tool_names)
     base = template.format(

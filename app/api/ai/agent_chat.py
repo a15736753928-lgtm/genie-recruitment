@@ -258,6 +258,24 @@ def _can_see_all(current: CurrentUser) -> bool:
     return WILDCARD_PERMISSION in current.permissions
 
 
+# ── Agent ID 推导 ──────────────────────────────────────────
+# 一账号一角色，agent_id = role_code。equity_committee 回退到 hr。
+ROLE_TO_AGENT: dict[str, str] = {
+    "hr": "hr", "ceo": "ceo", "manager": "manager",
+    "interviewer": "interviewer", "mentor": "mentor",
+    "project_lead": "project_lead", "employee": "employee",
+    "admin": "admin", "equity_committee": "equity_committee",
+}
+
+
+def _agent_id_for_user(current: CurrentUser) -> str:
+    """从当前用户角色推导 agent_id。取第一个匹配的角色 code。"""
+    for role in current.roles:
+        if role in ROLE_TO_AGENT:
+            return ROLE_TO_AGENT[role]
+    return "employee"
+
+
 async def _get_owned_session(
     db: AsyncSession, session_id: str, current: CurrentUser
 ) -> AgentSession | None:
@@ -350,21 +368,23 @@ async def _build_global_overview(db: AsyncSession, current: CurrentUser) -> dict
     task_result = await db.execute(task_q.limit(1))
     active_task = task_result.scalar_one_or_none()
 
+    # 一账号一角色：返回当前用户角色的 agent 配置
+    agent_id = _agent_id_for_user(current)
+    agent_cfg = AGENT_CONFIGS.get(agent_id, AGENT_CONFIGS["employee"])
+
     return {
         "projectId": None,
         "projectName": None,
-        # 只有 genie 一个真实 agent（其余 AGENT_CONFIGS 仅作为 build_system_prompt 的
-        # 兜底映射保留，无独立工具集/路由）。工作台只展示 genie，避免「多 agent 协作」
-        # 的假象。
         "agents": [
             {
-                "id": "genie", "name": AGENT_CONFIGS["genie"]["name"],
-                "description": AGENT_CONFIGS["genie"]["description"],
-                "status": "全能就绪",
+                "id": agent_id,
+                "name": agent_cfg["name"],
+                "description": agent_cfg["description"],
+                "status": "就绪",
                 "tone": "active",
-                "icon": AGENT_CONFIGS["genie"]["icon"],
-                "iconBg": AGENT_CONFIGS["genie"]["iconBg"],
-                "iconColor": AGENT_CONFIGS["genie"]["iconColor"],
+                "icon": agent_cfg["icon"],
+                "iconBg": agent_cfg["iconBg"],
+                "iconColor": agent_cfg["iconColor"],
             },
         ],
         "workflowSteps": [
@@ -633,6 +653,7 @@ async def delete_project(
 
 class CreateSessionRequest(BaseModel):
     projectId: Optional[str] = None
+    agentId: Optional[str] = None
 
 
 @router.post("/ai-agent/sessions")
@@ -651,7 +672,7 @@ async def create_session(
 
     session = AgentSession(
         title="新对话",
-        agent_id="genie",
+        agent_id=_agent_id_for_user(current),
         project_id=project_id,
         owner_id=current.id,
     )
@@ -845,7 +866,7 @@ async def append_session_message(
         if session.owner_id is not None and session.owner_id != current.id and not _can_see_all(current):
             return not_found("对话不存在")
     else:
-        session = AgentSession(id=sid, title="新对话", agent_id="genie", owner_id=current.id)
+        session = AgentSession(id=sid, title="新对话", agent_id=_agent_id_for_user(current), owner_id=current.id)
         db.add(session)
         await db.flush()
 
@@ -883,7 +904,7 @@ async def materials_from_candidates(
     session_result = await db.execute(session_q)
     session = session_result.scalar_one_or_none()
     if not session:
-        session = AgentSession(title="新对话", agent_id="recruit", owner_id=current.id)
+        session = AgentSession(title="新对话", agent_id=_agent_id_for_user(current), owner_id=current.id)
         db.add(session)
         await db.flush()
 
@@ -1186,7 +1207,7 @@ async def upload_material(
         session_result = await db.execute(session_q)
         session = session_result.scalar_one_or_none()
     if not session:
-        session = AgentSession(title="新对话", agent_id="recruit", owner_id=current.id)
+        session = AgentSession(title="新对话", agent_id=_agent_id_for_user(current), owner_id=current.id)
         db.add(session)
         await db.flush()
 
@@ -1468,7 +1489,10 @@ async def agent_chat(
     message_meta = body.get("messageMeta")
     finalize_materials = body.get("finalizeMaterials")
     session_id = body.get("sessionId")
-    agent_id = body.get("agentId", "genie")
+    # agent_id 不由前端指定（不可信）。已有会话从 session.agent_id 读取；
+    # 新建会话由当前角色推导（_agent_id_for_user）。这里先按角色兜底，
+    # session 确定后若 session.agent_id 有值则覆盖。
+    agent_id = _agent_id_for_user(current)
     material_ids = body.get("materialIds", [])
     ingestion_completed = bool(body.get("ingestionCompleted"))
     user_message_persisted = bool(body.get("userMessagePersisted"))
@@ -1572,12 +1596,16 @@ async def agent_chat(
             session = AgentSession(
                 id=client_sid or uuid.uuid4(),
                 title="新对话",
-                agent_id="genie",
+                agent_id=_agent_id_for_user(current),
                 owner_id=current.id,
             )
             db.add(session)
             await db.flush()
             session_id = str(session.id)
+
+        # agent_id 以数据库为准：旧会话保留其 agent_id，新会话已按角色推导
+        if session.agent_id:
+            agent_id = session.agent_id
 
         # Save user message (display text for UI; model prompt may differ)
         if not user_message_persisted:

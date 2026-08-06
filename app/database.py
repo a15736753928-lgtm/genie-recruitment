@@ -273,6 +273,8 @@ def _run_migrations(connection):
     _migrate_v21_worktask_submitted_at(connection)
     # v22: 正式员工人才池 —— 画像培训/项目字段 + 能力标签状态化(申请/确认/拒绝)
     _migrate_v22_talent_pool(connection)
+    # v23: 9 角色独立对话框 —— 旧 agent_id='genie' → 'employee'（最通用角色）
+    _migrate_v23_agent_id(connection)
 
 
 def _migrate_v20_offer_prefill(connection) -> None:
@@ -313,6 +315,19 @@ def _migrate_v22_talent_pool(connection) -> None:
     _add_column_if_missing(connection, "ability_tags", "status", "VARCHAR(16) NOT NULL DEFAULT 'confirmed'")
     _add_column_if_missing(connection, "ability_tags", "requested_by", "UUID NULL")
     _add_column_if_missing(connection, "ability_tags", "reject_reason", "VARCHAR(255)")
+
+
+def _migrate_v23_agent_id(connection) -> None:
+    """v23: 9 角色独立对话框 —— 旧 agent_id='genie' → 'employee'。
+
+    rebuild_db 不跑迁移（从头建表），此函数仅对线上存量数据生效。
+    幂等：WHERE 条件限定只改 genie/NULL，跑多次无副作用。
+    """
+    from sqlalchemy import text
+    connection.execute(text(
+        "UPDATE agent_sessions SET agent_id = 'employee' "
+        "WHERE agent_id = 'genie' OR agent_id IS NULL"
+    ))
 
 
 def _migrate_v17_confirmation_override(connection) -> None:
