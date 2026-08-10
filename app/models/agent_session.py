@@ -87,6 +87,8 @@ class AgentMaterial(Base):
     type = Column(String(16))
     knowledge_id = Column(UUID(as_uuid=True), ForeignKey("knowledge_items.id"))
     file_path = Column(String(512))
+    # 素材内容 SHA256（全局去重键）。同文件字节完全相同则复用已有记录，不重复入库。
+    content_hash = Column(String(64), index=True)
     uploaded_at = Column(DateTime, default=datetime.utcnow)
 
     session = relationship("AgentSession", back_populates="materials")

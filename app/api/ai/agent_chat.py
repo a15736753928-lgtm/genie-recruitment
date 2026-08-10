@@ -10,6 +10,7 @@ import json
 import re
 import uuid
 import asyncio
+import hashlib
 from datetime import datetime, date
 from typing import Optional, List, AsyncGenerator, Any
 from fastapi import APIRouter, Depends, File, Form, Query, UploadFile, Request
@@ -17,6 +18,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc, func
 from sqlalchemy.orm import selectinload
+from sqlalchemy.orm.attributes import flag_modified
 from pydantic import BaseModel
 from openai import AsyncOpenAI
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
@@ -251,6 +253,186 @@ async def _verify_executor(tool_name: str, params: dict) -> str:
         return await _execute_tool_sync(tool_name, **params)
     except Exception as e:
         return f"验证查询失败: {e}"
+
+
+def _build_session_graph(agent_id: str, current: CurrentUser):
+    """重建会话的工具集 + 系统提示词 + 编译图。
+
+    chat / resume / pending 三个端点共用。resume 时历史从 checkpoint 恢复，
+    这里只保证图结构与挂起时一致（同 agent、同角色 → 同工具集与能力清单）。
+    """
+    langchain_tools = create_langchain_tools(agent_id, current)
+    visible_tool_names = {
+        getattr(t, "name", "") for t in langchain_tools if getattr(t, "name", "")
+    }
+    system_prompt = build_system_prompt(
+        agent_id,
+        visible_tool_names=visible_tool_names,
+        role_codes=current.roles,
+    )
+    graph = build_agent_graph(langchain_tools, system_prompt)
+    return graph, langchain_tools, system_prompt
+
+
+async def _persist_pending_confirm(
+    *,
+    session_obj_id,
+    task_id,
+    result: "AgentResult",
+    interrupt_payload: dict,
+) -> None:
+    """挂起时保存 assistant 消息（含 confirming 块）+ 任务保持 running。
+
+    与 _persist_assistant_turn 不同：任务不设 finished_at、不标 done，
+    前端据此知道本任务尚未完结、确认卡保持可交互。resume 端点成功后会
+    把这条消息的 confirming 块就地更新为 resolved。
+    """
+    tool_blocks = []
+    for block in result.tool_blocks:
+        cleaned = {k: v for k, v in block.items() if not k.startswith("_")}
+        if cleaned.get("confirmation"):
+            cleaned["status"] = "confirming"
+        tool_blocks.append(cleaned)
+    async with async_session_factory() as db:
+        msg = AgentMessage(
+            session_id=session_obj_id,
+            role="assistant",
+            content=result.full_content,
+            thinking=None,
+            tool_blocks=tool_blocks or None,
+            handoffs={
+                "type": "confirm",
+                "kind": interrupt_payload.get("kind"),
+                "question": interrupt_payload.get("question"),
+                "options": interrupt_payload.get("options", []),
+                "created_at": datetime.utcnow().isoformat(),
+            },
+        )
+        db.add(msg)
+        await db.commit()
+
+
+async def _resolve_pending_message(session_id) -> None:
+    """resume 成功后把该会话最近一条挂起消息的 confirming 块更新为 resolved。
+
+    只处理最近一条 ``handoffs.type=="confirm"`` 的 assistant 消息——旧的已
+    resolved 或 expired 的跳过。
+    """
+    async with async_session_factory() as db:
+        result = await db.execute(
+            select(AgentMessage)
+            .where(
+                AgentMessage.session_id == session_id,
+                AgentMessage.role == "assistant",
+            )
+            .order_by(desc(AgentMessage.created_at))
+            .limit(10)
+        )
+        for msg in result.scalars().all():
+            handoffs = msg.handoffs if isinstance(msg.handoffs, dict) else {}
+            if handoffs.get("type") == "confirm":
+                blocks = msg.tool_blocks or []
+                changed = False
+                for b in blocks:
+                    if isinstance(b, dict) and b.get("status") == "confirming":
+                        b["status"] = "resolved"
+                        changed = True
+                if changed:
+                    # 坑：`msg.tool_blocks = blocks` 赋回的是同一 list 引用，普通
+                    # JSON 列 set 时用 == 比较新旧值（同一对象恒等）→ 不标记 dirty，
+                    # UPDATE 不含 tool_blocks，confirming→resolved 从未落库，刷新后
+                    # 前端回放仍是 confirming 确认卡仍可点。必须 flag_modified 强制
+                    # 标记该列（就地改过的 dict 会在 flush 时被重新序列化）。
+                    flag_modified(msg, "tool_blocks")
+                    msg.handoffs = {
+                        **handoffs,
+                        "resolved_at": datetime.utcnow().isoformat(),
+                    }
+                    await db.commit()
+                return
+
+
+async def _run_quality_guard(
+    *,
+    result: "AgentResult",
+    compacted: list,
+    langchain_tools: list,
+    system_prompt: str,
+    request: Request,
+    allow_retry: bool = True,
+) -> AsyncGenerator[str, None]:
+    """QualityGuard 读后写验证 + 单次修正轮（chat 与 resume 共用）。
+
+    - allow_retry=True 且有 compacted 历史：验证失败喂回模型做一次修正。
+    - 否则（resume 无重建的历史 / 明确关闭）：只做单次验证并如实报告。
+    任何异常视为通过，不阻断主流程。
+    """
+    try:
+        if not result.tool_blocks:
+            return
+        guard_result = await _quality_guard.guard(
+            tool_calls=result.tool_blocks,
+            tool_executor=_verify_executor,
+        )
+        if not guard_result.passed:
+            issues_text = "\n".join(f"- {i}" for i in guard_result.issues[:5])
+            if allow_retry and compacted:
+                # Feed the verification failures back to the model and
+                # let it try to fix them (single retry).
+                correction_msgs = compacted + [
+                    AIMessage(content=result.full_content or ""),
+                    HumanMessage(content=(
+                        "[系统校验] 以下写操作未能确认生效。请先检查原因："
+                        "若操作其实已生效（可能只是回读时机太早），不要重复执行；"
+                        "若确实失败，重新调用对应写工具并确认成功：\n"
+                        f"{issues_text}"
+                    )),
+                ]
+                retry_result = AgentResult()
+                retry_graph = build_agent_graph(langchain_tools, system_prompt)
+                # QA 修正轮用独立 thread：与主线程隔离，避免污染挂起/恢复状态。
+                async for sse_str in stream_agent_response(
+                    retry_graph, correction_msgs, retry_result,
+                    thread_id=f"qa_{uuid.uuid4().hex[:12]}",
+                ):
+                    if await request.is_disconnected():
+                        break
+                    yield sse_str
+                if retry_result.full_content:
+                    result.full_content = retry_result.full_content
+                # 最终验证必须覆盖「第一次 + 修正轮」的写操作：
+                #   - 修正轮重调过的工具名 → 只验证修正轮那次（旧的失败调用若已
+                #     被后续成功调用覆盖，不应拖累整体结果）；
+                #   - 修正轮未重调的工具 → 仍验证第一次那次（真实生效则通过、
+                #     仍失败则如实报告）。
+                retry_blocks = retry_result.tool_blocks or []
+                first_blocks = list(result.tool_blocks)
+                retry_names = {b.get("name") for b in retry_blocks if b.get("name")}
+                unretried = [
+                    b for b in first_blocks if b.get("name") not in retry_names
+                ]
+                if retry_blocks:
+                    result.tool_blocks.extend(retry_blocks)
+                final_blocks = unretried + retry_blocks
+                final_check = await _quality_guard.guard(
+                    tool_calls=final_blocks,
+                    tool_executor=_verify_executor,
+                )
+                yield sse_event("verification", {
+                    "verified": final_check.passed,
+                    "issues": final_check.issues[:5],
+                })
+            else:
+                # resume 路径：没有重建的历史上下文，无法安全做修正轮——
+                # 如实报告未通过的验证，让用户/模型下一轮处理。
+                yield sse_event("verification", {
+                    "verified": False,
+                    "issues": guard_result.issues[:5],
+                })
+        else:
+            yield sse_event("verification", {"verified": True, "issues": []})
+    except Exception:
+        pass
 
 
 def _can_see_all(current: CurrentUser) -> bool:
@@ -1232,6 +1414,24 @@ async def upload_material(
     file_ext = os.path.splitext(filename)[1].lower() or ".pdf"
     content = await file.read()
 
+    # ── 全局去重：同内容（SHA256）已入库 → 复用已有素材，不重复入库 ──
+    content_hash = hashlib.sha256(content).hexdigest() if content else ""
+    if content_hash:
+        dup_result = await db.execute(
+            select(AgentMaterial).where(AgentMaterial.content_hash == content_hash).limit(1)
+        )
+        dup = dup_result.scalar_one_or_none()
+        if dup:
+            # 复用已有素材：不写 MinIO、不建 Candidate、不落新记录
+            return ok({
+                "id": str(dup.id), "name": dup.name, "type": dup.type,
+                "knowledgeId": str(dup.knowledge_id) if dup.knowledge_id else None,
+                "uploadedAt": iso_utc(dup.uploaded_at),
+                "ingested": bool(dup.file_path and dup.file_path.startswith("resumes/")),
+                "analysis": None,
+                "duplicate": True,
+            }, message="该文件已存在，已复用已有素材，不重复入库")
+
     # Save to a temp file on disk so extract_text_from_file can read it.
     # (extract_text_from_file handles both local paths and MinIO keys;
     #  we give it a local temp so we can decide the final MinIO prefix
@@ -1382,7 +1582,7 @@ async def upload_material(
         # 8) Create AgentMaterial referencing the ingested candidate
         material = AgentMaterial(
             session_id=session.id, name=filename, type="resume",
-            file_path=object_key,
+            file_path=object_key, content_hash=content_hash,
         )
         db.add(material)
         await db.flush()
@@ -1772,71 +1972,38 @@ async def agent_chat(
             graph = build_agent_graph(langchain_tools, system_prompt)
 
             # Stream agent execution
-            async for sse_str in stream_agent_response(graph, compacted, result):
+            async for sse_str in stream_agent_response(
+                graph, compacted, result, thread_id=str(session_obj_id)
+            ):
                 if await request.is_disconnected():
                     break
                 yield sse_str
+
+            # ── 用户决策挂起：保存 confirming 块，等前端调 resume ──
+            if result.interrupted:
+                await _persist_pending_confirm(
+                    session_obj_id=session_obj_id,
+                    task_id=task_id,
+                    result=result,
+                    interrupt_payload=result.interrupt_payload or {},
+                )
+                yield sse_event("done", {})
+                return
 
             # ── Quality Guard: verify writes actually took effect ──
             # Read-after-write confirmation. If a write can't be confirmed, we
             # inject the issue back into the agent for ONE correction pass
             # instead of just reporting it and marking the task done.
-            try:
-                if result.tool_blocks:
-                    guard_result = await _quality_guard.guard(
-                        tool_calls=result.tool_blocks,
-                        tool_executor=_verify_executor,
-                    )
-                    if not guard_result.passed:
-                        # Feed the verification failures back to the model and
-                        # let it try to fix them (single retry).
-                        issues_text = "\n".join(f"- {i}" for i in guard_result.issues[:5])
-                        correction_msgs = compacted + [
-                            AIMessage(content=result.full_content or ""),
-                            HumanMessage(content=(
-                                "[系统校验] 以下写操作未能确认生效。请先检查原因："
-                                "若操作其实已生效（可能只是回读时机太早），不要重复执行；"
-                                "若确实失败，重新调用对应写工具并确认成功：\n"
-                                f"{issues_text}"
-                            )),
-                        ]
-                        retry_result = AgentResult()
-                        retry_graph = build_agent_graph(langchain_tools, system_prompt)
-                        async for sse_str in stream_agent_response(retry_graph, correction_msgs, retry_result):
-                            if await request.is_disconnected():
-                                break
-                            yield sse_str
-                        if retry_result.full_content:
-                            result.full_content = retry_result.full_content
-                        # 最终验证必须覆盖「第一次 + 修正轮」的写操作：
-                        #   - 修正轮重调过的工具名 → 只验证修正轮那次（旧的失败调用若已
-                        #     被后续成功调用覆盖，不应拖累整体结果）；
-                        #   - 修正轮未重调的工具 → 仍验证第一次那次（真实生效则通过、
-                        #     仍失败则如实报告）。
-                        # 这样即使模型无视校验指令直接回复文本（retry 无 tool_blocks），
-                        # 也不会出现「空 tool_blocks → 假通过」——第一次的写操作仍会被回读验证。
-                        retry_blocks = retry_result.tool_blocks or []
-                        first_blocks = list(result.tool_blocks)
-                        retry_names = {b.get("name") for b in retry_blocks if b.get("name")}
-                        unretried = [
-                            b for b in first_blocks
-                            if b.get("name") not in retry_names
-                        ]
-                        if retry_blocks:
-                            result.tool_blocks.extend(retry_blocks)
-                        final_blocks = unretried + retry_blocks
-                        final_check = await _quality_guard.guard(
-                            tool_calls=final_blocks,
-                            tool_executor=_verify_executor,
-                        )
-                        yield sse_event("verification", {
-                            "verified": final_check.passed,
-                            "issues": final_check.issues[:5],
-                        })
-                    else:
-                        yield sse_event("verification", {"verified": True, "issues": []})
-            except Exception:
-                pass
+            async for sse_str in _run_quality_guard(
+                result=result,
+                compacted=compacted,
+                langchain_tools=langchain_tools,
+                system_prompt=system_prompt,
+                request=request,
+            ):
+                if await request.is_disconnected():
+                    break
+                yield sse_str
 
             # Save assistant message + update task (short-lived session)
             await _persist_assistant_turn(
@@ -1940,3 +2107,260 @@ async def agent_chat(
     )
 
 
+async def _confirm_expired(session_id) -> bool:
+    """该会话最近一条挂起确认是否已超时（>30 分钟）或已被标过期/已处理。
+
+    resume 端点在恢复 checkpoint 前校验，与 app.py 的定时清理口径一致；
+    幂等返回 True 时调用方清 checkpoint 并回 410。
+    """
+    from datetime import timedelta
+    async with async_session_factory() as db:
+        result = await db.execute(
+            select(AgentMessage)
+            .where(
+                AgentMessage.session_id == session_id,
+                AgentMessage.role == "assistant",
+            )
+            .order_by(desc(AgentMessage.created_at))
+            .limit(10)
+        )
+        for m in result.scalars().all():
+            handoffs = m.handoffs if isinstance(m.handoffs, dict) else {}
+            if handoffs.get("type") != "confirm":
+                continue
+            if handoffs.get("expired_at") or handoffs.get("resolved_at"):
+                return True
+            raw = handoffs.get("created_at") or m.created_at
+            try:
+                created = datetime.fromisoformat(str(raw)) if isinstance(raw, str) else raw
+            except (TypeError, ValueError):
+                created = m.created_at
+            return created is not None and created < datetime.utcnow() - timedelta(minutes=30)
+    return False
+
+
+async def _check_session_ownership(session_id: str, current: CurrentUser) -> AgentSession | None:
+    """校验会话存在且属本人/admin；否则返回 None（调用方回 404 防探测）。"""
+    async with async_session_factory() as db:
+        result = await db.execute(
+            select(AgentSession).where(AgentSession.id == session_id)
+        )
+        session = result.scalar_one_or_none()
+    if not session:
+        return None
+    if session.owner_id is not None and session.owner_id != current.id and not _can_see_all(current):
+        return None
+    return session
+
+
+@router.post("/ai-agent/sessions/{session_id}/resume")
+async def agent_resume(
+    request: Request,
+    session_id: str,
+    body: dict,
+    current: CurrentUser = Depends(get_current_user),
+):
+    """Resume a paused agent conversation after a user decision.
+
+    图从 checkpoint 恢复（thread_id = session_id），不传 messages——历史与
+    挂起状态都在 checkpoint 里。SSE 事件格式与 /chat 一致，前端可复用同一
+    解析逻辑。
+    """
+    choice = (body.get("choice") or "").strip()
+    session = await _check_session_ownership(session_id, current)
+    if not session:
+        return JSONResponse(
+            status_code=404,
+            content={"code": 404, "message": "对话不存在", "data": None},
+        )
+
+    agent_id = session.agent_id or _agent_id_for_user(current)
+    graph, langchain_tools, system_prompt = _build_session_graph(agent_id, current)
+
+    config = {"configurable": {"thread_id": str(session.id)}}
+    try:
+        state = await graph.aget_state(config)
+    except Exception:
+        state = None
+    has_pending = bool(state and state.next and state.tasks)
+    if not has_pending:
+        # 没有挂起的确认（可能已 resume / 已过期 / 进程重启丢内存）——幂等告知
+        return JSONResponse(
+            status_code=410,
+            content={"code": 410, "message": "该对话没有待确认的操作", "data": None},
+        )
+
+    # 超时校验：挂起确认超过 30 分钟视为过期（与 app.py 定时清理同口径），
+    # 即时清掉 checkpoint，避免用户点选后才报错。
+    if await _confirm_expired(session.id):
+        try:
+            # CompiledStateGraph 不暴露 adelete_thread，走底层 checkpointer
+            await graph.checkpointer.adelete_thread(str(session.id))
+        except Exception:
+            pass
+        return JSONResponse(
+            status_code=410,
+            content={"code": 410, "message": "该确认已超过 30 分钟未操作，已过期，请重新发起。", "data": None},
+        )
+
+    async def resume_stream() -> AsyncGenerator[str, None]:
+        result = AgentResult()
+        task_id = None
+
+        try:
+            trace_id = get_trace_id()
+            if trace_id:
+                yield sse_event("meta", {"traceId": trace_id, "sessionId": str(session.id)})
+            yield sse_event("thinking", {"text": "正在继续执行…", "append": False})
+
+            # 本次 resume 也建一个任务用于追踪
+            async with async_session_factory() as db:
+                task = AgentTask(
+                    session_id=session.id,
+                    title=f"确认：{choice[:50]}" if choice else "继续执行确认操作",
+                    description=choice,
+                    progress=0,
+                    status="running",
+                    started_at=datetime.utcnow(),
+                )
+                db.add(task)
+                await db.flush()
+                task_id = task.id
+                await db.commit()
+
+            # resume_value 非空 → stream_agent_response 内部用 Command(resume=choice)
+            # 从 checkpoint 恢复并继续执行（tools 不重跑、confirm_gate 拿回选择）。
+            async for sse_str in stream_agent_response(
+                graph, None, result,
+                thread_id=str(session.id),
+                resume_value=choice,
+            ):
+                if await request.is_disconnected():
+                    break
+                yield sse_str
+
+            # resume 无重建的历史上下文，QA 只做单次验证、不做修正轮
+            async for sse_str in _run_quality_guard(
+                result=result,
+                compacted=[],
+                langchain_tools=langchain_tools,
+                system_prompt=system_prompt,
+                request=request,
+                allow_retry=False,
+            ):
+                if await request.is_disconnected():
+                    break
+                yield sse_str
+
+            # 保存本轮 assistant 消息 + 关闭任务；再把上一条挂起消息的
+            # confirming 块就地更新为 resolved（前端不再渲染确认按钮）。
+            await _persist_assistant_turn(
+                session_obj_id=session.id,
+                task_id=task_id,
+                result=result,
+                message=f"（用户确认：{choice}）",
+                is_new_session=False,
+                session_title=session.title or "新对话",
+                task_status="done",
+            )
+            await _resolve_pending_message(session.id)
+
+            yield sse_event("phase_result", {
+                "id": f"phase_{uuid.uuid4().hex[:6]}",
+                "tone": "success",
+                "title": "任务完成",
+                "description": f"已按您的选择继续：{choice[:80]}",
+            })
+            yield sse_event("done", {})
+
+        except asyncio.CancelledError:
+            try:
+                db2 = async_session_factory()
+                try:
+                    if task_id is not None:
+                        task_result = await asyncio.shield(
+                            db2.execute(select(AgentTask).where(AgentTask.id == task_id))
+                        )
+                        task_obj = task_result.scalar_one_or_none()
+                        if task_obj:
+                            task_obj.status = "cancelled"
+                            task_obj.finished_at = datetime.utcnow()
+                    await asyncio.shield(db2.commit())
+                except BaseException:
+                    await asyncio.shield(db2.rollback())
+                    raise
+                finally:
+                    await asyncio.shield(db2.close())
+            except Exception:
+                pass
+            raise
+        except Exception as e:
+            if not result.full_content:
+                result.full_content = "（抱歉，这次回复出现异常，请重试。）"
+            try:
+                await _persist_assistant_turn(
+                    session_obj_id=session.id,
+                    task_id=task_id,
+                    result=result,
+                    message=f"（用户确认：{choice}）",
+                    is_new_session=False,
+                    session_title=session.title or "新对话",
+                    task_status="failed",
+                )
+            except Exception:
+                pass
+            yield sse_event("error", {"message": str(e)})
+
+    return StreamingResponse(
+        resume_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.get("/ai-agent/sessions/{session_id}/pending")
+async def agent_pending(
+    session_id: str,
+    current: CurrentUser = Depends(get_current_user),
+):
+    """返回会话是否有待确认的挂起操作（前端刷新恢复 / 轮询用）。
+
+    挂起状态存在 LangGraph checkpoint（内存），进程重启会丢——查询不到时
+    返回 pending:false，前端自然降级为不可恢复的普通历史消息。
+    """
+    session = await _check_session_ownership(session_id, current)
+    if not session:
+        return JSONResponse(
+            status_code=404,
+            content={"code": 404, "message": "对话不存在", "data": None},
+        )
+
+    agent_id = session.agent_id or _agent_id_for_user(current)
+    graph, _, _ = _build_session_graph(agent_id, current)
+    config = {"configurable": {"thread_id": str(session.id)}}
+    try:
+        state = await graph.aget_state(config)
+    except Exception:
+        state = None
+    if not (state and state.next and state.tasks):
+        return ok({"pending": False})
+
+    intr = None
+    for t in state.tasks:
+        if getattr(t, "interrupts", None):
+            intr = t.interrupts[0]
+            break
+    if intr is None:
+        return ok({"pending": False})
+    value = getattr(intr, "value", None) or {}
+    return ok({
+        "pending": True,
+        "kind": value.get("kind"),
+        "question": value.get("question"),
+        "options": value.get("options", []),
+        "interruptId": getattr(intr, "id", ""),
+    })

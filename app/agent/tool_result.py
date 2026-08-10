@@ -46,6 +46,7 @@ class ToolResult:
     data: Optional[dict[str, Any]] = None # Structured payload
     error: Optional[ErrorDetail] = None
     display_hint: str = "text"            # "card" | "list" | "table" | "text" | "score" | "questions"
+    confirmation: Optional[dict] = None   # 非空 = 需用户决策；graph 的 confirm_gate 据此 interrupt
     affected_ids: list[str] = field(default_factory=list)  # IDs of affected entities (for cache invalidation)
 
     def to_llm_context(self) -> str:
@@ -53,6 +54,9 @@ class ToolResult:
 
         Keeps it compact so we don't waste token budget on verbose formatting.
         """
+        if self.confirmation:
+            # 需用户决策的结果：对 LLM 是中性提示（不是错误），供模型在 resume 后继续。
+            return self.details or self.summary
         if self.success:
             return self.details
         # Error path: give the LLM structured recovery information
@@ -84,6 +88,8 @@ class ToolResult:
                 "retryable": self.error.retryable,
                 "suggested_actions": self.error.suggested_actions,
             }
+        if self.confirmation is not None:
+            base["confirmation"] = self.confirmation
         return base
 
     @classmethod

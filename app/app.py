@@ -147,6 +147,78 @@ async def lifespan(app: FastAPI):
                     await session.rollback()
                     logger.warning("Offer 提醒任务失败: %s", e)
 
+        async def _scheduled_confirm_expiry():
+            """AI 对话挂起确认超时清理：超 30 分钟未确认 → confirming 块标过期、
+            相关 running 任务标 failed、删除 checkpoint thread（resume 返 410）。"""
+            from datetime import timedelta as _td
+            import uuid as _uuid
+            from sqlalchemy import select, desc as _desc
+            from app.models.agent_session import AgentMessage, AgentTask
+            from app.agent.checkpointer import get_agent_checkpointer
+
+            cutoff = datetime.utcnow() - _td(minutes=30)
+            session_ids: set = set()
+            try:
+                async with async_session_factory() as session:
+                    result = await session.execute(
+                        select(AgentMessage)
+                        .where(AgentMessage.role == "assistant")
+                        .order_by(_desc(AgentMessage.created_at))
+                        .limit(500)
+                    )
+                    for msg in result.scalars().all():
+                        handoffs = msg.handoffs if isinstance(msg.handoffs, dict) else {}
+                        if handoffs.get("type") != "confirm":
+                            continue
+                        if handoffs.get("resolved_at") or handoffs.get("expired_at"):
+                            continue
+                        raw = handoffs.get("created_at") or msg.created_at
+                        try:
+                            created = datetime.fromisoformat(str(raw)) if isinstance(raw, str) else raw
+                        except (TypeError, ValueError):
+                            created = msg.created_at
+                        if created is None or created >= cutoff:
+                            continue
+                        blocks = msg.tool_blocks or []
+                        changed = False
+                        for b in blocks:
+                            if isinstance(b, dict) and b.get("status") == "confirming":
+                                b["status"] = "expired"
+                                changed = True
+                        if changed:
+                            msg.tool_blocks = blocks
+                            msg.handoffs = {
+                                **handoffs,
+                                "expired_at": datetime.utcnow().isoformat(),
+                            }
+                            session_ids.add(str(msg.session_id))
+                    if session_ids:
+                        tasks = await session.execute(
+                            select(AgentTask).where(
+                                AgentTask.session_id.in_(
+                                    [_uuid.UUID(s) for s in session_ids]
+                                )
+                            )
+                        )
+                        for t in tasks.scalars().all():
+                            if t.status == "running":
+                                t.status = "failed"
+                                t.finished_at = datetime.utcnow()
+                        await session.commit()
+                        logger.info("AI 挂起确认超时清理: %d 个会话标过期", len(session_ids))
+                    else:
+                        await session.rollback()
+                # 删除过期线程的 checkpoint：resume 返 410、/pending 返 false
+                if session_ids:
+                    saver = get_agent_checkpointer()
+                    for sid in session_ids:
+                        try:
+                            await saver.adelete_thread(sid)
+                        except Exception:
+                            pass
+            except Exception as e:
+                logger.warning("AI 挂起确认超时清理失败: %s", e)
+
         from datetime import datetime, timedelta
 
         scheduler = AsyncIOScheduler()
@@ -163,9 +235,17 @@ async def lifespan(app: FastAPI):
         # Offer：每小时扫一次过期；每天 09:05 跑提醒
         scheduler.add_job(_scheduled_offer_expiry_scan, "interval", hours=1, id="offer_expiry_scan")
         scheduler.add_job(_scheduled_offer_reminders, "cron", hour=9, minute=5, id="offer_reminders")
+        # AI 挂起确认：每 5 分钟扫过期（启动 1 分钟后先跑一遍，清掉开发期遗留）
+        scheduler.add_job(
+            _scheduled_confirm_expiry,
+            "interval",
+            minutes=5,
+            id="confirm_expiry",
+            next_run_time=datetime.now() + timedelta(seconds=60),
+        )
         scheduler.start()
         logger.info(
-            "✓ 定时任务已注册 (清理 02:00 / 面试提醒 09:00 / 欢迎页推荐 每30分钟 / Offer过期 每小时 / Offer提醒 09:05) (%s)",
+            "✓ 定时任务已注册 (清理 02:00 / 面试提醒 09:00 / 欢迎页推荐 每30分钟 / Offer过期 每小时 / Offer提醒 09:05 / AI挂起确认 每5分钟) (%s)",
             _elapsed(),
         )
     except Exception as e:

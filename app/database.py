@@ -275,6 +275,14 @@ def _run_migrations(connection):
     _migrate_v22_talent_pool(connection)
     # v23: 9 角色独立对话框 —— 旧 agent_id='genie' → 'employee'（最通用角色）
     _migrate_v23_agent_id(connection)
+    # v24: agent_materials.content_hash —— 会话材料全库去重字段（模型已有，旧库缺列）
+    _add_column_if_missing(connection, "agent_materials", "content_hash", "VARCHAR(64)")
+    _ensure_index_if_missing(
+        connection,
+        "ix_agent_materials_content_hash",
+        "agent_materials",
+        "content_hash",
+    )
 
 
 def _migrate_v20_offer_prefill(connection) -> None:

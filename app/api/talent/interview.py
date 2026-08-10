@@ -88,6 +88,18 @@ async def _fetch_pre_generated_questions(
     )
     return list(result.scalars().all())
 
+
+def _questions_too_similar(a: str, b: str, threshold: float = 0.88) -> bool:
+    """判断两道题内容是否过于接近，避免换题后仍生成雷同题目。"""
+    a = (a or "").strip()
+    b = (b or "").strip()
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    from difflib import SequenceMatcher
+    return SequenceMatcher(None, a, b).ratio() >= threshold
+
 # ── Helpers ─────────────────────────────────────────────
 
 async def get_setting(db: AsyncSession, key: str, default=None):
@@ -956,6 +968,24 @@ async def replace_question(question_id: str, body: dict, db: AsyncSession = Depe
         old_q = await db.execute(select(InterviewQuestion).where(InterviewQuestion.id == parsed_qid))
         old = old_q.scalar_one_or_none()
 
+    # 换题必须明确避开原题与题单已有题目，否则 LLM 容易生成雷同内容
+    prompt_parts: list[str] = []
+    existing = await _fetch_pre_generated_questions(candidate_id, round, db)
+    if old and old.content:
+        prompt_parts.append(
+            f"原题（请生成一道考察角度不同的新题，不要与原题内容重复）：\n{old.content[:600]}"
+        )
+    others = [q for q in existing if old is None or q.id != old.id]
+    if others:
+        preview = "\n".join(
+            f"- 第{q.index_num}题：{(q.content or '')[:80]}" for q in others
+        )
+        prompt_parts.append(f"题单现有其他题目（新题不要与它们内容雷同）：\n{preview}")
+    user_prompt = (body.get("prompt") or "").strip()
+    if user_prompt:
+        prompt_parts.append(f"额外要求：{user_prompt}")
+    prompt_override = "\n\n".join(prompt_parts)
+
     rag_text = ""
     if candidate.resume_file:
         try:
@@ -969,13 +999,40 @@ async def replace_question(question_id: str, body: dict, db: AsyncSession = Depe
         round,
         1,
         rag_text,
-        prompt_override=body.get("prompt", ""),
+        prompt_override=prompt_override,
         category_override=body.get("category", ""),
         difficulty_override=body.get("difficulty", "medium"),
     )
 
     if isinstance(q_data, list) and q_data:
         q_data = q_data[0]
+
+    # 生成结果仍与原题或其他已有题目过于接近时，带着「必须换角度」的强约束重试一次
+    new_content = q_data.get("content", "") if isinstance(q_data, dict) else ""
+    too_similar = (
+        (old is not None and old.content and _questions_too_similar(old.content, new_content))
+        or any(_questions_too_similar((q.content or ""), new_content) for q in others)
+    )
+    if too_similar:
+        retry_prompt = (
+            prompt_override
+            + "\n\n上次生成内容仍与原题过于接近，请换一个完全不同的考察角度，"
+              "禁止复用原题中的具体技术点与措辞。"
+        ).strip()
+        retry_data = await generate_questions_with_llm(
+            candidate.name,
+            candidate.position.name if candidate.position else "未知",
+            round,
+            1,
+            rag_text,
+            prompt_override=retry_prompt,
+            category_override=body.get("category", ""),
+            difficulty_override=body.get("difficulty", "medium"),
+        )
+        if isinstance(retry_data, list) and retry_data:
+            retry_data = retry_data[0]
+        if isinstance(retry_data, dict):
+            q_data = retry_data
 
     if old is not None:
         # 替换已存在的题目：保留原 index

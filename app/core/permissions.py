@@ -141,6 +141,16 @@ def permissions_for_roles(role_codes: list[str]) -> set[str]:
     return perms
 
 
+def roles_for_permission(perm: str) -> list[str]:
+    """反查显式拥有某权限点的角色编码（AI 权限拒绝时告知「找谁」）。
+
+    不含 admin：admin 靠 ``system:manage`` 通配放行一切（security.py），但业务
+    操作应找业务角色而不是系统管理员；也不含走通配读的 ceo——ceo 只见只读
+    集合，业务写权限需显式在 ROLE_PERMISSIONS 声明。
+    """
+    return [rc for rc, perms in ROLE_PERMISSIONS.items() if perm in perms]
+
+
 # ────────────────────────────────────────────────────────────
 # AI 对话能力描述已迁移至 app/agent/tools.py
 # ────────────────────────────────────────────────────────────

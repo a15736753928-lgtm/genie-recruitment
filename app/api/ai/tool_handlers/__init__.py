@@ -17,8 +17,12 @@ from typing import Callable, Awaitable
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-# A tool handler receives (params: dict, db: AsyncSession) → str
-ToolHandler = Callable[[dict, AsyncSession], Awaitable[str]]
+from app.agent.tool_result import ToolResult
+
+# A tool handler receives (params: dict, db: AsyncSession) → str | ToolResult
+# ToolResult（尤其带 confirmation 的「需用户决策」结果）由 graph 的 confirm_gate
+# 识别后 interrupt 挂起；纯字符串结果照旧由 from_legacy_string 包装。
+ToolHandler = Callable[[dict, AsyncSession], Awaitable[str | ToolResult]]
 
 
 class ToolHandlerRegistry:

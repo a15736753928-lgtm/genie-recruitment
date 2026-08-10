@@ -105,6 +105,9 @@ async def _get_resume(params: dict, db: AsyncSession) -> str:
     selected = resolve_fields(
         "resume", view=view, fields=fields, purpose=purpose, default_view="detail",
     )
+    # 查看候选人时始终带上原版文件链接，回复默认给「查看原版简历」按钮。
+    if "resumeFileUrl" not in selected:
+        selected = [*selected, "resumeFileUrl"]
     flat = dict(data)
     if "skills" in flat and isinstance(flat["skills"], list):
         flat["skills"] = ", ".join(flat["skills"]) or "无"

@@ -13,16 +13,16 @@ from __future__ import annotations
 import json
 import uuid
 from dataclasses import dataclass, field
-from typing import AsyncGenerator
+from typing import Any, AsyncGenerator, TypedDict, Annotated
 
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
-from langgraph.prebuilt import ToolNode
-from langchain_core.messages import BaseMessage, SystemMessage
+from langgraph.types import interrupt, Command
+from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage, ToolMessage
 from langchain_core.tools import BaseTool
-from typing import TypedDict, Annotated
 
 from app.agent.tool_result import ToolResult, DisplayHint
+from app.agent.checkpointer import get_agent_checkpointer
 from app.agent_os.output import DISPLAY_HINTS
 from app.services.ai import create_langchain_llm
 
@@ -31,6 +31,9 @@ from app.services.ai import create_langchain_llm
 
 class AgentState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
+    # 本轮 tools 节点的原始返回（含 ToolResult）。覆盖写、无 reducer——否则每轮
+    # 累积，resume 后 confirm_gate 会撞到旧 confirmation 再次 interrupt。
+    last_tool_results: list[Any]
 
 
 # ── Result container ────────────────────────────────────
@@ -40,6 +43,9 @@ class AgentResult:
     """Collected results populated during streaming."""
     tool_blocks: list[dict] = field(default_factory=list)
     full_content: str = ""
+    # 本轮流在 confirm_gate 处被 interrupt 挂起（等待用户决策）。
+    interrupted: bool = False
+    interrupt_payload: dict | None = None
 
 
 # ── Graph Builder ───────────────────────────────────────
@@ -80,15 +86,76 @@ def build_agent_graph(
             return "tools"
         return END
 
+    async def tools_node(state: AgentState) -> dict:
+        """自定义工具节点：逐个执行工具，保留原始返回（含 ToolResult）供 confirm_gate 检测。
+
+        复刻 ToolNode 的 ToolMessage 配对约定——tool_call_id 必须与 AIMessage 的
+        tool_calls[].id 一致，否则 OpenAI 兼容接口把孤儿 ToolMessage 拒成 400。
+        """
+        last_msg = state["messages"][-1]
+        tool_calls = getattr(last_msg, "tool_calls", None) or []
+        tool_by_name = {t.name: t for t in tools}
+        raw_results: list[Any] = []
+        tool_messages: list[ToolMessage] = []
+        for tc in tool_calls:
+            tool = tool_by_name.get(tc["name"])
+            if tool is None:
+                raw_results.append(None)
+                tool_messages.append(ToolMessage(
+                    content=f"工具 {tc['name']} 不存在",
+                    tool_call_id=tc.get("id", ""),
+                ))
+                continue
+            try:
+                out = await tool.ainvoke(tc.get("args") or {})
+            except Exception as e:
+                out = f"工具执行失败: {str(e)}"
+            # last_tool_results 只保留「需用户决策」的确认信息（纯 dict），不把
+            # ToolResult 对象本身写进 state/checkpoint：msgpack 对未注册类型
+            # 序列化会告警（未来版本直接 block），且减小 checkpoint 体积。
+            raw_results.append(
+                out.confirmation
+                if isinstance(out, ToolResult) and out.confirmation
+                else None
+            )
+            if isinstance(out, ToolResult):
+                content = out.to_llm_context()
+            else:
+                content = str(out)
+            tool_messages.append(ToolMessage(content=content, tool_call_id=tc.get("id", "")))
+        return {"messages": tool_messages, "last_tool_results": raw_results}
+
+    async def confirm_gate(state: AgentState) -> dict:
+        """检测本轮工具结果是否有「需用户决策」的确认；有则 interrupt 挂起，resume 后把
+        用户选择注入为一条 HumanMessage，让模型据此继续（如先 update_resume 再出题）。"""
+        for r in state.get("last_tool_results", []):
+            if isinstance(r, dict) and r.get("kind"):
+                confirm = r
+                # 首次调用抛 GraphInterrupt 挂起；resume 时返回用户选择，从这行继续。
+                choice = interrupt(confirm)
+                candidate_id = confirm.get("candidate_id", "")
+                candidate_name = confirm.get("candidate_name", "")
+                round_label = confirm.get("round", "")
+                return {"messages": [HumanMessage(content=(
+                    f"[系统] 用户确认：{choice}。请按此继续执行："
+                    f"若确认邀约一面，先调用 update_resume 把候选人 {candidate_id}"
+                    f"（{candidate_name}）状态改为 round1，再调用 generate_questions 生成{round_label}"
+                    f"面试题；若已执行成功则勿重复。若用户取消，则直接回复已取消，"
+                    f"不要再调用任何写工具。"
+                ))]}
+        return {}
+
     workflow = StateGraph(AgentState)
     workflow.add_node("agent", call_model)
-    workflow.add_node("tools", ToolNode(tools))
+    workflow.add_node("tools", tools_node)
+    workflow.add_node("confirm_gate", confirm_gate)
 
     workflow.add_edge(START, "agent")
     workflow.add_conditional_edges("agent", should_continue, {"tools": "tools", END: END})
-    workflow.add_edge("tools", "agent")
+    workflow.add_edge("tools", "confirm_gate")
+    workflow.add_edge("confirm_gate", "agent")
 
-    return workflow.compile()
+    return workflow.compile(checkpointer=get_agent_checkpointer())
 
 
 # ── SSE Helpers ─────────────────────────────────────────
@@ -143,8 +210,10 @@ def _display_hint_for(tool_name: str) -> str:
 
 async def stream_agent_response(
     graph,
-    messages: list[BaseMessage],
+    messages: list[BaseMessage] | None,
     result: AgentResult,
+    thread_id: str,
+    resume_value: Any = None,
 ) -> AsyncGenerator[str, None]:
     """Execute the agent graph, yielding SSE-formatted events.
 
@@ -155,17 +224,28 @@ async def stream_agent_response(
     Args:
         graph: Compiled LangGraph graph.
         messages: Initial message list (system prompt NOT included —
-                  the agent node will prepend it automatically).
+                  the agent node will prepend it automatically).  For a
+                  resume run, pass ``None`` — history is restored from the
+                  checkpoint via ``thread_id``.
         result: Mutable AgentResult to populate during streaming.
+        thread_id: LangGraph checkpoint thread id (= session id).  Required
+                  so interrupt 挂起 / resume 能定位到同一线程状态。
+        resume_value: 非空表示这是一次 resume（用户对挂起确认的选择），
+                  从暂停点继续执行而非开启新对话。
 
     Yields:
         SSE-formatted strings ready for ``StreamingResponse``.
     """
-    async for event in graph.astream_events(
-        {"messages": messages},
-        version="v2",
-        config={"recursion_limit": 40},
-    ):
+    config = {
+        "recursion_limit": 40,
+        "configurable": {"thread_id": thread_id},
+    }
+    if resume_value is not None:
+        inputs = Command(resume=resume_value)  # checkpoint 恢复历史，从暂停点继续
+    else:
+        inputs = {"messages": messages}
+
+    async for event in graph.astream_events(inputs, version="v2", config=config):
         kind = event.get("event", "")
 
         # ── LLM token streaming ──
@@ -190,9 +270,7 @@ async def stream_agent_response(
                 "params": tool_input,
                 "result": "",
                 "status": "running",
-                # LangGraph's ToolNode runs parallel tool_calls concurrently
-                # (asyncio.gather), so completion order can differ from start
-                # order. run_id uniquely ties each on_tool_end back to the
+                # run_id uniquely ties each on_tool_end back to the
                 # on_tool_start that spawned it — without it, two in-flight
                 # tools can get their results swapped.
                 "_run_id": event.get("run_id"),
@@ -221,14 +299,12 @@ async def stream_agent_response(
             tr = None
             if isinstance(output, ToolResult):
                 tr = output
-            elif hasattr(output, "success"):
-                # dict with success key
-                tr = ToolResult.from_legacy_string(tool_name, raw_text)
             else:
                 tr = ToolResult.from_legacy_string(tool_name, raw_text)
 
-            # Apply display hint from the adapter's comprehensive map
-            tr.display_hint = _display_hint_for(tool_name)
+            # 「需用户决策」的确认结果保留 handler 设置的 CONFIRM，不被工具表覆盖。
+            if tr.confirmation is None:
+                tr.display_hint = _display_hint_for(tool_name)
             sse_data = tr.to_sse_dict()
 
             # Match this completion back to its own tool_start via run_id
@@ -249,6 +325,8 @@ async def stream_agent_response(
                     block["display_hint"] = tr.display_hint
                     if tr.data is not None:
                         block["data"] = tr.data
+                    if tr.confirmation is not None:
+                        block["confirmation"] = tr.confirmation
                     if tr.error:
                         # ErrorDetail 是 dataclass（无 model_dump），用 asdict 序列化
                         from dataclasses import asdict
@@ -259,6 +337,29 @@ async def stream_agent_response(
                         **sse_data,
                     })
                     break
+
+        # ── 用户决策挂起（interrupt）──
+        # interrupt 在根图的 on_chain_stream 事件以 __interrupt__ chunk 冒泡，
+        # on_chain_end 拿不到。检测到即发 ask_user 事件并优雅结束生成器
+        # （checkpoint 已保存挂起状态，resume 时从暂停点继续）。
+        elif kind == "on_chain_stream" and event.get("name") == "LangGraph":
+            chunk = event.get("data", {}).get("chunk")
+            if isinstance(chunk, dict) and "__interrupt__" in chunk:
+                interrupts = chunk.get("__interrupt__") or ()
+                intr = interrupts[0] if interrupts else None
+                if intr is not None:
+                    payload = getattr(intr, "value", None) or {}
+                    result.interrupted = True
+                    result.interrupt_payload = payload
+                    yield _sse("ask_user", {
+                        "sessionId": thread_id,
+                        "kind": payload.get("kind"),
+                        "question": payload.get("question"),
+                        "options": payload.get("options", []),
+                        "interruptId": getattr(intr, "id", ""),
+                        "context": payload,
+                    })
+                    return
 
     # Note: the caller (router) is responsible for yielding "done" and "phase_result"
     # after this generator is exhausted, so those events are emitted in the correct order.

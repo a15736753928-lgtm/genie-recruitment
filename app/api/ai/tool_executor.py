@@ -58,6 +58,7 @@ async def execute_tool_call(tool_name: str, params: dict, db: AsyncSession) -> s
         cu = get_current_user_for_tools()
         if cu is not None:
             from app.agent.tools import TOOL_PERMISSIONS, PUBLIC_TOOL_PERMISSION
+            from app.core.permissions import roles_for_permission, ROLES
             perm = TOOL_PERMISSIONS.get(tool_name)
             # fail-closed：未登记或非公共工具而用户无对应权限 → 拒绝。
             if perm is None or (perm != PUBLIC_TOOL_PERMISSION and not cu.has(perm)):
@@ -65,9 +66,18 @@ async def execute_tool_call(tool_name: str, params: dict, db: AsyncSession) -> s
                     "工具权限拒绝 tool=%s user=%s perm=%s trace=%s",
                     tool_name, cu.username, perm, get_trace_id(),
                 )
+                # 反查拥有该权限的角色，如实告知「找谁」——不诱导越权、不假装能做。
+                roles = roles_for_permission(perm) if perm else []
+                if roles:
+                    roles_text = "、".join(
+                        f"{ROLES.get(rc, (rc, '未知'))[0]}({rc})" for rc in roles
+                    )
+                else:
+                    roles_text = "无公开角色"
                 return (
                     f"您没有执行该操作的权限（需要 {perm}）。"
-                    "如需处理请联系有对应权限的同事。"
+                    f"拥有该权限的角色：{roles_text}。"
+                    "请转告对应角色的同事处理；我无法代替您执行越权操作。"
                 )
 
         registry = get_registry()

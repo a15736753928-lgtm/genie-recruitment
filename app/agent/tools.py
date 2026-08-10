@@ -32,7 +32,7 @@ TOOL_REGISTRY = {
             "读取单个候选人详情",
             "看完整简历/匹配分/技能/经历；view=full 看全量",
             "岗位题库(get_position_questions)、候选人题单(get_questions)、改状态",
-            "「查看吴佳熙完整简历」→ get_resume(id, view=full)；「看原版简历/原件/原始文件」→ get_resume(id, view=file) 拿 resumeFileUrl 并在回复中给出可点击链接",
+            "「查看丁洁简历」→ get_resume(id)（返回含 resumeFileUrl，回复中自动附「查看原版简历」链接）；「看完整简历」→ view=full",
         ),
         "parameters": {
             "type": "object",
@@ -40,7 +40,7 @@ TOOL_REGISTRY = {
                 "id": {"type": "string", "description": "候选人 UUID（必须是 list_resumes 返回的真实 id）"},
                 "view": {
                     "type": "string",
-                    "description": "summary|core|detail|contact|screening|file|full，默认 detail。用户要看原版简历/原件/原始文件时用 file（返回 resumeFileUrl）",
+                    "description": "summary|core|detail|contact|screening|file|full，默认 detail。只要查看候选人简历，返回都会带 resumeFileUrl（用于在回复中给「查看原版简历」可点击链接）；只看文件信息可用 file",
                 },
                 "fields": {
                     "type": "array",
@@ -264,9 +264,9 @@ TOOL_REGISTRY = {
     "generate_questions": {
         "name": "generate_questions",
         "description": tool_desc(
-            "重新生成候选人面试题（覆盖旧题）",
-            "用户明确要求「生成/换一批/重新出题」",
-            "改状态、面试评定、仅查看题目(get_questions)",
+            "生成/重新生成候选人面试题（覆盖旧题）",
+            "用户要求「出题/生成面试题/换一批/重新出题」；候选人状态是否满足由系统判断，直接调用本工具即可",
+            "仅查看题目(get_questions)、面试评定、改状态；候选人状态不满足出题条件时，系统会自动弹出确认卡征求用户决策——不要自行调 update_resume 改状态、不要用自然语言向用户询问「是否出题/是否先改状态」，直接调用本工具，收到「[系统] 用户确认」指令后按指示执行",
             "「给张三重新出一面题」",
         ),
         "parameters": {
