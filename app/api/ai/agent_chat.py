@@ -886,7 +886,10 @@ async def delete_session(
     )
     for mat in mat_result.scalars().all():
         if mat.file_path and not (os.path.isabs(mat.file_path)):
-            await asyncio.to_thread(minio_storage.delete_object, mat.file_path)
+            try:
+                await asyncio.to_thread(minio_storage.delete_object, mat.file_path)
+            except Exception:
+                pass
 
     await db.delete(session)
     return ok()
@@ -1037,6 +1040,9 @@ async def append_session_message(
     if role not in ("user", "assistant") or not content:
         return fail(400, "请提供 role 与 content")
 
+    tool_blocks = body.get("toolBlocks")
+    handoffs = body.get("handoffs")
+
     try:
         sid = uuid.UUID(session_id)
     except ValueError:
@@ -1052,7 +1058,13 @@ async def append_session_message(
         db.add(session)
         await db.flush()
 
-    msg = AgentMessage(session_id=sid, role=role, content=content)
+    msg = AgentMessage(
+        session_id=sid,
+        role=role,
+        content=content,
+        tool_blocks=tool_blocks if isinstance(tool_blocks, list) else None,
+        handoffs=handoffs if isinstance(handoffs, dict) else None,
+    )
     db.add(msg)
     session.updated_at = datetime.utcnow()
     await db.commit()
@@ -1063,7 +1075,8 @@ async def append_session_message(
           "sessionId": str(msg.session_id),
           "role": msg.role,
           "content": msg.content,
-          "meta": None,
+          "meta": msg.handoffs if msg.role == "user" and isinstance(msg.handoffs, dict) else None,
+          "toolBlocks": msg.tool_blocks if isinstance(msg.tool_blocks, list) else None,
           "createdAt": iso_utc(msg.created_at),
       })
 
@@ -1149,6 +1162,8 @@ async def ingest_materials_batch(
     material_ids = body.get("materialIds") or []
     if not material_ids:
         return fail(400, "请提供 materialIds")
+    choice = body.get("choice") or ""
+    resolve_only = bool(body.get("resolveOnly"))
 
     from app.api.recruitment.resume_upload import _upload_one_resume, _load_candidate, launch_resume_scoring, launch_score_task
     import os
@@ -1161,6 +1176,45 @@ async def ingest_materials_batch(
         ).where(AgentSession.owner_id == current.id)
     result = await db.execute(mat_q)
     by_id = {str(m.id): m for m in result.scalars().all()}
+
+    async def _mark_confirm_resolved(ids: list, chosen_label: str = "") -> None:
+        """把对应确认卡置为 resolved，并回写用户选择（入库/仅分析）。"""
+        session_ids = {mat.session_id for mat in by_id.values() if mat.session_id}
+        if not session_ids:
+            return
+        msg_result = await db.execute(
+            select(AgentMessage).where(
+                AgentMessage.session_id.in_(session_ids),
+                AgentMessage.role == "assistant",
+            )
+        )
+        material_id_set = {str(mid) for mid in ids}
+        for msg in msg_result.scalars().all():
+            blocks = msg.tool_blocks if isinstance(msg.tool_blocks, list) else []
+            changed = False
+            for block in blocks:
+                if not isinstance(block, dict):
+                    continue
+                confirmation = block.get("confirmation")
+                if (
+                    block.get("name") == "confirm_ingest"
+                    and block.get("status") == "confirming"
+                    and isinstance(confirmation, dict)
+                    and str(confirmation.get("material_id")) in material_id_set
+                ):
+                    block["status"] = "resolved"
+                    if chosen_label:
+                        block["chosen"] = chosen_label
+                        block["summary"] = "已确认入库" if "确认入库" in chosen_label else "已选择仅分析"
+                    changed = True
+            if changed:
+                flag_modified(msg, "tool_blocks")
+
+    if resolve_only:
+        # 用户选择“仅分析不入库”：只关闭确认卡，不创建候选人
+        await _mark_confirm_resolved(material_ids, choice)
+        await db.commit()
+        return ok([])
 
     # ── Phase 1: classify — fast-path vs need-processing ──────────
     # mid → pre-built item for fast-path cases (already ingested / wrong type /
@@ -1346,6 +1400,8 @@ async def ingest_materials_batch(
 
         out.append(r["item"])
 
+    await _mark_confirm_resolved(material_ids, choice)
+
     await db.commit()
     return ok(out)
 
@@ -1363,14 +1419,12 @@ async def upload_material(
 ):
     """Upload a material (resume/document/knowledge) for the current session.
 
-    Resumes (type="resume" or "file") are auto-detected: if the content parses
-    as a real resume the file goes through the same full ingestion pipeline as
-    the dedicated POST /api/resumes/upload endpoint — MinIO storage, position
-    matching, Candidate creation, parsing, scoring, RAG ingest.  Set
-    ``autoIngest=false`` to store as session attachment only (analyze later).
-    Non-resume files are stored as session attachments with a plain AI analysis preview.
+    Resumes (type="resume" or "file") are auto-detected, but **不会在上传时入库**：
+    文件只作为会话附件暂存，并在响应中标记 ``needsDecision=true``，由前端在对话里
+    弹出确认选项，用户确认后走 ``ingest-batch`` 再入库。非简历文件仅作为附件分析。
     """
-    should_ingest = autoIngest.strip().lower() not in ("false", "0", "no")
+    # 上传阶段一律不入库：入库必须由用户在对话确认后显式触发（黑盒禁止）。
+    should_ingest = False
     # Get or create session — prefer the explicit sessionId from the caller
     # (falling back to "latest session" keeps老前端兼容，但有并发竞态)
     session = None
@@ -1590,6 +1644,7 @@ async def upload_material(
 
         # 后台评分在 commit 之后启动（独立 session 需读到已提交的候选人）
         await db.commit()
+        from app.api.recruitment.resume_upload import launch_score_task
         launch_score_task(score_task)
 
         return ok({
@@ -1647,6 +1702,9 @@ async def upload_material(
           "uploadedAt": iso_utc(material.uploaded_at),
           "ingested": False,
           "analysis": analysis,
+          "needsDecision": bool(is_resume),
+          "candidateName": (parsed.get("name") or "") if isinstance(parsed, dict) else "",
+          "position": "",
       })
 
 

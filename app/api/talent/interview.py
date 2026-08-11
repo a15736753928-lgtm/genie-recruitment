@@ -2068,7 +2068,7 @@ async def submit_evaluation(
                 if round_ == "second":
                     # 二面通过 → 待发 Offer，等候「录用审批」流程处理。
                     # 注意：员工记录只能由 offer.py 的录用审批通过后自动生成
-                    # （见 CLAUDE.md「员工数据来源」）。这里过去会直接调用
+                    # （见 AGENTS.md「员工数据来源」）。这里过去会直接调用
                     # ensure_employee_for_candidate() 绕开审批创建员工，
                     # 与 offer.py 形成两条并行的入职通道，现已移除。
                     await transition(db, "candidate", candidate, "pending_offer",
