@@ -16,6 +16,8 @@
 """
 from __future__ import annotations
 
+from app.prompts import render_prompt
+
 import asyncio
 import io
 import logging
@@ -274,30 +276,7 @@ async def _safe_transition(db, entity_type, entity, to_status, *, actor_id=None,
 
 async def _build_ai_advice(candidate: Candidate, offer: OfferApproval) -> Optional[dict]:
     """Call LLM for hire/no-hire recommendation; return None on failure."""
-    prompt = f"""你是一位资深HR总监，请基于以下候选人综合评估信息给出录用建议。
-
-候选人: {candidate.name if candidate else '未知'}
-简历评分: {float(offer.resume_score) if offer.resume_score else 'N/A'}
-一面综合分: {float(offer.r1_score) if offer.r1_score else 'N/A'}
-二面综合分: {float(offer.r2_score) if offer.r2_score else 'N/A'}
-实操评分: {float(offer.practical_score) if offer.practical_score else 'N/A'}
-团队评分: {float(offer.team_score) if offer.team_score else 'N/A'}
-综合得分: {float(offer.final_score) if offer.final_score else 'N/A'}
-
-请给出JSON格式的录用建议（snake_case字段）:
-{{
-  "result": "recommend（建议录用）或 reject（不建议录用）",
-  "score": 综合评估分(0-100整数),
-  "confidence": 置信度(0.0-1.0),
-  "evidence": ["关键依据1", "关键依据2"],
-  "strengths": ["优势1"],
-  "risks": ["风险1"],
-  "missing_information": [],
-  "recommended_action": "具体建议",
-  "requires_human_confirmation": true
-}}
-
-严格返回纯JSON，不含markdown围栏。"""
+    prompt = render_prompt('talent/offer.md', {'candidate_name': candidate.name if candidate else '未知', 'resume_score': float(offer.resume_score) if offer.resume_score else 'N/A', 'r1_score': float(offer.r1_score) if offer.r1_score else 'N/A', 'r2_score': float(offer.r2_score) if offer.r2_score else 'N/A', 'practical_score': float(offer.practical_score) if offer.practical_score else 'N/A', 'team_score': float(offer.team_score) if offer.team_score else 'N/A', 'final_score': float(offer.final_score) if offer.final_score else 'N/A'}, 'Prompt 1')
     try:
         raw_text = await llm_chat([{"role": "user", "content": prompt}], max_tokens=2048)
         raw_dict = extract_json_object(raw_text.strip())

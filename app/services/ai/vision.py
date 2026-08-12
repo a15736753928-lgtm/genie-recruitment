@@ -30,6 +30,7 @@ from PIL import Image
 from openai import AsyncOpenAI
 
 from app.config import get_settings
+from app.prompts import render_prompt
 from app.services.ai.router import llm_chat
 
 logger = logging.getLogger(__name__)
@@ -160,12 +161,9 @@ async def extract_text_from_images_async(pages: list[bytes]) -> str:
         png_bytes = png if _is_png(png) else (_bytes_to_png(png) or b"")
         if not png_bytes:
             continue
-        prompt = (
-            "这是一份简历文档" + (f"（第 {idx + 1} 页）" if len(pages) > 1 else "") +
-            "。请准确提取其中的全部文字内容，逐行输出，保留姓名、性别、联系方式、" +
-            "教育经历、工作经历、项目经历、专业技能等所有信息。只输出提取到的文字，" +
-            "不要遗漏，不要臆造，不要额外解释。注意：请直接给出最终答案，不要展示思考过程。"
-        )
+        prompt = render_prompt("ai_services/vision.md", {
+            "page_label": f"（第 {idx + 1} 页）" if len(pages) > 1 else "",
+        })
         raw = await _llm_with_retry(
             _to_content(prompt, [_to_image_url(png_bytes)]),
             max_tokens=4000, what=f"多模态文字提取 (页 {idx + 1})",

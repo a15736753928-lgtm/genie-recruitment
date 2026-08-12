@@ -1,3 +1,4 @@
+from app.prompts import render_prompt
 import json
 from datetime import date, timedelta, datetime
 from typing import Optional
@@ -365,22 +366,7 @@ async def ai_evaluate_probation(employee_id: str, db: AsyncSession = Depends(get
     tasks = [{"title": t.title, "status": t.status, "week": t.week_number}
              for t in (emp.tasks or [])]
 
-    prompt = f"""作为HR试用期评估专家,请对以下员工进行试用期表现评估。
-
-员工:{emp.name}
-部门:{emp.department or '未指定'}
-入职日期:{emp.onboard_date}
-试用期截止:{emp.probation_end_date}
-
-任务数据:{json.dumps(tasks, ensure_ascii=False)}
-
-请从以下维度评估并返回JSON:
-1. 项目表现(60分满分)
-2. 技术能力(20分满分)
-3. 团队协作(20分满分)
-
-返回格式:{{"projectPerformance": 分数, "techCapability": 分数, "collaboration": 分数, "score": 综合总分, "result": "converted/extended/rejected", "comment": "评估意见"}}
-只返回JSON。"""
+    prompt = render_prompt('talent/probation.md', {'employee_name': emp.name, 'department': emp.department or '未指定', 'onboard_date': emp.onboard_date, 'probation_end_date': emp.probation_end_date, 'tasks_json': json.dumps(tasks, ensure_ascii=False)}, 'Prompt 1')
 
     try:
         response = await get_llm_client().chat.completions.create(

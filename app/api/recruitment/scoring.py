@@ -1,5 +1,7 @@
 """模块二: 简历评分 + 筛选决策 API。"""
 from __future__ import annotations
+
+from app.prompts import render_prompt
 import logging
 import uuid
 from typing import Optional
@@ -83,14 +85,7 @@ async def compute_8d_score(db: AsyncSession, candidate: Candidate) -> Optional[d
         resume_summary = f"姓名:{candidate.name} 学历:{candidate.education} 工作年限:{candidate.experience}"
 
     prompt = (
-        "你是专业 HR，请对以下候选人简历做 8 维评分，满分 100 分。\n"
-        f"候选人信息: {resume_summary}\n\n"
-        "返回 JSON（所有数值为整数/浮点数，字段不可缺失）:\n"
-        '{"skill_match":0-25,"project_match":0-20,"position_exp":0-15,'
-        '"achievement":0-15,"industry_exp":0-10,"learning":0-5,"stability":0-5,"bonus_skill":0-5,'
-        '"total":0-100,"confidence":0.0-1.0,'
-        '"evidence":["..."],"strengths":["..."],"risks":["..."],'
-        '"missing_information":["..."],"recommended_action":"...","requires_human_confirmation":true}'
+        render_prompt('recruitment/scoring.md', {'resume_summary': resume_summary}, 'Prompt 1')
     )
     # DeepSeek 批量并发下偶发空输出/失败，重试 3 次（空输出重试，异常也重试）
     import asyncio as _asyncio

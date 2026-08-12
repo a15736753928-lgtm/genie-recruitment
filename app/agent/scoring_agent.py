@@ -11,6 +11,8 @@
 
 from __future__ import annotations
 
+from app.prompts import render_prompt
+
 import asyncio
 import json
 from dataclasses import dataclass
@@ -44,43 +46,11 @@ class ScoringResult:
 def _build_system_prompt(position_name: str) -> str:
     """构造评分 Agent 的系统提示词。"""
     rubric_lines = "\n".join(f"- {name}：{desc}" for name, desc in DIMENSION_RUBRIC.items())
-    return f"""你是一位资深的技术面试评分专家（面试评分 Agent），正在为「{position_name}」岗位的候选人面试回答评分。
-
-你的职责：
-1. 仔细阅读面试官提出的问题和候选人的回答原文。
-2. 从以下 3 个维度独立打分，每维 0-100 分：
-{rubric_lines}
-
-评分原则：
-- 严格基于回答内容本身评分，不要臆造候选人未提及的信息。
-- 回答空泛、跑题、有明显错误时该维度低分（<50）。
-- 回答准确、有深度、有条理时该维度高分（>=80）。
-- 综合分 score 为 3 个维度的加权综合（技术深度与逻辑思维权重略高），不是简单平均。
-- 若候选人未作答或回答为空，3 个维度均给 0 分，综合分 0。
-
-输出格式：必须是纯 JSON 对象，不要包含任何 markdown 或解释文字，结构如下：
-{{
-  "score": <整数 0-100>,
-  "dimensions": [
-    {{"name": "表达能力", "score": <整数>}},
-    {{"name": "逻辑思维", "score": <整数>}},
-    {{"name": "技术深度", "score": <整数>}}
-  ]
-}}
-
-维度顺序必须与上面一致，只输出这 3 个维度的分数，不要输出其他内容。只返回 JSON。"""
+    return render_prompt('interview/scoring_agent.md', {'position_name': position_name, 'rubric_lines': rubric_lines}, 'Prompt 1')
 
 
 def _build_user_prompt(question_content: str, category: str, difficulty: str, answer: str) -> str:
-    return f"""请对以下面试问答进行评分。
-
-【题目】{question_content}
-【分类】{category or '综合'}
-【难度】{difficulty or 'medium'}
-【候选人回答】
-{answer or '（无回答）'}
-
-请按系统提示的维度和格式输出评分 JSON。"""
+    return render_prompt('interview/scoring_agent.md', {'question_content': question_content, 'category': category or '综合', 'difficulty': difficulty or 'medium', 'answer': answer or '（无回答）'}, 'Prompt 2')
 
 
 def _fallback_result(fallback_score: int) -> dict:

@@ -13,6 +13,8 @@
 
 from __future__ import annotations
 
+from app.prompts import render_prompt
+
 import json
 from typing import List
 
@@ -40,49 +42,11 @@ def _build_system_prompt(position_name: str) -> str:
         f"- {name}：{desc.format(position=position_name) if '{position}' in desc else desc}"
         for name, desc in DIMENSION_RUBRIC.items()
     )
-    return f"""你是一位资深的面试评分专家（自我介绍评分 Agent），正在为「{position_name}」岗位的候选人面试的「自我介绍」环节评分。
-
-你的职责：
-1. 仔细阅读候选人在面试开场所做的自我介绍原文，并**对照其简历**核实内容。
-2. 从以下 4 个维度独立打分，每维 0-100 分：
-{rubric_lines}
-
-评分原则：
-- 必须结合候选人简历进行评分，不要脱离简历凭感觉打分。
-- 「内容完整度」：自我介绍是否覆盖简历中的关键经历（教育、工作/项目、技能、求职意向）；遗漏简历重要信息则扣分。
-- 「亮点真实性」：自我介绍中陈述的亮点、成就、数据是否与简历一致、有据可查；夸大、与简历矛盾或简历无法佐证的亮点该维度低分。
-- 「岗位匹配度」：结合简历经历判断其与目标岗位「{position_name}」要求的契合程度。
-- 严格基于自我介绍与简历内容评分，不要臆造候选人未提及的信息。
-- 自我介绍空泛、跑题、信息缺失严重时该维度低分（<50）。
-- 自我介绍完整、清晰、与岗位高度契合、亮点可信时该维度高分（>=80）。
-- 综合分 score 为 4 个维度的加权综合（内容完整度与岗位匹配度权重略高），不是简单平均。
-- 若候选人未做自我介绍或内容为空，4 个维度均给 0 分，综合分 0。
-
-输出格式：必须是纯 JSON 对象，不要包含任何 markdown 或解释文字，结构如下：
-{{
-  "score": <整数 0-100>,
-  "dimensions": [
-    {{"name": "内容完整度", "score": <整数>}},
-    {{"name": "表达清晰度", "score": <整数>}},
-    {{"name": "岗位匹配度", "score": <整数>}},
-    {{"name": "亮点真实性", "score": <整数>}}
-  ]
-}}
-
-维度顺序必须与上面一致，只输出这 4 个维度的分数，不要输出其他内容。只返回 JSON。"""
+    return render_prompt('interview/self_intro_agent.md', {'position_name': position_name, 'rubric_lines': rubric_lines}, 'Prompt 1')
 
 
 def _build_user_prompt(self_intro_text: str, position_name: str, resume_text: str) -> str:
-    return f"""请对以下自我介绍片段进行评分。
-
-【岗位】{position_name or '未知'}
-【候选人简历摘要】
-{resume_text or '（无简历）'}
-
-【候选人自我介绍】
-{self_intro_text or '（无自我介绍）'}
-
-请对照简历，按系统提示的维度和格式输出评分 JSON。"""
+    return render_prompt('interview/self_intro_agent.md', {'position_name': position_name or '未知', 'resume_text': resume_text or '（无简历）', 'self_intro_text': self_intro_text or '（无自我介绍）'}, 'Prompt 2')
 
 
 def _fallback_result(fallback_score: int) -> dict:

@@ -20,6 +20,8 @@ mimo-v2.5），不新增配置项。ffmpeg 为运行环境依赖（生产部署�
 
 from __future__ import annotations
 
+from app.prompts import load_prompt, render_prompt
+
 import asyncio
 import base64
 import logging
@@ -91,10 +93,7 @@ def transcode_to_mp3(audio_bytes: bytes, timeout: int = 300) -> bytes:
 # ── 云端转写 ─────────────────────────────────────────────
 
 # 转写提示词：完整对话稿 + 说话人标注（对下游抽问答/评分最有价值）。
-_TRANSCRIBE_PROMPT = (
-    "这是一段面试录音。请把它完整转写成对话文字稿，标注说话人（面试官/候选人），"
-    "不要总结、不要省略任何内容。"
-)
+_TRANSCRIBE_PROMPT = load_prompt("ai_services/transcribe.md")
 
 # 30 分钟全文转写实测约 9500 字符（≈7k token），留足余量防截断。
 MAX_COMPLETION_TOKENS = 12000
@@ -106,8 +105,7 @@ def _today_str() -> str:
 
 def _system_prompt() -> str:
     return (
-        "You are MiMo, an AI assistant developed by Xiaomi. "
-        f"Today is date: {_today_str()}. Your knowledge cutoff date is December 2024."
+        render_prompt('ai_services/speech.md', {'today_str': _today_str()}, 'Prompt 1')
     )
 
 

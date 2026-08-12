@@ -14,11 +14,11 @@ from __future__ import annotations
 import json
 import logging
 import re
-from pathlib import Path
 from typing import Optional
 
 from app.config import get_settings
 from app.services.ai import get_llm_client
+from app.prompts import load_prompt, render_prompt
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -36,9 +36,8 @@ _LLM_DIMENSIONS = {
 
 
 def _load_prompt(folder: str) -> str:
-    """Load the rubric prompt for a sub-agent from its ``prompt.md`` file."""
-    path = Path(__file__).parent / folder / "prompt.md"
-    return path.read_text(encoding="utf-8")
+    """加载统一管理的维度评分标准。"""
+    return load_prompt(f"resume_scoring/{folder}.md")
 
 
 async def _llm_score(rubric: str, resume_text: str, position_name: str) -> Optional[int]:
@@ -46,12 +45,11 @@ async def _llm_score(rubric: str, resume_text: str, position_name: str) -> Optio
     if not resume_text or not resume_text.strip():
         return None
     position_line = f"\n目标应聘岗位：{position_name}" if position_name else ""
-    prompt = (
-        f"{rubric}\n"
-        f"{position_line}\n\n"
-        f"【简历文本】\n{resume_text[:8000]}\n\n"
-        f"请只输出一个 0 到 100 的整数分数，不要任何其它文字、解释或标点。"
-    )
+    prompt = render_prompt("resume_scoring/single_score.md", {
+        "rubric": rubric,
+        "position_line": position_line,
+        "resume_text": resume_text[:8000],
+    })
     try:
         client = get_llm_client()
         resp = await client.chat.completions.create(
@@ -100,9 +98,7 @@ async def _llm_score_batched(
         rubrics = {name: _load_prompt(folder) for name, folder in _LLM_DIMENSIONS.items()}
 
     # ── Build combined prompt ──
-    parts = [
-        "你是一个简历评估专家。请根据以下四个维度的评分标准，对候选人简历逐一打分。",
-    ]
+    parts = [load_prompt("resume_scoring/batched.md", "Intro")]
     for name, rubric in rubrics.items():
         parts.append(f"\n## {name}\n{rubric}")
 
@@ -112,11 +108,9 @@ async def _llm_score_batched(
     parts.append(f"\n【简历文本】\n{resume_text[:8000]}")
 
     field_names = "、".join(rubrics.keys())
-    parts.append(
-        f"\n请返回一个 JSON 对象，字段为 {field_names}，"
-        f"每个字段值为 0-100 的整数。只输出 JSON，不要其他内容。\n"
-        f'示例：{{"项目经验": 85, "工作经验": 70, "专业技能": 80, "实习经历": 60}}'
-    )
+    parts.append(render_prompt("resume_scoring/batched.md", {
+        "field_names": field_names,
+    }, "Output"))
 
     prompt = "\n".join(parts)
 
@@ -127,7 +121,7 @@ async def _llm_score_batched(
             resp = await client.chat.completions.create(
                 model=settings.deepseek_model,
                 messages=[
-                    {"role": "system", "content": "You must output a valid JSON object. 只输出 JSON，无其他文字。"},
+                    {"role": "system", "content": load_prompt("resume_scoring/batched.md", "System")},
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.2,

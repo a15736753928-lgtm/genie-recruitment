@@ -5,6 +5,8 @@
 带教周期: high=4w / experienced=6w / fresh=8w / core=8w
 """
 from __future__ import annotations
+
+from app.prompts import render_prompt
 import json
 import logging
 import uuid
@@ -172,9 +174,7 @@ async def create_plan(
     try:
         from app.services.ai import llm_chat
         prompt = (
-            f"为{body.type}类新员工制定{total_weeks}周试用期计划。"
-            f"岗位: {emp.department or '技术'}。"
-            f"返回 JSON: [{{\"week\":1,\"title\":\"...\",\"focus\":\"...\",\"goals\":[\"...\"],\"trainingItems\":[\"...\"]}},...]"
+            render_prompt('talent/phase2.md', {'plan_type': body.type, 'total_weeks': total_weeks, 'department': emp.department or '技术'}, 'Prompt 1')
         )
         resp = await llm_chat([{"role": "user", "content": prompt}], max_tokens=2048)
         weeks_data = (extract_json_array(resp) or [])[:total_weeks]

@@ -1,6 +1,8 @@
 """判断上传文档是否为个人求职简历。"""
 from __future__ import annotations
 
+from app.prompts import render_prompt
+
 import json
 import logging
 import re
@@ -117,19 +119,7 @@ def heuristic_text_is_resume(text: str) -> Tuple[bool, str]:
 
 async def classify_with_llm(text: str) -> Tuple[bool, str, str]:
     """使用 LLM 判断文档类型。Returns (is_resume, reason, document_type)."""
-    prompt = f"""你是文档分类助手。请判断下列文本是否属于「个人求职简历 / CV」（含应届生简历）。
-
-不属于简历的例子：劳动合同、商业合同、发票、论文、产品说明书、公司介绍、新闻稿、会议纪要、面试对话记录、空白页或乱码。
-
-【文档文本】
-{text[:8000]}
-
-只返回 JSON，不要其他文字：
-{{
-  "isResume": true或false,
-  "reason": "一句话说明判断依据",
-  "documentType": "简历/合同/发票/论文/其他"
-}}"""
+    prompt = render_prompt('recruitment/resume_validator.md', {'text_8000': text[:8000]}, 'Prompt 1')
 
     response = await get_llm_client().chat.completions.create(
         model=settings.deepseek_model,

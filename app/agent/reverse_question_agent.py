@@ -13,6 +13,8 @@
 
 from __future__ import annotations
 
+from app.prompts import render_prompt
+
 import json
 from typing import List
 
@@ -37,51 +39,11 @@ DIMENSION_RUBRIC = {
 
 def _build_system_prompt(position_name: str) -> str:
     rubric_lines = "\n".join(f"- {name}：{desc}" for name, desc in DIMENSION_RUBRIC.items())
-    return f"""你是一位资深的面试评分专家（反问环节评分 Agent），正在为「{position_name}」岗位的候选人面试的「反问环节」评分。
-
-反问环节指面试结尾候选人向面试官提问的部分。
-
-你的职责：
-1. 仔细阅读候选人在反问环节提出的问题原文，并**结合该岗位的实际要求（岗位职责/任职要求/技术栈）**判断提问质量。
-2. 从以下 4 个维度独立打分，每维 0-100 分：
-{rubric_lines}
-
-评分原则：
-- 必须结合岗位要求进行评分，不要脱离岗位凭感觉打分。
-- 「问题深度」：提问是否切中该岗位的核心职责、技术难点或业务挑战，而非泛泛而谈。
-- 「团队业务理解」：提问是否体现出对岗位所在团队业务方向、协作方式、技术栈的关注与初步理解。
-- 「职业规划清晰度」：是否通过提问展现出与该岗位发展路径匹配的清晰规划。
-- 严格基于候选人提问内容本身评分，不要臆造候选人未提及的信息。
-- 提问空泛、跑题、只问薪资福利等表面问题时该维度低分（<50）。
-- 提问有深度、关注团队业务、体现清晰规划且沟通得体时该维度高分（>=80）。
-- 综合分 score 为 4 个维度的加权综合（问题深度与团队业务理解权重略高），不是简单平均。
-- 若候选人未提问或内容为空，4 个维度均给 0 分，综合分 0。
-
-输出格式：必须是纯 JSON 对象，不要包含任何 markdown 或解释文字，结构如下：
-{{
-  "score": <整数 0-100>,
-  "dimensions": [
-    {{"name": "问题深度", "score": <整数>}},
-    {{"name": "团队业务理解", "score": <整数>}},
-    {{"name": "职业规划清晰度", "score": <整数>}},
-    {{"name": "沟通", "score": <整数>}}
-  ]
-}}
-
-维度顺序必须与上面一致，只输出这 4 个维度的分数，不要输出其他内容。只返回 JSON。"""
+    return render_prompt('interview/reverse_question_agent.md', {'position_name': position_name, 'rubric_lines': rubric_lines}, 'Prompt 1')
 
 
 def _build_user_prompt(reverse_text: str, position_name: str, position_requirements: str) -> str:
-    return f"""请对以下反问环节片段进行评分。
-
-【岗位】{position_name or '未知'}
-【岗位要求】
-{position_requirements or '（无岗位要求信息）'}
-
-【候选人向面试官提出的问题】
-{reverse_text or '（无反问）'}
-
-请结合岗位要求，按系统提示的维度和格式输出评分 JSON。"""
+    return render_prompt('interview/reverse_question_agent.md', {'position_name': position_name or '未知', 'position_requirements': position_requirements or '（无岗位要求信息）', 'reverse_text': reverse_text or '（无反问）'}, 'Prompt 2')
 
 
 def _fallback_result(fallback_score: int) -> dict:

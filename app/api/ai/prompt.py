@@ -12,88 +12,35 @@ required.
 
 from __future__ import annotations
 
-import os
-
-_PROMPTS_DIR = os.path.join(os.path.dirname(__file__), "prompts")
-
-
-def _load(filename: str) -> str:
-    """Read a prompt file, stripping leading/trailing whitespace."""
-    path = os.path.join(_PROMPTS_DIR, filename)
-    with open(path, "r", encoding="utf-8") as f:
-        return f.read().strip()
-
-
-_PROMPT_MTIMES: dict[str, float] = {}
-_PROMPT_CACHE: str | None = None
-
-
-def _load_all() -> str:
-    """Load and join all prompt sections; reload when any .txt file changes."""
-    global _PROMPT_CACHE
-    filenames = ("system.txt", "tone.txt", "recommend.txt", "rules.txt")
-    mtimes = {
-        name: os.path.getmtime(os.path.join(_PROMPTS_DIR, name)) for name in filenames
-    }
-    if _PROMPT_CACHE is not None and mtimes == _PROMPT_MTIMES:
-        return _PROMPT_CACHE
-    _PROMPT_MTIMES.clear()
-    _PROMPT_MTIMES.update(mtimes)
-    sections = [_load(name) for name in filenames]
-    _PROMPT_CACHE = "\n\n".join(sections)
-    return _PROMPT_CACHE
+from app.prompts import load_prompt, render_prompt
 
 
 # ── 角色专属提示词（按账号角色叠加）──────────────────
-# prompts/roles/<role_code>.txt —— 每个角色一份，做「对话模式」差异化：
+# app/prompts/agent_workspace/roles/<role_code>.md —— 每个角色一份：
 # 身份定位 / 职责视角 / 话术风格 / 补充语境。只影响 LLM 的说话方式与关注点，
 # 不改变工具可见性（仍由 visible_tool_names 同源驱动）与共享工作规则（rules.txt）。
 
-_ROLE_DIR = os.path.join(_PROMPTS_DIR, "roles")
-_ROLE_CACHE_KEY: tuple | None = None
-_ROLE_CACHE: str | None = None
-
-
-def _role_file_map() -> dict[str, str]:
-    """返回 {role_code: absolute_path}，仅含 roles/ 下已存在的 .txt 文件。"""
-    result: dict[str, str] = {}
-    if not os.path.isdir(_ROLE_DIR):
-        return result
-    for name in os.listdir(_ROLE_DIR):
-        if name.endswith(".txt"):
-            result[name[:-4]] = os.path.join(_ROLE_DIR, name)
-    return result
-
-
 def _load_role_sections(role_codes: list[str] | None) -> str:
-    """按角色加载 prompts/roles/<role>.txt 专属段，拼为一段（无角色文件返回空串）。
+    """按角色加载统一目录中的专属段，拼为一段（无角色文件返回空串）。
 
     与共享段分开缓存：任何相关角色文件的 mtime 变化都会触发重载（支持热更新）。
     多角色用户按传入顺序拼接多个角色段。
     """
-    global _ROLE_CACHE, _ROLE_CACHE_KEY
     if not role_codes:
         return ""
-    role_files = _role_file_map()
-    want = [c for c in role_codes if c in role_files]
-    if not want:
-        return ""
-    sig = tuple((c, os.path.getmtime(role_files[c])) for c in want)
-    if _ROLE_CACHE is not None and _ROLE_CACHE_KEY == sig:
-        return _ROLE_CACHE
     sections = []
-    for code in want:
-        with open(role_files[code], "r", encoding="utf-8") as f:
-            sections.append(f.read().strip())
-    text = "\n\n".join(sections)
-    _ROLE_CACHE = text
-    _ROLE_CACHE_KEY = sig
-    return text
+    for code in role_codes:
+        try:
+            sections.append(load_prompt(f"agent_workspace/roles/{code}.md"))
+        except ValueError as exc:
+            if "文件不存在" not in str(exc):
+                raise
+    return "\n\n".join(sections)
 
 
 # ── Agent Configurations ──────────────────────────────────
 # 8 个角色各有独立 agent 入口，agent_id = role_code。
-# 与 prompts/roles/<role>.txt 一一对应，工具集由 permissions fail-closed 驱动。
+# 与 agent_workspace/roles/<role>.md 一一对应，工具集由权限过滤驱动。
 
 AGENT_CONFIGS = {
     "hr": {
@@ -205,8 +152,7 @@ def build_system_prompt(
 ) -> str:
     """Build the full system prompt for a given agent.
 
-    Loads prompt text from the ``prompts/`` directory, then interpolates
-    the agent's name and description via ``str.format()``.
+    从 ``app/prompts/`` 加载提示词，并用严格的 ``[[name]]`` 占位符渲染。
 
     ``visible_tool_names``：当前用户可见的工具名集合（来自 get_tools_for_agent 的
     fail-closed 过滤）。能力清单由该集合反向驱动（app/agent/tools.py 的
@@ -215,18 +161,22 @@ def build_system_prompt(
     传 None（未接权限的内部调用方）时保持全量能力，作为兜底以免误裁。
 
     ``role_codes``：当前账号的角色编码列表（如 CurrentUser.roles）。存在
-    prompts/roles/<role>.txt 时，把角色专属段（身份/职责视角/话术/补充语境）
+    agent_workspace/roles/<role>.md 存在时，把角色专属段（身份/职责视角/话术/补充语境）
     叠加到共享提示词之后，实现各角色不同的对话模式。角色段只改对话人格，
     不改变工具可见性与共享工作规则。传 None 保持纯共享提示词（向后兼容）。
     """
     agent_info = AGENT_CONFIGS.get(agent_id, AGENT_CONFIGS["employee"])
-    template = _load_all()
     capabilities = _render_capabilities(visible_tool_names)
-    base = template.format(
-        name=agent_info["name"],
-        description=agent_info["description"],
-        capabilities=capabilities,
-    )
+    base = "\n\n".join((
+        render_prompt("agent_workspace/system.md", {
+            "name": agent_info["name"],
+            "description": agent_info["description"],
+            "capabilities": capabilities,
+        }),
+        load_prompt("agent_workspace/tone.md"),
+        load_prompt("agent_workspace/recommend.md"),
+        load_prompt("agent_workspace/rules.md"),
+    ))
     role_sections = _load_role_sections(role_codes)
     if role_sections:
         base = base + "\n\n" + role_sections

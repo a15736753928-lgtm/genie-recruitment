@@ -36,6 +36,7 @@ from app.middleware.trace import get_trace_id
 from app.infrastructure import minio_storage
 from app.api.recruitment.resumes import extract_text_from_file, parse_resume_with_llm
 from app.api.ai.prompt import AGENT_CONFIGS, build_system_prompt
+from app.prompts import render_prompt
 from app.api.ai.tool_executor import sse_event, execute_tool_call
 from app.services.ai import get_llm_client, create_langchain_llm
 import os
@@ -207,10 +208,10 @@ async def _persist_assistant_turn(
         # produced content — skip on empty/failed turns).
         if (is_new_session or session_title == "新对话") and result.full_content:
             try:
-                title_prompt = (
-                    f"根据以下对话内容，生成一个简短的标题（10个字以内，不要引号）：\n"
-                    f"用户：{message[:200]}\nAI：{result.full_content[:200]}"
-                )
+                title_prompt = render_prompt("agent_workspace/title.md", {
+                    "user_message": message[:200],
+                    "assistant_message": result.full_content[:200],
+                })
                 title_resp = await get_llm_client().chat.completions.create(
                     model=settings.deepseek_model,
                     extra_body={"thinking": {"type": "disabled"}},  # deepseek-v4-flash 关闭思考
@@ -2005,7 +2006,7 @@ async def agent_chat(
             visible_tool_names = {
                 getattr(t, "name", "") for t in langchain_tools if getattr(t, "name", "")
             }
-            # 叠加当前账号角色专属段（prompts/roles/<role>.txt）——身份/职责视角/
+            # 叠加当前账号角色专属段（app/prompts/agent_workspace/roles/<role>.md）——身份/职责视角/
             # 话术按角色差异化，工具可见性仍由 visible_tool_names 同源驱动。
             system_prompt = build_system_prompt(
                 agent_id,

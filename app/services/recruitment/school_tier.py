@@ -15,6 +15,8 @@ Results are cached per school name.
 """
 from __future__ import annotations
 
+from app.prompts import render_prompt
+
 import logging
 import re
 from typing import Optional
@@ -110,10 +112,7 @@ async def classify_school_tier(school_name: str) -> str:
     try:
         client = get_llm_client()
         prompt = (
-            f"判断「{key}」这所中国高校的招生层次。只回答一个词，从以下选一个："
-            f"一本、二本、民办本、专科、未知。\n"
-            f"规则：先看办学性质——民办/独立学院/转设民办=民办本；公办本科按多数省份"
-            f"本科录取批次分一本/二本（不确定时归二本）；高职专科=专科；信息不足=未知。"
+            render_prompt('recruitment/school_tier.md', {'key': key}, 'Prompt 1')
         )
         resp = await client.chat.completions.create(
             model=settings.deepseek_model,

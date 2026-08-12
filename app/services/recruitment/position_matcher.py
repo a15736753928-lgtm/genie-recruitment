@@ -9,6 +9,8 @@
 """
 from __future__ import annotations
 
+from app.prompts import render_prompt
+
 import json
 import logging
 import re
@@ -100,21 +102,7 @@ async def match_position_for_resume(
     positions_brief = [_serialize_position_for_matching(p) for p in positions]
 
     prompt = (
-        "你是一个招聘助理 Agent，任务是根据候选人简历内容，从公司当前在招的岗位列表中"
-        "选出**最匹配**的一个岗位。\n\n"
-        "## 在招岗位列表\n"
-        f"{json.dumps(positions_brief, ensure_ascii=False)}\n\n"
-        "## 候选人简历文本\n"
-        f"{resume_text[:8000]}\n\n"
-        "## 判断规则\n"
-        "1. 优先看简历中明确写出的「求职意向 / 期望岗位 / 应聘岗位」字段；\n"
-        "2. 其次结合工作经历、项目经历、专业技能与岗位 JD（职责 / 要求 / 技术栈）做语义匹配；\n"
-        "3. 必须从上面岗位列表的 id 中选一个，不要凭空捏造；\n"
-        "4. 若简历与所有岗位都不匹配（例如岗位列表为空，或简历内容明显属于完全不同的方向），"
-        "请将 positionId 返回为 null，并在 reason 中说明原因。\n\n"
-        "## 输出格式\n"
-        "只返回纯 JSON，不要任何额外文字或 markdown 代码块：\n"
-        '{"positionId": "<岗位id 或 null>", "positionName": "<岗位名 或 null>", "reason": "<一句话理由>"}'
+        render_prompt('recruitment/position_matcher.md', {'json_dumps_positions_brief_ensure_ascii_': json.dumps(positions_brief, ensure_ascii=False), 'resume_text_8000': resume_text[:8000]}, 'Prompt 1')
     )
 
     try:

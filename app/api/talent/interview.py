@@ -1,3 +1,4 @@
+from app.prompts import render_prompt
 import builtins
 import os
 import re
@@ -121,17 +122,7 @@ async def generate_questions_with_llm(
     """Generate interview questions using DeepSeek with optional RAG context."""
     round_label = "一面（侧重基础技能和项目经验）" if round == "first" else "二面（侧重架构设计、领导力和综合素质）"
 
-    system_prompt = f"""你是一位资深的HR面试官和技术面试专家。请为候选人「{candidate_name}」生成{round_label}的面试题目。
-岗位：{position_name}
-题目数量：{count}
-
-要求：
-1. 每道题包含：category（分类）、difficulty（easy/medium/hard）、content（题目内容）
-2. 难度分布：30% easy, 40% medium, 30% hard
-3. 题目要有针对性，结合候选人背景和岗位要求
-4. 一面侧重技术基础、编码能力、项目经验
-5. 二面侧重系统设计、架构能力、领导力、团队协作
-6. 分类可从以下选择：技术能力、项目经验、系统设计、沟通协作、学习能力、领导力"""
+    system_prompt = render_prompt('interview/interview.md', {'candidate_name': candidate_name, 'round_label': round_label, 'position_name': position_name, 'count': count, 'default_difficulty': 'hard' if difficulty_override else 'easy'}, 'Prompt 1')
 
     if rag_context:
         system_prompt += f"\n\n参考知识库素材：\n{rag_context}"
@@ -142,16 +133,8 @@ async def generate_questions_with_llm(
     if resume_text:
         system_prompt += f"\n\n候选人简历摘要：\n{resume_text[:2000]}"
 
-    system_prompt += f"\n\n请返回纯JSON数组，每道题格式如下：\n[{{\"category\": \"分类\", \"difficulty\": \"{'hard' if difficulty_override else 'easy'}\", \"content\": \"题目内容\"}}, ...]"
-
     if category_override and difficulty_override:
-        system_prompt = f"""请为「{candidate_name}」生成1道面试题目（{round_label}）。
-岗位：{position_name}
-分类：{category_override}
-难度：{difficulty_override}
-{('额外要求：' + prompt_override) if prompt_override else ''}
-
-请返回纯JSON对象：{{"category": "...", "difficulty": "...", "content": "..."}}"""
+        system_prompt = render_prompt('interview/interview.md', {'candidate_name': candidate_name, 'round_label': round_label, 'position_name': position_name, 'category_override': category_override, 'difficulty_override': difficulty_override, 'extra_requirement': ('额外要求：' + prompt_override) if prompt_override else ''}, 'Prompt 4')
 
     try:
         response = await get_llm_client().chat.completions.create(
@@ -304,55 +287,7 @@ async def extract_qa_from_transcript(transcript_text: str, position_name: str) -
         logger.info("[extract_qa] 转写文本长度 %d 超过 %d，仅解析前 %d 字符",
                     len(transcript_text), MAX_CHARS, MAX_CHARS)
 
-    system_prompt = f"""你是一位资深的面试记录分析专家。请从下面这段面试转写文本中，抽取面试官实际提出的问题以及候选人对应的回答原文。
-
-岗位：{position_name or '未知'}
-
-输入文本可能是以下任一格式，请都识别：
-- 「面试官：...」「候选人：...」之类的说话人标注
-- 「Q：...」「A：...」之类的问答标注
-- 带时间戳的转写文本，如「00:01:23 面试官：...」
-- 没有说话人标注的连续对话（请根据语义判断哪一段是问、哪一段是答）
-
-**严格限制：最多输出 15 条问答。** 一场45分钟面试，真实独立问题通常不超过15道。超过15道说明你没有去重。
-
-要求：
-1. **只抽取面试中真实发生的一问一答，不要臆造，不要把面试官的引导语单独成题。**
-2. **question 必须是问题本身**，禁止包含：问候语（如"你好，欢迎参加面试"）、自我介绍（如"我是负责XX岗位的面试官"）、过渡语（如"接下来我们聊一下"）。这些是引导语，不是问题。例如：
-   - ❌ "你好，桂云飞，欢迎参加今天的一面面试，我是负责Agent工程师岗位的面试官，先请你做一个简单的自我介绍吧。"
-   - ✅ "请先做一个简单的自我介绍吧。"
-3. **去重**（极其重要）：同一道问题如果在转写中出现多次（面试官口头重复、引导、过渡后重述），只保留最完整的一次。判断标准：去掉问候语/过渡语后，核心问题相同的只保留一条。
-4. 自我介绍只出现一次——即使面试官在不同时间点多次要求「请先做自我介绍」，也只保留一条最完整的记录。
-5. **排除反问环节（最关键，务必遵守）**：反问环节 = 面试结尾候选人向面试官提问、面试官解答的对话，
-   通常由面试官说「你还有什么想问我的吗」「你有什么问题想问我吗」「要不要问我几个问题」等引出。
-   这类对话的提问方是候选人、回答方是面试官，方向与普通问答相反，**一律不要抽取**（反问环节由专门的评分模块独立评估）。
-   判断方法：若某句「问题」由候选人说出、面试官回答，即属反问环节，跳过。例如：
-   - ❌ question="这个岗位目前主要的业务场景是什么？"（候选人问面试官，不是面试官问候选人）
-   - ❌ question="团队目前的技术栈主要是什么？"（同上，方向反了）
-6. **每条必须输出 `questioner` 字段**：标注本条的提问方，只能是 `"面试官"` 或 `"候选人"`。
-   - 普通问答（面试官提问、候选人回答）填 `"面试官"`。
-   - 反问环节（候选人提问、面试官回答）填 `"候选人"`——后端会据此丢弃该条目。
-   - **不得省略该字段，也不得填其他值。**
-7. 其余字段：question（问题原文，去掉问候语/引导语，只保留问题核心）、answer（回答原文，保留关键内容）、category（从「技术能力、项目经验、工程素养、团队协作、架构设计、领导力、沟通表达」中选一个）。
-8. 按面试发生顺序输出。
-9. 若文本明显不是面试对话，返回空数组 []。
-10. 严格返回纯 JSON 数组，不要包含任何 markdown 代码围栏、解释文字或前后缀。
-
-输出格式（最多15条）：
-[{{"question": "问题原文", "answer": "回答原文", "category": "技术能力", "questioner": "面试官"}}, ...]
-
-错误示例（禁止）：
-- question="你好，欢迎参加面试，我是负责XX岗位的面试官，请先做个自我介绍吧。"  ← 包含问候语
-- question="请先做个自我介绍。" 且出现两次  ← 未去重
-- question="这个岗位目前主要的业务场景是什么？", questioner="候选人"  ← 反问环节（候选人问面试官），后端会丢弃，必须跳过
-- question="团队目前的技术栈主要是什么？", questioner="候选人"  ← 同上，方向反了
-
-正确示例：
-- question="请先做一个简单的自我介绍吧。", answer="我叫张三...", category="沟通表达", questioner="面试官"
-- question="讲一下你最近负责的订单系统架构。", answer="我们用了微服务...", category="架构设计", questioner="面试官"
-
-面试转写文本：
-{transcript_slice}"""
+    system_prompt = render_prompt('interview/interview.md', {'position_name': position_name or '未知', 'transcript_slice': transcript_slice}, 'Prompt 2')
 
     # DeepSeek 偶发返回空串/非法 JSON，重试最多 3 次；重试时略升 temperature 打破确定性空返回。
     MAX_ATTEMPTS = 3
@@ -408,23 +343,7 @@ async def extract_segments_from_transcript(transcript_text: str, position_name: 
     if not transcript_text or not transcript_text.strip():
         return {"self_intro": "", "reverse_questions": ""}
 
-    system_prompt = f"""你是一位资深的面试记录分析专家。请从下面这段面试转写文本中，抽取两个特殊片段。
-
-岗位：{position_name or '未知'}
-
-需要抽取的片段：
-1. self_intro（自我介绍）：面试开场候选人对自己的自我陈述原文。通常是面试官说「请先做个自我介绍」之后候选人的一段独白。
-2. reverse_questions（反问环节）：面试结尾候选人向面试官提出的问题原文。通常是面试官说「你有什么想问的吗」之后候选人的提问。
-
-要求：
-1. 只抽取真实出现的内容，不要臆造；不要把常规问答混入这两个片段。
-2. 保留原文关键内容，可适当精简但保留原意。
-3. 若某个片段在转写中不存在，对应字段返回空字符串 ""。
-4. 严格返回纯 JSON 对象，不要包含 markdown 或解释文字：
-{{"self_intro": "...", "reverse_questions": "..."}}
-
-面试转写文本：
-{transcript_text[:15000]}"""
+    system_prompt = render_prompt('interview/interview.md', {'position_name': position_name or '未知', 'transcript_text': transcript_text[:15000]}, 'Prompt 3')
 
     try:
         response = await get_llm_client().chat.completions.create(
